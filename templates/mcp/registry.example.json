@@ -1,0 +1,13 @@
+{
+  "updated_at": "bootstrap",
+  "parent_registry": "__ASSETS_HOME__/registry.json",
+  "policy": {
+    "stdio_entrypoint_dir": "__BIN_DIR__",
+    "wrapper_pattern": "__BIN_DIR__/*-mcp",
+    "rule": "Host MCP configs should point to stable wrappers. Package-manager and project internals should not be referenced directly from host configs unless no wrapper is appropriate."
+  },
+  "stdio_servers": {},
+  "http_servers": {},
+  "internal_servers": {}
+}
+

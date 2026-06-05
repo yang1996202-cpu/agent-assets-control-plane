@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+
+# Local generated state. Templates are committed instead.
+registry.json
+discovered.json
+discovery-review.json
+mcp-health-cache.json
+dashboard.html
+

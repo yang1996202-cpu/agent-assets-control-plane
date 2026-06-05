@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+HOME = Path(os.environ.get("AGENT_ASSETS_USER_HOME", str(Path.home()))).expanduser()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config"))).expanduser()
+ASSETS_HOME = Path(os.environ.get("AGENT_ASSETS_HOME", str(CONFIG_HOME / "agent-assets"))).expanduser()
+STABLE_BIN_DIR = Path(os.environ.get("AGENT_ASSETS_BIN_DIR", str(HOME / ".local/bin"))).expanduser()
+
+REGISTRY = os.environ.get("AGENT_ASSETS_REGISTRY", str(ASSETS_HOME / "registry.json"))
+SECRET_HINTS = ("bearer ", "authorization:", "api_key=", "apikey=", "token=", "secret=")
+OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}")
+
+
+def reject_secret(value):
+    if not value:
+        return
+    lower = value.lower()
+    if any(hint in lower for hint in SECRET_HINTS) or OPENAI_KEY_RE.search(value):
+        raise SystemExit("Refusing to write likely secret material into the registry.")
+
+
+def append_unique(target, key, values):
+    if not values:
+        return
+    existing = target.setdefault(key, [])
+    for value in values:
+        if value not in existing:
+            existing.append(value)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Register or update a local agent-facing asset.")
+    parser.add_argument("--id", required=True, help="Stable asset id, e.g. gbrain or mcp-context7")
+    parser.add_argument("--category", action="append", default=[], help="Repeatable category")
+    parser.add_argument("--entrypoint", action="append", default=[], help="Stable command/app path")
+    parser.add_argument("--url", action="append", default=[], help="MCP or service URL; do not include tokens")
+    parser.add_argument("--source", action="append", default=[], help="Source/package/project path")
+    parser.add_argument("--data", action="append", default=[], help="Data directory/path")
+    parser.add_argument("--config", action="append", default=[], help="Config path")
+    parser.add_argument("--host", action="append", default=[], help="Host config reference")
+    parser.add_argument("--registry", action="append", default=[], help="Related registry path/reference")
+    parser.add_argument("--health", action="append", default=[], help="Health check command")
+    parser.add_argument("--note", action="append", default=[], help="Short note")
+    parser.add_argument("--status", help="Current status note")
+    args = parser.parse_args()
+
+    for values in (
+        args.category,
+        args.entrypoint,
+        args.url,
+        args.source,
+        args.data,
+        args.config,
+        args.host,
+        args.registry,
+        args.health,
+        args.note,
+        [args.status] if args.status else [],
+    ):
+        for value in values:
+            reject_secret(value)
+
+    with open(REGISTRY, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assets = data.setdefault("assets", {})
+    asset = assets.setdefault(args.id, {})
+
+    append_unique(asset, "category", args.category)
+    append_unique(asset, "stable_entrypoints", args.entrypoint)
+    append_unique(asset, "mcp_urls", args.url)
+    append_unique(asset, "source_paths", args.source)
+    append_unique(asset, "data_paths", args.data)
+    append_unique(asset, "config_paths", args.config)
+    append_unique(asset, "host_configs", args.host)
+    append_unique(asset, "registries", args.registry)
+    append_unique(asset, "health_checks", args.health)
+    append_unique(asset, "notes", args.note)
+    if args.status:
+        asset["status"] = args.status
+
+    stable_dir = data.get("policy", {}).get("stable_entrypoint_dir", str(STABLE_BIN_DIR))
+    stable_bin = data.setdefault("indexes", {}).setdefault("stable_bin_dir", {})
+    stable_bin.setdefault("path", stable_dir)
+    current = stable_bin.setdefault("current_known_agent_entrypoints", [])
+    for entrypoint in args.entrypoint:
+        if entrypoint.startswith(stable_dir + "/") and entrypoint not in current:
+            current.append(entrypoint)
+    current.sort()
+
+    data["updated_at"] = dt.date.today().isoformat()
+
+    tmp = REGISTRY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, REGISTRY)
+    print(f"Registered {args.id} in {REGISTRY}")
+
+
+if __name__ == "__main__":
+    main()

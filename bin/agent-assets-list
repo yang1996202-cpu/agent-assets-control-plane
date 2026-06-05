@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+HOME = Path(os.environ.get("AGENT_ASSETS_USER_HOME", str(Path.home()))).expanduser()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config"))).expanduser()
+ASSETS_HOME = Path(os.environ.get("AGENT_ASSETS_HOME", str(CONFIG_HOME / "agent-assets"))).expanduser()
+
+REGISTRY = os.environ.get("AGENT_ASSETS_REGISTRY", str(ASSETS_HOME / "registry.json"))
+
+
+def load_registry():
+    with open(REGISTRY, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def first_value(asset, keys):
+    values = []
+    for key in keys:
+        item = asset.get(key)
+        if isinstance(item, list):
+            values.extend(str(x) for x in item)
+        elif item:
+            values.append(str(item))
+    return ", ".join(values[:2]) + (" ..." if len(values) > 2 else "")
+
+
+def table(rows):
+    headers = ["id", "category", "entry/url", "source/data", "status"]
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = min(max(widths[i], len(cell)), 46)
+
+    def trim(s, width):
+        return s if len(s) <= width else s[: max(0, width - 3)] + "..."
+
+    print("  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
+    print("  ".join("-" * widths[i] for i in range(len(headers))))
+    for row in rows:
+        print("  ".join(trim(row[i], widths[i]).ljust(widths[i]) for i in range(len(headers))))
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a]
+    as_json = "--json" in args
+    terms = [a.lower() for a in args if a != "--json"]
+
+    data = load_registry()
+    assets = data.get("assets", {})
+
+    if as_json:
+        if not terms:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+            return
+        filtered = {
+            k: v
+            for k, v in assets.items()
+            if any(term in k.lower() or term in json.dumps(v, ensure_ascii=False).lower() for term in terms)
+        }
+        print(json.dumps(filtered, ensure_ascii=False, indent=2))
+        return
+
+    rows = []
+    for asset_id, asset in sorted(assets.items()):
+        haystack = asset_id.lower() + " " + json.dumps(asset, ensure_ascii=False).lower()
+        if terms and not all(term in haystack for term in terms):
+            continue
+        category = ", ".join(asset.get("category", []))
+        entry = first_value(asset, ["stable_entrypoints", "mcp_urls"])
+        source = first_value(asset, ["source_paths", "package_paths", "project_paths", "data_paths", "config_paths"])
+        status = asset.get("status", "")
+        rows.append([asset_id, category, entry, source, status])
+
+    if not rows:
+        print(f"No assets matched: {' '.join(terms) if terms else '(none)'}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Registry: {REGISTRY}")
+    print(f"Updated:  {data.get('updated_at', 'unknown')}")
+    print()
+    table(rows)
+
+
+if __name__ == "__main__":
+    if not os.path.exists(REGISTRY):
+        print(f"Missing registry: {REGISTRY}", file=sys.stderr)
+        sys.exit(1)
+    main()

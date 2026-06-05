@@ -1,0 +1,1062 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import http.server
+import html
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import urllib.parse
+
+HOME = pathlib.Path(os.environ.get("AGENT_ASSETS_USER_HOME", str(pathlib.Path.home()))).expanduser()
+CONFIG_HOME = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config"))).expanduser()
+ASSETS_HOME = pathlib.Path(os.environ.get("AGENT_ASSETS_HOME", str(CONFIG_HOME / "agent-assets"))).expanduser()
+MCP_HOME = pathlib.Path(os.environ.get("AGENT_ASSETS_MCP_HOME", str(CONFIG_HOME / "mcp"))).expanduser()
+STABLE_BIN_DIR = pathlib.Path(os.environ.get("AGENT_ASSETS_BIN_DIR", str(HOME / ".local/bin"))).expanduser()
+PROJECTS_DIR = pathlib.Path(os.environ.get("AGENT_ASSETS_PROJECTS_DIR", str(HOME / "projects"))).expanduser()
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+
+REGISTRY = pathlib.Path(os.environ.get("AGENT_ASSETS_REGISTRY", str(ASSETS_HOME / "registry.json"))).expanduser()
+MCP_REGISTRY = pathlib.Path(os.environ.get("AGENT_ASSETS_MCP_REGISTRY", str(MCP_HOME / "registry.json"))).expanduser()
+DISCOVERED = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVERED", str(ASSETS_HOME / "discovered.json"))).expanduser()
+MCP_HEALTH_CACHE = pathlib.Path(os.environ.get("AGENT_ASSETS_MCP_HEALTH_CACHE", str(ASSETS_HOME / "mcp-health-cache.json"))).expanduser()
+OUT = pathlib.Path(os.environ.get("AGENT_ASSETS_DASHBOARD_HTML", str(ASSETS_HOME / "dashboard.html"))).expanduser()
+START_FILE = pathlib.Path(os.environ.get("AGENT_ASSETS_START_FILE", str(HOME / "AGENT_START_HERE.md"))).expanduser()
+CLAUDE = pathlib.Path(os.environ.get("AGENT_ASSETS_CLAUDE", str(STABLE_BIN_DIR / "claude"))).expanduser()
+ASSET_DISCOVER = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVER_CMD", str(STABLE_BIN_DIR / "agent-assets-discover"))).expanduser()
+if not ASSET_DISCOVER.exists():
+    repo_local_discover = SCRIPT_DIR / "agent-assets-discover"
+    legacy_discover = STABLE_BIN_DIR / "asset-discover"
+    if repo_local_discover.exists():
+        ASSET_DISCOVER = repo_local_discover
+    elif legacy_discover.exists():
+        ASSET_DISCOVER = legacy_discover
+
+
+def load_json(path):
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def h(value):
+    return html.escape(str(value), quote=True)
+
+
+def href_for_path(value):
+    path = path_part(value)
+    if not path:
+        return ""
+    return "file://" + urllib.parse.quote(str(path))
+
+
+def path_part(value):
+    if not value or not str(value).startswith("/"):
+        return None
+    raw = str(value)
+    if pathlib.Path(raw).exists() or pathlib.Path(raw).is_symlink():
+        return raw
+    for idx, char in enumerate(raw):
+        if char != ":":
+            continue
+        candidate = raw[:idx]
+        if pathlib.Path(candidate).exists() or pathlib.Path(candidate).is_symlink():
+            return candidate
+    return raw
+
+
+def path_state(value):
+    path_value = path_part(value)
+    if not path_value:
+        return "ref"
+    path = pathlib.Path(path_value)
+    if path.exists():
+        if path_value != str(value):
+            return "file-ref"
+        if path.is_dir():
+            return "dir"
+        if os.access(path, os.X_OK):
+            return "exec"
+        return "file"
+    if path.is_symlink():
+        return "broken-link"
+    return "missing"
+
+
+def chip(value, css_class=""):
+    value = str(value)
+    state = path_state(value)
+    href = href_for_path(value)
+    label = h(value)
+    state_label = h(state)
+    classes = "chip " + h(css_class)
+    if href:
+        return f'<a class="{classes}" href="{h(href)}"><span>{label}</span><b>{state_label}</b></a>'
+    return f'<span class="{classes}"><span>{label}</span><b>{state_label}</b></span>'
+
+
+def listify(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v is not None]
+    return [str(value)]
+
+
+def collect_entrypoints(agent_registry):
+    owners = {}
+    categories = {}
+    assets = agent_registry.get("assets", {})
+    for asset_id, asset in assets.items():
+        for entry in listify(asset.get("stable_entrypoints")):
+            owners.setdefault(entry, []).append(asset_id)
+            categories.setdefault(entry, set()).update(asset.get("category", []))
+
+    known = agent_registry.get("indexes", {}).get("stable_bin_dir", {}).get("current_known_agent_entrypoints", [])
+    for entry in known:
+        owners.setdefault(entry, [])
+
+    rows = []
+    for entry, owner_list in sorted(owners.items()):
+        rows.append({
+            "path": entry,
+            "state": path_state(entry),
+            "owners": sorted(owner_list),
+            "kind": entrypoint_kind(entry, categories.get(entry, set())),
+        })
+    return rows
+
+
+def entrypoint_kind(entry, categories):
+    name = pathlib.Path(entry).name
+    if str(entry).endswith(".app"):
+        return "app"
+    if name.endswith("-mcp") or "mcp" in categories:
+        return "mcp-wrapper"
+    if "agent-host" in categories:
+        return "agent-command"
+    if "dashboard" in categories:
+        return "dashboard"
+    if "package-manager" in categories or "cli-runtime" in categories:
+        return "runtime"
+    return "cli"
+
+
+def collect_skills(agent_registry):
+    roots = agent_registry.get("indexes", {}).get("skill_roots", {})
+    rows = []
+    all_files = []
+    global_identities = set()
+    for name, root in sorted(roots.items()):
+        root_path = pathlib.Path(root)
+        skill_files = []
+        if root_path.exists():
+            try:
+                skill_files = sorted(root_path.rglob("SKILL.md"), key=lambda p: str(p).lower())
+            except OSError:
+                skill_files = []
+        identity_map = {}
+        for skill_file in skill_files:
+            try:
+                identity = str(skill_file.resolve())
+            except OSError:
+                identity = str(skill_file)
+            identity_map.setdefault(identity, []).append(str(skill_file))
+            global_identities.add(identity)
+            all_files.append(str(skill_file))
+        path_count = len(skill_files)
+        unique_count = len(identity_map)
+        alias_count = path_count - unique_count
+        rows.append({
+            "name": name,
+            "root": root,
+            "count": path_count,
+            "unique_count": unique_count,
+            "alias_count": alias_count,
+            "examples": [str(p) for p in skill_files[:6]],
+            "state": path_state(root),
+        })
+    totals = {
+        "paths": len(all_files),
+        "unique": len(global_identities),
+        "aliases": len(all_files) - len(global_identities),
+    }
+    return rows, totals
+
+
+def parse_health_text(combined):
+    health = {}
+    for raw_line in combined.splitlines():
+        line = raw_line.strip()
+        if ": " not in line or " - " not in line:
+            continue
+        name = line.split(":", 1)[0].strip()
+        status = line.rsplit(" - ", 1)[-1].strip()
+        if "Connected" in status:
+            health[name] = {"state": "connected", "label": status}
+        elif "Failed" in status:
+            health[name] = {"state": "failed", "label": status}
+        else:
+            health[name] = {"state": "unknown", "label": status}
+    return health
+
+
+def cached_mcp_health(prefix):
+    if not MCP_HEALTH_CACHE.exists():
+        return {}, prefix
+    try:
+        data = load_json(MCP_HEALTH_CACHE)
+    except Exception:
+        return {}, prefix
+    raw = data.get("raw", "")
+    health = data.get("health", {})
+    updated = data.get("updated_at", "unknown")
+    return health, f"{prefix}\nShowing cached MCP health from {updated}.\n\n{raw}".strip()
+
+
+def parse_claude_mcp_health():
+    if not CLAUDE.exists():
+        return cached_mcp_health("claude command missing")
+    try:
+        proc = subprocess.run(
+            [str(CLAUDE), "mcp", "list"],
+            cwd=str(HOME),
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except subprocess.TimeoutExpired:
+        return cached_mcp_health("claude mcp list timed out after 8s")
+    except OSError as exc:
+        return cached_mcp_health(str(exc))
+
+    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    health = parse_health_text(combined)
+    try:
+        MCP_HEALTH_CACHE.write_text(
+            json.dumps(
+                {
+                    "updated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "health": health,
+                    "raw": combined.strip(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    return health, combined.strip()
+
+
+def collect_mcp(mcp_registry, health):
+    rows = []
+    for name, server in sorted(mcp_registry.get("stdio_servers", {}).items()):
+        rows.append({
+            "name": name,
+            "kind": "stdio",
+            "entry": server.get("wrapper") or server.get("underlying") or server.get("package_path") or "",
+            "hosts": listify(server.get("hosts")),
+            "state": health.get(name, {}).get("state", "registered"),
+            "health": health.get(name, {}).get("label", "registered"),
+            "note": server.get("status_note") or "",
+        })
+    for name, server in sorted(mcp_registry.get("http_servers", {}).items()):
+        rows.append({
+            "name": name,
+            "kind": "http",
+            "entry": server.get("url") or "",
+            "hosts": listify(server.get("hosts")),
+            "state": health.get(name, {}).get("state", "registered"),
+            "health": health.get(name, {}).get("label", "registered"),
+            "note": server.get("secret_location") or "",
+        })
+    for name, server in sorted(mcp_registry.get("internal_servers", {}).items()):
+        rows.append({
+            "name": name,
+            "kind": "internal",
+            "entry": server.get("command") or "",
+            "hosts": listify(server.get("host")),
+            "state": "internal",
+            "health": "internal",
+            "note": server.get("note") or "",
+        })
+    return rows
+
+
+def refresh_discovery(include_versions=False):
+    if not ASSET_DISCOVER.exists():
+        return ""
+    try:
+        command = [str(ASSET_DISCOVER)]
+        if include_versions:
+            command.append("--versions")
+        proc = subprocess.run(
+            command,
+            cwd=str(HOME),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    except Exception as exc:
+        return f"asset-discover failed: {exc}"
+
+
+def collect_discovered():
+    data = load_json(DISCOVERED)
+    return data.get("candidates", []), data.get("updated_at", "")
+
+
+def render_chips(values, css_class=""):
+    values = listify(values)
+    if not values:
+        return '<span class="muted">none</span>'
+    return "\n".join(chip(v, css_class) for v in values)
+
+
+def render_asset_cards(agent_registry):
+    cards = []
+    for asset_id, asset in sorted(agent_registry.get("assets", {}).items()):
+        categories = ", ".join(asset.get("category", [])) or "uncategorized"
+        refs = []
+        for key in ("stable_entrypoints", "mcp_urls", "config_paths", "data_paths", "source_paths", "project_paths", "skill_roots", "registries"):
+            values = listify(asset.get(key))
+            if values:
+                refs.append(f'<div class="asset-row"><strong>{h(key)}</strong><div>{render_chips(values)}</div></div>')
+        status = asset.get("status") or ""
+        cards.append(f"""
+        <article class="asset-card searchable" data-section="assets" data-text="{h(asset_id)} {h(categories)} {h(json.dumps(asset, ensure_ascii=False))}">
+          <div class="asset-head">
+            <div>
+              <h3>{h(asset_id)}</h3>
+              <p>{h(categories)}</p>
+            </div>
+            <span class="badge">{h(asset.get("category", ["asset"])[0]) if asset.get("category") else "asset"}</span>
+          </div>
+          {'<p class="status-text">' + h(status) + '</p>' if status else ''}
+          <div class="asset-refs">
+            {''.join(refs)}
+          </div>
+        </article>
+        """)
+    return "\n".join(cards)
+
+
+def state_badge(state, label=None):
+    text = label or state
+    normalized = state.replace("_", "-")
+    return f'<span class="state state-{h(normalized)}">{h(text)}</span>'
+
+
+def render_mcp_rows(rows):
+    out = []
+    for row in rows:
+        out.append(f"""
+        <tr class="searchable" data-section="mcp" data-text="{h(json.dumps(row, ensure_ascii=False))}">
+          <td><strong>{h(row["name"])}</strong><span class="subtle">{h(row["kind"])}</span></td>
+          <td>{chip(row["entry"])}</td>
+          <td>{state_badge(row["state"], row["health"])}</td>
+          <td>{render_chips(row["hosts"])}</td>
+          <td class="note-cell">{h(row["note"])}</td>
+        </tr>
+        """)
+    return "\n".join(out)
+
+
+def render_entrypoint_rows(rows):
+    out = []
+    for row in rows:
+        owner_text = ", ".join(row["owners"]) if row["owners"] else "unclaimed"
+        out.append(f"""
+        <tr class="searchable" data-section="entrypoints" data-text="{h(row["path"])} {h(owner_text)} {h(row["state"])} {h(row["kind"])}">
+          <td>{chip(row["path"])}</td>
+          <td>{state_badge(row["kind"])}</td>
+          <td>{state_badge(row["state"])}</td>
+          <td>{h(owner_text)}</td>
+        </tr>
+        """)
+    return "\n".join(out)
+
+
+def render_skill_rows(rows):
+    out = []
+    for row in rows:
+        examples = render_chips(row["examples"])
+        alias = ""
+        if row.get("alias_count"):
+            alias = f' <span class="count-pill">{row["alias_count"]} aliases</span>'
+        out.append(f"""
+        <tr class="searchable" data-section="skills" data-text="{h(json.dumps(row, ensure_ascii=False))}">
+          <td><strong>{h(row["name"])}</strong></td>
+          <td>{chip(row["root"])}</td>
+          <td>{state_badge(row["state"])} <span class="count-pill">{row["unique_count"]} unique</span> <span class="count-pill">{row["count"]} paths</span>{alias}</td>
+          <td>{examples}</td>
+        </tr>
+        """)
+    return "\n".join(out)
+
+
+def render_config_rows(agent_registry):
+    configs = []
+    configs.append(("start file", str(START_FILE)))
+    for key, value in agent_registry.get("policy", {}).items():
+        if isinstance(value, str) and value.startswith("/"):
+            configs.append((key, value))
+    for key, value in agent_registry.get("indexes", {}).get("host_configs", {}).items():
+        configs.append((key, value))
+    out = []
+    seen = set()
+    for label, value in configs:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(f"""
+        <tr class="searchable" data-section="config" data-text="{h(label)} {h(value)}">
+          <td><strong>{h(label)}</strong></td>
+          <td>{chip(value)}</td>
+          <td>{state_badge(path_state(value))}</td>
+        </tr>
+        """)
+    return "\n".join(out)
+
+
+def render_discovered_rows(rows):
+    out = []
+    for row in rows:
+        cats = ", ".join(row.get("categories", []))
+        owners = ", ".join(row.get("owners", [])) or "unregistered"
+        state = "registered" if row.get("registered") else row.get("review_status", "new")
+        version = row.get("version") or ""
+        review_bits = [state_badge(state)]
+        if row.get("review_action"):
+            review_bits.append(f'<span class="subtle">{h(row.get("review_action"))}</span>')
+        if row.get("review_note"):
+            review_bits.append(f'<span class="subtle">{h(row.get("review_note"))}</span>')
+        out.append(f"""
+        <tr class="searchable" data-section="discovered" data-text="{h(json.dumps(row, ensure_ascii=False))}">
+          <td><strong>{h(row.get("name", ""))}</strong><span class="subtle">{h(cats)}</span></td>
+          <td>{chip(row.get("path", ""))}<span class="subtle">{h(row.get("package_hint") or "")}</span></td>
+          <td>{state_badge(state)}<span class="subtle">{h(owners)}</span></td>
+          <td>{''.join(review_bits)}</td>
+          <td>{h(version)}</td>
+        </tr>
+        """)
+    return "\n".join(out)
+
+
+def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, skill_totals, health_raw, discovered_rows, discovered_at, discovery_raw, live=False):
+    asset_count = len(agent_registry.get("assets", {}))
+    mcp_connected = sum(1 for r in mcp_rows if r["state"] == "connected")
+    entry_ok = sum(1 for r in entrypoints if r["state"] in {"exec", "file", "dir"})
+    unregistered_count = sum(1 for r in discovered_rows if not r.get("registered"))
+    needs_review_count = sum(1 for r in discovered_rows if not r.get("registered") and r.get("review_status", "new") == "new")
+    deferred_count = sum(1 for r in discovered_rows if not r.get("registered") and r.get("review_status") == "defer")
+    ignored_count = sum(1 for r in discovered_rows if not r.get("registered") and r.get("review_status") == "ignore")
+    generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    live_attr = "true" if live else "false"
+    scan_disabled = "" if live else "disabled"
+    scan_hint = "Live mode: click to rescan local CLI/MCP candidates." if live else "Static file is read-only. Open the live dashboard to scan from the browser."
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Assets Dashboard</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f7f7f4;
+      --panel: #ffffff;
+      --line: #deded8;
+      --text: #1f2328;
+      --muted: #6b6f76;
+      --soft: #f0f1ed;
+      --blue: #2458d3;
+      --green: #137333;
+      --red: #b42318;
+      --amber: #996500;
+      --violet: #6f42c1;
+      --ink: #24292f;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      letter-spacing: 0;
+    }}
+    .shell {{
+      display: grid;
+      grid-template-columns: 248px minmax(0, 1fr);
+      min-height: 100vh;
+    }}
+    aside {{
+      border-right: 1px solid var(--line);
+      background: #fbfbf8;
+      padding: 22px 18px;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+    }}
+    main {{ padding: 28px 32px 60px; }}
+    h1 {{ margin: 0; font-size: 30px; line-height: 1.15; }}
+    h2 {{ margin: 28px 0 14px; font-size: 18px; }}
+    h3 {{ margin: 0; font-size: 16px; }}
+    p {{ margin: 6px 0; color: var(--muted); line-height: 1.45; }}
+    .brand {{ display: flex; gap: 10px; align-items: center; margin-bottom: 22px; }}
+    .brand-mark {{
+      width: 34px; height: 34px; border-radius: 8px;
+      background: #20242a; color: white; display: grid; place-items: center;
+      font-weight: 700;
+    }}
+    .nav button {{
+      width: 100%;
+      border: 0;
+      background: transparent;
+      padding: 10px 12px;
+      border-radius: 8px;
+      text-align: left;
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+      margin-bottom: 4px;
+    }}
+    .nav button.active {{ background: #eceee8; font-weight: 650; }}
+    .meta {{ margin-top: 20px; font-size: 12px; color: var(--muted); line-height: 1.5; }}
+    .topbar {{
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 20px;
+      margin-bottom: 20px;
+    }}
+    .search {{
+      width: min(440px, 100%);
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 11px 12px;
+      font-size: 14px;
+      outline: none;
+    }}
+    .summary {{
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0 24px;
+    }}
+    .actions {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      flex-wrap: wrap;
+      min-width: 260px;
+    }}
+    .primary-action {{
+      border: 1px solid #1d4ed8;
+      background: var(--blue);
+      color: #fff;
+      border-radius: 8px;
+      min-height: 40px;
+      padding: 0 14px;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }}
+    .primary-action:disabled {{
+      border-color: var(--line);
+      background: #e5e7eb;
+      color: var(--muted);
+      cursor: not-allowed;
+    }}
+    .scan-status {{
+      color: var(--muted);
+      font-size: 12px;
+      max-width: 320px;
+      line-height: 1.35;
+    }}
+    .metric {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }}
+    .metric b {{ display: block; font-size: 26px; margin-bottom: 4px; }}
+    .metric span {{ color: var(--muted); font-size: 13px; }}
+    .section {{ display: none; }}
+    .section.active {{ display: block; }}
+    .asset-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .asset-card {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      min-width: 0;
+    }}
+    .asset-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 10px;
+    }}
+    .badge, .state, .count-pill {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: var(--soft);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }}
+    .state-connected, .state-exec, .state-file, .state-dir, .state-file-ref {{ color: var(--green); background: #e8f2ea; }}
+    .state-failed, .state-missing, .state-broken-link {{ color: var(--red); background: #fbeaea; }}
+    .state-registered, .state-ref, .state-internal {{ color: var(--blue); background: #e9eefb; }}
+    .state-unregistered, .state-new, .state-cli-candidate, .state-agent-candidate, .state-mcp-wrapper {{ color: var(--violet); background: #f1eafb; }}
+    .state-defer {{ color: var(--amber); background: #fff5d6; }}
+    .state-ignore {{ color: var(--muted); background: #eceee8; }}
+    .state-unknown {{ color: var(--amber); background: #fff5d6; }}
+    .asset-row {{ margin: 9px 0; }}
+    .asset-row strong {{ display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }}
+    .chip {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 100%;
+      min-height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 3px 7px;
+      margin: 2px 4px 2px 0;
+      background: #fafafa;
+      color: var(--ink);
+      text-decoration: none;
+      vertical-align: top;
+      font-size: 12px;
+    }}
+    .chip span {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: min(680px, 64vw);
+    }}
+    .chip b {{ color: var(--muted); font-weight: 500; }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    th, td {{
+      text-align: left;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      font-size: 13px;
+    }}
+    th {{ background: #f3f4ef; color: var(--muted); font-weight: 650; }}
+    tr:last-child td {{ border-bottom: 0; }}
+    .subtle {{ display: block; color: var(--muted); margin-top: 4px; font-size: 12px; }}
+    .note-cell {{ color: var(--muted); max-width: 280px; }}
+    .status-text {{
+      color: var(--ink);
+      background: #f5f6f1;
+      border-radius: 7px;
+      padding: 8px 10px;
+      font-size: 13px;
+    }}
+    .empty {{
+      display: none;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+    }}
+    .raw-health {{
+      white-space: pre-wrap;
+      background: #22252a;
+      color: #f4f4f1;
+      border-radius: 8px;
+      padding: 14px;
+      font-size: 12px;
+      overflow: auto;
+    }}
+    @media (max-width: 920px) {{
+      .shell {{ grid-template-columns: 1fr; }}
+      aside {{ position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }}
+      .summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .asset-grid {{ grid-template-columns: 1fr; }}
+      .topbar {{ flex-direction: column; }}
+      main {{ padding: 20px; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <div class="brand">
+        <div class="brand-mark">AA</div>
+        <div>
+          <strong>Agent Assets</strong>
+          <p>本机工具总览</p>
+        </div>
+      </div>
+      <nav class="nav" aria-label="dashboard sections">
+        <button class="active" data-tab="overview">Overview</button>
+        <button data-tab="assets">Assets</button>
+        <button data-tab="mcp">MCP</button>
+        <button data-tab="entrypoints">Entrypoints</button>
+        <button data-tab="discovered">Discovered</button>
+        <button data-tab="skills">Skills</button>
+        <button data-tab="config">Config</button>
+      </nav>
+      <div class="meta">
+        Generated: {h(generated)}<br>
+        Registry: {h(REGISTRY)}
+      </div>
+    </aside>
+    <main>
+      <div class="topbar">
+        <div>
+          <h1>本机 Agent 资产面板</h1>
+          <p>这页把 MCP、CLI、Agent、skill、配置路径和入口状态放到一个地方。</p>
+        </div>
+        <div class="actions">
+          <input class="search" id="search" placeholder="搜索 gbrain、alice、mcp、skill、路径..." autocomplete="off">
+          <button class="primary-action" id="scanButton" data-live="{live_attr}" {scan_disabled}>一键扫描</button>
+          <span class="scan-status" id="scanStatus">{h(scan_hint)}</span>
+        </div>
+      </div>
+
+      <section class="section active" data-section="overview">
+        <div class="summary">
+          <div class="metric"><b>{asset_count}</b><span>registered assets</span></div>
+          <div class="metric"><b>{mcp_connected}/{len(mcp_rows)}</b><span>MCP connected</span></div>
+          <div class="metric"><b>{entry_ok}/{len(entrypoints)}</b><span>valid entrypoints</span></div>
+          <div class="metric"><b>{needs_review_count}</b><span>needs review ({unregistered_count} unregistered)</span></div>
+          <div class="metric"><b>{skill_totals.get("unique", 0)}</b><span>unique skills ({skill_totals.get("paths", 0)} paths)</span></div>
+        </div>
+        <h2>给新 Agent 的一句话</h2>
+        <table>
+          <tbody>
+            <tr>
+              <td><strong>Start file</strong></td>
+              <td>{chip(str(START_FILE))}</td>
+            </tr>
+            <tr>
+              <td><strong>Tell any agent</strong></td>
+              <td>Read <code>{h(START_FILE)}</code> first, then follow the local agent-assets rules.</td>
+            </tr>
+          </tbody>
+        </table>
+        <h2>Claude MCP Health</h2>
+        <pre class="raw-health">{h(health_raw or "No health output captured.")}</pre>
+        <h2>Discovery</h2>
+        <table>
+          <tbody>
+            <tr><td><strong>Last scan</strong></td><td>{h(discovered_at or "not scanned")}</td></tr>
+            <tr><td><strong>Summary</strong></td><td><pre class="raw-health">{h(discovery_raw or "No discovery output captured.")}</pre></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section" data-section="assets">
+        <h2>Registered Assets</h2>
+        <div class="asset-grid">{render_asset_cards(agent_registry)}</div>
+        <div class="empty">没有匹配的资产。</div>
+      </section>
+
+      <section class="section" data-section="mcp">
+        <h2>MCP Servers</h2>
+        <table>
+          <thead><tr><th>Name</th><th>Entry / URL</th><th>Health</th><th>Hosts</th><th>Note</th></tr></thead>
+          <tbody>{render_mcp_rows(mcp_rows)}</tbody>
+        </table>
+        <div class="empty">没有匹配的 MCP。</div>
+      </section>
+
+      <section class="section" data-section="entrypoints">
+        <h2>Stable Entrypoints</h2>
+        <table>
+          <thead><tr><th>Path</th><th>Kind</th><th>State</th><th>Owners</th></tr></thead>
+          <tbody>{render_entrypoint_rows(entrypoints)}</tbody>
+        </table>
+        <div class="empty">没有匹配的入口。</div>
+      </section>
+
+      <section class="section" data-section="discovered">
+        <h2>Discovered CLI / Agent Candidates</h2>
+        <p>自动扫描常见入口目录。new 需要处理；defer 是先放着；ignore 是明确噪声。</p>
+        <p>当前：{needs_review_count} new / {deferred_count} deferred / {ignored_count} ignored / {unregistered_count} unregistered total。</p>
+        <table>
+          <thead><tr><th>Name</th><th>Path</th><th>Registry</th><th>Review</th><th>Version</th></tr></thead>
+          <tbody>{render_discovered_rows(discovered_rows)}</tbody>
+        </table>
+        <div class="empty">没有匹配的候选项。</div>
+      </section>
+
+      <section class="section" data-section="skills">
+        <h2>Skill Roots</h2>
+        <p>这里同时显示真实去重数量和路径数量。Finder 里的“替身”通常是 symlink，会让路径数量高于真实技能数量。</p>
+        <table>
+          <thead><tr><th>Root</th><th>Path</th><th>Count</th><th>Examples</th></tr></thead>
+          <tbody>{render_skill_rows(skill_rows)}</tbody>
+        </table>
+        <div class="empty">没有匹配的 skill。</div>
+      </section>
+
+      <section class="section" data-section="config">
+        <h2>Config / Rules</h2>
+        <table>
+          <thead><tr><th>Name</th><th>Path</th><th>State</th></tr></thead>
+          <tbody>{render_config_rows(agent_registry)}</tbody>
+        </table>
+        <div class="empty">没有匹配的配置。</div>
+      </section>
+    </main>
+  </div>
+  <script>
+    const buttons = Array.from(document.querySelectorAll("[data-tab]"));
+    const sections = Array.from(document.querySelectorAll(".section"));
+    const search = document.getElementById("search");
+    const scanButton = document.getElementById("scanButton");
+    const scanStatus = document.getElementById("scanStatus");
+
+    function activate(tab) {{
+      buttons.forEach((button) => button.classList.toggle("active", button.dataset.tab === tab));
+      sections.forEach((section) => section.classList.toggle("active", section.dataset.section === tab));
+      filter();
+    }}
+
+    function filter() {{
+      const active = document.querySelector(".section.active");
+      if (!active) return;
+      const query = (search.value || "").trim().toLowerCase();
+      const items = Array.from(active.querySelectorAll(".searchable"));
+      let visible = 0;
+      items.forEach((item) => {{
+        const text = (item.dataset.text || item.textContent || "").toLowerCase();
+        const show = !query || text.includes(query);
+        item.style.display = show ? "" : "none";
+        if (show) visible += 1;
+      }});
+      const empty = active.querySelector(".empty");
+      if (empty) empty.style.display = items.length && !visible ? "block" : "none";
+    }}
+
+    buttons.forEach((button) => button.addEventListener("click", () => activate(button.dataset.tab)));
+    search.addEventListener("input", filter);
+    if (scanButton && scanButton.dataset.live === "true") {{
+      scanButton.addEventListener("click", async () => {{
+        scanButton.disabled = true;
+        scanStatus.textContent = "正在扫描本机入口、刷新 MCP 状态...";
+        try {{
+          const response = await fetch("/api/scan", {{ method: "POST" }});
+          if (!response.ok) throw new Error(await response.text());
+          const result = await response.json();
+          scanStatus.textContent = `扫描完成：${{result.candidates}} 个候选，${{result.unregistered}} 个未登记。正在刷新页面...`;
+          setTimeout(() => window.location.reload(), 450);
+        }} catch (error) {{
+          scanStatus.textContent = `扫描失败：${{error.message || error}}`;
+          scanButton.disabled = false;
+        }}
+      }});
+    }}
+    if (location.hash) {{
+      const tab = location.hash.slice(1);
+      if (buttons.some((button) => button.dataset.tab === tab)) activate(tab);
+    }}
+  </script>
+</body>
+</html>
+"""
+
+
+def build_dashboard(run_discovery=True, refresh_mcp=True, live=False):
+    agent_registry = load_json(REGISTRY)
+    mcp_registry = load_json(MCP_REGISTRY)
+    discovery_raw = refresh_discovery() if run_discovery else ""
+    discovered_rows, discovered_at = collect_discovered()
+    if refresh_mcp:
+        health, health_raw = parse_claude_mcp_health()
+    else:
+        health, health_raw = cached_mcp_health("MCP health cache. Click one-key scan to refresh.")
+    mcp_rows = collect_mcp(mcp_registry, health)
+    entrypoints = collect_entrypoints(agent_registry)
+    skill_rows, skill_totals = collect_skills(agent_registry)
+    html_text = build_html(
+        agent_registry,
+        mcp_registry,
+        mcp_rows,
+        entrypoints,
+        skill_rows,
+        skill_totals,
+        health_raw,
+        discovered_rows,
+        discovered_at,
+        discovery_raw,
+        live=live,
+    )
+    summary = {
+        "assets": len(agent_registry.get("assets", {})),
+        "mcp_total": len(mcp_rows),
+        "mcp_connected": sum(1 for row in mcp_rows if row["state"] == "connected"),
+        "entrypoints": len(entrypoints),
+        "valid_entrypoints": sum(1 for row in entrypoints if row["state"] in {"exec", "file", "dir"}),
+        "candidates": len(discovered_rows),
+        "unregistered": sum(1 for row in discovered_rows if not row.get("registered")),
+        "needs_review": sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status", "new") == "new"),
+        "deferred": sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status") == "defer"),
+        "ignored": sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status") == "ignore"),
+        "skills_unique": skill_totals.get("unique", 0),
+        "skills_paths": skill_totals.get("paths", 0),
+        "skills_aliases": skill_totals.get("aliases", 0),
+        "discovered_at": discovered_at,
+    }
+    return html_text, summary
+
+
+def write_dashboard(run_discovery=True, refresh_mcp=True, live=False):
+    html_text, summary = build_dashboard(run_discovery=run_discovery, refresh_mcp=refresh_mcp, live=live)
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(html_text, encoding="utf-8")
+    return summary
+
+
+def run_scan(include_versions=False):
+    discovery_raw = refresh_discovery(include_versions=include_versions)
+    discovered_rows, discovered_at = collect_discovered()
+    mcp_registry = load_json(MCP_REGISTRY)
+    health, health_raw = parse_claude_mcp_health()
+    mcp_rows = collect_mcp(mcp_registry, health)
+    write_dashboard(run_discovery=False, refresh_mcp=False, live=False)
+    return {
+        "ok": True,
+        "updated_at": discovered_at,
+        "candidates": len(discovered_rows),
+        "unregistered": sum(1 for row in discovered_rows if not row.get("registered")),
+        "needs_review": sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status", "new") == "new"),
+        "deferred": sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status") == "defer"),
+        "ignored": sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status") == "ignore"),
+        "mcp_total": len(mcp_rows),
+        "mcp_connected": sum(1 for row in mcp_rows if row["state"] == "connected"),
+        "discovery_output": discovery_raw,
+        "mcp_output": health_raw,
+    }
+
+
+class DashboardHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "AgentAssetsDashboard/1.0"
+
+    def send_text(self, text, content_type="text/plain; charset=utf-8", status=200, include_body=True):
+        data = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if include_body:
+            self.wfile.write(data)
+
+    def send_json(self, payload, status=200):
+        self.send_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", "application/json; charset=utf-8", status)
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in {"/", "/dashboard.html"}:
+            html_text, _summary = build_dashboard(run_discovery=False, refresh_mcp=False, live=True)
+            self.send_text(html_text, "text/html; charset=utf-8")
+            return
+        if parsed.path == "/favicon.ico":
+            self.send_text("", "image/x-icon", status=204)
+            return
+        if parsed.path == "/api/status":
+            _html_text, summary = build_dashboard(run_discovery=False, refresh_mcp=False, live=True)
+            self.send_json(summary)
+            return
+        self.send_json({"ok": False, "error": "not found"}, status=404)
+
+    def do_HEAD(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in {"/", "/dashboard.html"}:
+            html_text, _summary = build_dashboard(run_discovery=False, refresh_mcp=False, live=True)
+            self.send_text(html_text, "text/html; charset=utf-8", include_body=False)
+            return
+        if parsed.path == "/api/status":
+            _html_text, summary = build_dashboard(run_discovery=False, refresh_mcp=False, live=True)
+            self.send_text(json.dumps(summary, ensure_ascii=False) + "\n", "application/json; charset=utf-8", include_body=False)
+            return
+        self.send_text("", status=404, include_body=False)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/scan":
+            query = urllib.parse.parse_qs(parsed.query)
+            include_versions = query.get("versions", ["0"])[0] in {"1", "true", "yes"}
+            try:
+                self.send_json(run_scan(include_versions=include_versions))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        self.send_json({"ok": False, "error": "not found"}, status=404)
+
+    def log_message(self, format, *args):
+        sys.stderr.write("asset-dashboard: " + (format % args) + "\n")
+
+
+def serve_dashboard(port, open_browser=False):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), DashboardHandler)
+    url = f"http://127.0.0.1:{port}/"
+    write_dashboard(run_discovery=True, refresh_mcp=False, live=False)
+    print(url)
+    if open_browser:
+        subprocess.run(["/usr/bin/open", url], check=False)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate or serve the local Agent Assets dashboard.")
+    parser.add_argument("--open", action="store_true", help="Open the generated dashboard in the default browser")
+    parser.add_argument("--serve", action="store_true", help="Run a local dashboard server with one-click scan support")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("AGENT_ASSETS_PORT", "17654")), help="Local dashboard server port")
+    args = parser.parse_args()
+
+    if args.serve:
+        serve_dashboard(args.port, open_browser=args.open)
+        return
+
+    write_dashboard(run_discovery=True, refresh_mcp=True, live=False)
+    print(str(OUT))
+
+    if args.open:
+        subprocess.run(["/usr/bin/open", str(OUT)], check=False)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"asset-dashboard failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)

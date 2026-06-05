@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+import json
+import os
+import argparse
+import pathlib
+import re
+import subprocess
+import time
+
+HOME = pathlib.Path(os.environ.get("AGENT_ASSETS_USER_HOME", str(pathlib.Path.home()))).expanduser()
+CONFIG_HOME = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config"))).expanduser()
+ASSETS_HOME = pathlib.Path(os.environ.get("AGENT_ASSETS_HOME", str(CONFIG_HOME / "agent-assets"))).expanduser()
+STABLE_BIN_DIR = pathlib.Path(os.environ.get("AGENT_ASSETS_BIN_DIR", str(HOME / ".local/bin"))).expanduser()
+
+REGISTRY = pathlib.Path(os.environ.get("AGENT_ASSETS_REGISTRY", str(ASSETS_HOME / "registry.json"))).expanduser()
+OUT = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVERED", str(ASSETS_HOME / "discovered.json"))).expanduser()
+REVIEW = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVERY_REVIEW", str(ASSETS_HOME / "discovery-review.json"))).expanduser()
+
+DEFAULT_SCAN_DIRS = [
+    str(STABLE_BIN_DIR),
+    str(HOME / ".npm-global/bin"),
+    str(HOME / ".bun/bin"),
+    str(HOME / ".opencode/bin"),
+    str(HOME / ".cherrystudio/bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+]
+
+SCAN_DIRS = [
+    item
+    for item in os.environ.get("AGENT_ASSETS_SCAN_DIRS", os.pathsep.join(DEFAULT_SCAN_DIRS)).split(os.pathsep)
+    if item
+]
+
+AGENTISH = re.compile(
+    r"(agent|alice|boss|brain|claude|claw|codex|cursor|feishu|gemini|gbrain|hermes|kimi|lark|mcp|open|opencode|skill|workbuddy)",
+    re.IGNORECASE,
+)
+
+SKIP_NAMES = {
+    "python",
+    "python3",
+    "python3.11",
+    "python3.14",
+    "pip",
+    "pip3",
+    "pip3.14",
+    "npm",
+    "npx",
+    "node",
+    "bun",
+}
+
+
+def load_registry():
+    if not REGISTRY.exists():
+        return {}
+    with REGISTRY.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_review():
+    if not REVIEW.exists():
+        return {}
+    with REVIEW.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def collect_registered(registry):
+    registered = {}
+    names = {}
+    for asset_id, asset in registry.get("assets", {}).items():
+        for entry in asset.get("stable_entrypoints", []) or []:
+            registered.setdefault(entry, []).append(asset_id)
+            names.setdefault(pathlib.Path(entry).name, []).append(asset_id)
+            try:
+                resolved = str(pathlib.Path(entry).resolve())
+                registered.setdefault(resolved, []).append(asset_id)
+            except OSError:
+                pass
+    return registered, names
+
+
+def is_executable(path):
+    try:
+        return path.exists() and os.access(path, os.X_OK) and not path.is_dir()
+    except OSError:
+        return False
+
+
+def include_candidate(path):
+    name = path.name
+    if name in SKIP_NAMES:
+        return False
+    raw = str(path)
+    stable_prefix = str(STABLE_BIN_DIR) + "/"
+    npm_prefix = str(HOME / ".npm-global/bin") + "/"
+    bun_prefix = str(HOME / ".bun/bin") + "/"
+    if raw.startswith(stable_prefix):
+        return True
+    if raw.startswith(npm_prefix):
+        return True
+    if raw.startswith(bun_prefix) and AGENTISH.search(name):
+        return True
+    if AGENTISH.search(name):
+        return True
+    return False
+
+
+def classify(path, owners):
+    name = path.name
+    cats = []
+    if str(path).endswith(".app"):
+        cats.append("agent-app")
+    if name.endswith("-mcp") or "mcp" in name.lower():
+        cats.append("mcp-wrapper")
+    if re.search(r"(claude|codex|cursor|alice|opencode|openclaw|workbuddy)", name, re.I):
+        cats.append("agent-candidate")
+    if "skill" in name.lower():
+        cats.append("skill-helper")
+    if not cats:
+        cats.append("cli-candidate")
+    if owners:
+        cats.append("registered")
+    else:
+        cats.append("unregistered")
+    return cats
+
+
+def detect_version(path):
+    try:
+        proc = subprocess.run(
+            [str(path), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            cwd=str(HOME),
+        )
+    except Exception:
+        return None
+    text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    if not text:
+        return None
+    first = text.splitlines()[0].strip()
+    return first[:120]
+
+
+def package_hint(path):
+    try:
+        resolved = pathlib.Path(path).resolve()
+    except OSError:
+        resolved = path
+    parts = resolved.parts
+    for idx, part in enumerate(parts):
+        if part == "node_modules" and idx + 1 < len(parts):
+            if parts[idx + 1].startswith("@") and idx + 2 < len(parts):
+                return "/".join(parts[idx + 1 : idx + 3])
+            return parts[idx + 1]
+        if part == "site-packages" and idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
+
+
+def scan(include_versions=False):
+    registry = load_registry()
+    review = load_review()
+    registered, registered_names = collect_registered(registry)
+    rows = []
+    seen = set()
+    for directory in SCAN_DIRS:
+        root = pathlib.Path(directory)
+        if not root.exists():
+            continue
+        try:
+            entries = sorted(root.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+        for path in entries:
+            if not include_candidate(path):
+                continue
+            if not is_executable(path):
+                continue
+            raw = str(path)
+            try:
+                resolved = str(path.resolve())
+            except OSError:
+                resolved = raw
+            key = (raw, resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            owners = sorted(set(registered.get(raw, []) + registered.get(resolved, [])))
+            covered_by_same_command = False
+            if not owners and path.name in registered_names:
+                owners = sorted(set(registered_names[path.name]))
+                covered_by_same_command = True
+            row = {
+                "name": path.name,
+                "path": raw,
+                "resolved_path": resolved,
+                "registered": bool(owners),
+                "covered_by_same_command": covered_by_same_command,
+                "owners": owners,
+                "categories": classify(path, owners),
+                "package_hint": package_hint(path),
+                "version": detect_version(path) if include_versions else None,
+            }
+            apply_review(row, review)
+            rows.append(row)
+    rows.sort(key=lambda r: (review_sort(r), r["name"].lower(), r["path"]))
+    return {
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "scan_dirs": SCAN_DIRS,
+        "review_file": str(REVIEW),
+        "candidates": rows,
+    }
+
+
+def apply_review(row, review):
+    entry = (review.get("paths") or {}).get(row["path"]) or (review.get("names") or {}).get(row["name"]) or {}
+    if row["registered"]:
+        status = "registered"
+    else:
+        status = entry.get("status") or "new"
+    row["review_status"] = status
+    row["review_note"] = entry.get("note") or ""
+    row["review_action"] = entry.get("action") or ""
+    row["review_owner"] = entry.get("owner") or ""
+    tag = f"review-{status}"
+    if tag not in row["categories"]:
+        row["categories"].append(tag)
+
+
+def review_sort(row):
+    order = {
+        "new": 0,
+        "defer": 1,
+        "ignore": 2,
+        "registered": 3,
+    }
+    return order.get(row.get("review_status"), 9)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Discover local agent-facing CLI/MCP/Agent executable candidates.")
+    parser.add_argument("--versions", action="store_true", help="Run each candidate with --version. Slower.")
+    args = parser.parse_args()
+
+    result = scan(include_versions=args.versions)
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    tmp = OUT.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(OUT)
+    print(str(OUT))
+    unregistered = [r for r in result["candidates"] if not r["registered"]]
+    needs_review = [r for r in unregistered if r.get("review_status") == "new"]
+    deferred = [r for r in unregistered if r.get("review_status") == "defer"]
+    ignored = [r for r in unregistered if r.get("review_status") == "ignore"]
+    print(f"candidates={len(result['candidates'])} unregistered={len(unregistered)} needs_review={len(needs_review)} deferred={len(deferred)} ignored={len(ignored)}")
+    for row in needs_review[:40]:
+        print(f"- {row['name']}: {row['path']} ({', '.join(row['categories'])})")
+
+
+if __name__ == "__main__":
+    main()

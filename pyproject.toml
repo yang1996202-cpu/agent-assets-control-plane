@@ -1,0 +1,7 @@
+[project]
+name = "agent-assets-control-plane"
+version = "0.1.0"
+description = "Local control plane for AI-agent-facing CLIs, MCPs, skills, and host configs."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }

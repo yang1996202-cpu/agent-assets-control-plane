@@ -1,0 +1,7 @@
+{
+  "updated_at": "bootstrap",
+  "purpose": "Review decisions for auto-discovered executable candidates. ignored items remain visible as known noise but do not count as needs-review.",
+  "paths": {},
+  "names": {}
+}
+

@@ -1,0 +1,45 @@
+{
+  "updated_at": "bootstrap",
+  "owner": "local-user",
+  "purpose": "Local registry for AI-agent-facing CLIs, MCPs, agent apps, skill roots, downloaded tools, and host configs.",
+  "policy": {
+    "stable_entrypoint_dir": "__BIN_DIR__",
+    "durable_projects_dir": "__PROJECTS_DIR__",
+    "no_secrets": true
+  },
+  "indexes": {
+    "stable_bin_dir": {
+      "path": "__BIN_DIR__",
+      "current_known_agent_entrypoints": []
+    },
+    "skill_roots": {},
+    "host_configs": {}
+  },
+  "assets": {
+    "agent-assets-control-plane": {
+      "category": [
+        "registry",
+        "dashboard",
+        "local-agent-contract"
+      ],
+      "stable_entrypoints": [
+        "__BIN_DIR__/agent-assets-dashboard",
+        "__BIN_DIR__/agent-assets-discover",
+        "__BIN_DIR__/agent-assets-register",
+        "__BIN_DIR__/agent-assets-list",
+        "__BIN_DIR__/agent-assets-contract"
+      ],
+      "config_paths": [
+        "__ASSETS_HOME__/README.md",
+        "__ASSETS_HOME__/AGENT_CONTRACT.md",
+        "__ASSETS_HOME__/registry.json",
+        "__ASSETS_HOME__/discovery-review.json",
+        "__HOME__/AGENT_START_HERE.md"
+      ],
+      "notes": [
+        "Bootstrap entry for the local agent assets control plane."
+      ]
+    }
+  }
+}
+
