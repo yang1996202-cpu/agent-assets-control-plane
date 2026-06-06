@@ -16,7 +16,7 @@ REGISTRY = pathlib.Path(os.environ.get("AGENT_ASSETS_REGISTRY", str(ASSETS_HOME 
 OUT = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVERED", str(ASSETS_HOME / "discovered.json"))).expanduser()
 REVIEW = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVERY_REVIEW", str(ASSETS_HOME / "discovery-review.json"))).expanduser()
 
-DEFAULT_SCAN_DIRS = [
+DEFAULT_DAILY_SCAN_DIRS = [
     str(STABLE_BIN_DIR),
     str(HOME / ".npm-global/bin"),
     str(HOME / ".bun/bin"),
@@ -26,9 +26,27 @@ DEFAULT_SCAN_DIRS = [
     "/usr/local/bin",
 ]
 
+DEFAULT_DEEP_EXTRA_DIRS = [
+    "/Applications",
+    str(HOME / "Applications"),
+    str(HOME / ".workbuddy/bin"),
+    str(HOME / ".codebuddy/bin"),
+    str(HOME / ".hermes/bin"),
+    str(HOME / ".cola/bin"),
+    str(HOME / ".cursor/bin"),
+    str(HOME / ".claude/local"),
+    str(HOME / ".codex/bin"),
+]
+
 SCAN_DIRS = [
     item
-    for item in os.environ.get("AGENT_ASSETS_SCAN_DIRS", os.pathsep.join(DEFAULT_SCAN_DIRS)).split(os.pathsep)
+    for item in os.environ.get("AGENT_ASSETS_SCAN_DIRS", os.pathsep.join(DEFAULT_DAILY_SCAN_DIRS)).split(os.pathsep)
+    if item
+]
+
+DEEP_EXTRA_DIRS = [
+    item
+    for item in os.environ.get("AGENT_ASSETS_DEEP_SCAN_DIRS", os.pathsep.join(DEFAULT_DEEP_EXTRA_DIRS)).split(os.pathsep)
     if item
 ]
 
@@ -81,8 +99,23 @@ def collect_registered(registry):
     return registered, names
 
 
+def scan_dirs(mode):
+    dirs = list(SCAN_DIRS)
+    if mode == "deep":
+        dirs.extend(DEEP_EXTRA_DIRS)
+    seen = set()
+    out = []
+    for item in dirs:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 def is_executable(path):
     try:
+        if str(path).endswith(".app"):
+            return path.exists() and path.is_dir()
         return path.exists() and os.access(path, os.X_OK) and not path.is_dir()
     except OSError:
         return False
@@ -161,13 +194,14 @@ def package_hint(path):
     return None
 
 
-def scan(include_versions=False):
+def scan(include_versions=False, mode="daily"):
     registry = load_registry()
     review = load_review()
     registered, registered_names = collect_registered(registry)
     rows = []
     seen = set()
-    for directory in SCAN_DIRS:
+    active_scan_dirs = scan_dirs(mode)
+    for directory in active_scan_dirs:
         root = pathlib.Path(directory)
         if not root.exists():
             continue
@@ -198,6 +232,7 @@ def scan(include_versions=False):
                 "name": path.name,
                 "path": raw,
                 "resolved_path": resolved,
+                "scan_mode": mode,
                 "registered": bool(owners),
                 "covered_by_same_command": covered_by_same_command,
                 "owners": owners,
@@ -210,7 +245,8 @@ def scan(include_versions=False):
     rows.sort(key=lambda r: (review_sort(r), r["name"].lower(), r["path"]))
     return {
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "scan_dirs": SCAN_DIRS,
+        "scan_mode": mode,
+        "scan_dirs": active_scan_dirs,
         "review_file": str(REVIEW),
         "candidates": rows,
     }
@@ -243,10 +279,11 @@ def review_sort(row):
 
 def main():
     parser = argparse.ArgumentParser(description="Discover local agent-facing CLI/MCP/Agent executable candidates.")
+    parser.add_argument("--mode", choices=["daily", "deep"], default="daily", help="daily scans low-noise trusted entry dirs; deep adds common Agent/app audit dirs.")
     parser.add_argument("--versions", action="store_true", help="Run each candidate with --version. Slower.")
     args = parser.parse_args()
 
-    result = scan(include_versions=args.versions)
+    result = scan(include_versions=args.versions, mode=args.mode)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     tmp = OUT.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -256,7 +293,7 @@ def main():
     needs_review = [r for r in unregistered if r.get("review_status") == "new"]
     deferred = [r for r in unregistered if r.get("review_status") == "defer"]
     ignored = [r for r in unregistered if r.get("review_status") == "ignore"]
-    print(f"candidates={len(result['candidates'])} unregistered={len(unregistered)} needs_review={len(needs_review)} deferred={len(deferred)} ignored={len(ignored)}")
+    print(f"mode={args.mode} candidates={len(result['candidates'])} unregistered={len(unregistered)} needs_review={len(needs_review)} deferred={len(deferred)} ignored={len(ignored)}")
     for row in needs_review[:40]:
         print(f"- {row['name']}: {row['path']} ({', '.join(row['categories'])})")
 
