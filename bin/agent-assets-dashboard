@@ -586,6 +586,13 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       flex-wrap: wrap;
       min-width: 260px;
     }}
+    .scan-action {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .scan-action[hidden] {{ display: none; }}
     .primary-action {{
       border: 1px solid #1d4ed8;
       background: var(--blue);
@@ -761,13 +768,15 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
     <main>
       <div class="topbar">
         <div>
-          <h1>本机 Agent 资产面板</h1>
-          <p>这页把 MCP、CLI、Agent、skill、配置路径和入口状态放到一个地方。</p>
+          <h1 id="pageTitle">总览</h1>
+          <p id="pageSubtitle">看现在整体是否健康：资产数、MCP 连接、稳定入口、待处理扫描项和技能数量。</p>
         </div>
         <div class="actions">
           <input class="search" id="search" placeholder="搜索 gbrain、alice、mcp、skill、路径..." autocomplete="off">
-          <button class="primary-action" id="scanButton" data-live="{live_attr}" {scan_disabled}>刷新扫描</button>
-          <span class="scan-status" id="scanStatus">{h(scan_hint)}</span>
+          <div class="scan-action" id="scanAction">
+            <button class="primary-action" id="scanButton" data-live="{live_attr}" {scan_disabled}>刷新扫描</button>
+            <span class="scan-status" id="scanStatus">{h(scan_hint)}</span>
+          </div>
         </div>
       </div>
 
@@ -805,12 +814,14 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
 
       <section class="section" data-section="assets">
         <h2>正式资产</h2>
+        <p>这里是已经纳入总账的工具、Agent 应用、MCP、项目和数据目录；Agent 应优先信这里，而不是临场乱翻 dotdir。</p>
         <div class="asset-grid">{render_asset_cards(agent_registry)}</div>
         <div class="empty">没有匹配的资产。</div>
       </section>
 
       <section class="section" data-section="mcp">
         <h2>MCP 服务</h2>
+        <p>这里看 MCP 服务本身、入口或 URL、连接状态，以及哪些宿主配置正在引用它。</p>
         <table>
           <thead><tr><th>名称</th><th>入口 / URL</th><th>健康状态</th><th>宿主</th><th>备注</th></tr></thead>
           <tbody>{render_mcp_rows(mcp_rows)}</tbody>
@@ -820,6 +831,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
 
       <section class="section" data-section="entrypoints">
         <h2>稳定入口</h2>
+        <p>这里是 Agent 真正应该调用的命令入口，重点看路径是否存在、类型是否正确、归属到哪个资产。</p>
         <table>
           <thead><tr><th>路径</th><th>类型</th><th>状态</th><th>归属资产</th></tr></thead>
           <tbody>{render_entrypoint_rows(entrypoints)}</tbody>
@@ -850,6 +862,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
 
       <section class="section" data-section="config">
         <h2>配置 / 规则</h2>
+        <p>这里列出本机 Agent 资产规范、MCP 总账、宿主配置和启动文件，方便排查“规则到底写在哪里”。</p>
         <table>
           <thead><tr><th>名称</th><th>路径</th><th>状态</th></tr></thead>
           <tbody>{render_config_rows(agent_registry)}</tbody>
@@ -862,12 +875,50 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
     const buttons = Array.from(document.querySelectorAll("[data-tab]"));
     const sections = Array.from(document.querySelectorAll(".section"));
     const search = document.getElementById("search");
+    const pageTitle = document.getElementById("pageTitle");
+    const pageSubtitle = document.getElementById("pageSubtitle");
+    const scanAction = document.getElementById("scanAction");
     const scanButton = document.getElementById("scanButton");
     const scanStatus = document.getElementById("scanStatus");
+    const tabCopy = {{
+      overview: {{
+        title: "总览",
+        subtitle: "看现在整体是否健康：资产数、MCP 连接、稳定入口、待处理扫描项和技能数量。"
+      }},
+      assets: {{
+        title: "资产",
+        subtitle: "正式登记过的本机 Agent 资产；这里回答“这个工具归谁、入口在哪、配置在哪”。"
+      }},
+      mcp: {{
+        title: "MCP",
+        subtitle: "集中查看 MCP 服务入口、连接状态和宿主引用，判断 Claude Code、Codex 等能不能用。"
+      }},
+      entrypoints: {{
+        title: "入口",
+        subtitle: "Agent 应该调用的稳定命令和 wrapper；这里专门排查 PATH、坏链、归属不清。"
+      }},
+      discovered: {{
+        title: "发现",
+        subtitle: "从可信目录扫描出的 CLI / Agent 候选项，用来抓漏登记、误忽略和新的路径盲区。"
+      }},
+      skills: {{
+        title: "技能",
+        subtitle: "统计本机 skill 根目录、真实去重数量和路径数量，解释 Finder 里替身为什么看起来很多。"
+      }},
+      config: {{
+        title: "配置",
+        subtitle: "本机规则、总账、宿主配置和启动文件的位置；新 Agent 接入时先从这里找源头。"
+      }}
+    }};
+    const scanTabs = new Set(["overview", "discovered"]);
 
     function activate(tab) {{
       buttons.forEach((button) => button.classList.toggle("active", button.dataset.tab === tab));
       sections.forEach((section) => section.classList.toggle("active", section.dataset.section === tab));
+      const copy = tabCopy[tab] || tabCopy.overview;
+      if (pageTitle) pageTitle.textContent = copy.title;
+      if (pageSubtitle) pageSubtitle.textContent = copy.subtitle;
+      if (scanAction) scanAction.hidden = !scanTabs.has(tab);
       filter();
     }}
 
