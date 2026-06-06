@@ -33,7 +33,7 @@ SCAN_DIRS = [
 ]
 
 AGENTISH = re.compile(
-    r"(agent|alice|boss|brain|claude|claw|codex|cursor|feishu|gemini|gbrain|hermes|kimi|lark|mcp|open|opencode|skill|workbuddy)",
+    r"(^gh$|github|agent|alice|boss|brain|claude|claw|codex|cursor|feishu|gemini|gbrain|hermes|kimi|lark|mcp|open|opencode|skill|workbuddy)",
     re.IGNORECASE,
 )
 

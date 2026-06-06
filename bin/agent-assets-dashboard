@@ -316,14 +316,14 @@ def collect_discovered():
 def render_chips(values, css_class=""):
     values = listify(values)
     if not values:
-        return '<span class="muted">none</span>'
+        return '<span class="muted">无</span>'
     return "\n".join(chip(v, css_class) for v in values)
 
 
 def render_asset_cards(agent_registry):
     cards = []
     for asset_id, asset in sorted(agent_registry.get("assets", {}).items()):
-        categories = ", ".join(asset.get("category", [])) or "uncategorized"
+        categories = ", ".join(asset.get("category", [])) or "未分类"
         refs = []
         for key in ("stable_entrypoints", "mcp_urls", "config_paths", "data_paths", "source_paths", "project_paths", "skill_roots", "registries"):
             values = listify(asset.get(key))
@@ -337,7 +337,7 @@ def render_asset_cards(agent_registry):
               <h3>{h(asset_id)}</h3>
               <p>{h(categories)}</p>
             </div>
-            <span class="badge">{h(asset.get("category", ["asset"])[0]) if asset.get("category") else "asset"}</span>
+            <span class="badge">{h(asset.get("category", ["资产"])[0]) if asset.get("category") else "资产"}</span>
           </div>
           {'<p class="status-text">' + h(status) + '</p>' if status else ''}
           <div class="asset-refs">
@@ -349,7 +349,31 @@ def render_asset_cards(agent_registry):
 
 
 def state_badge(state, label=None):
-    text = label or state
+    state_labels = {
+        "registered": "已登记",
+        "connected": "已连接",
+        "failed": "失败",
+        "unknown": "未知",
+        "internal": "内部",
+        "exec": "可执行",
+        "file": "文件",
+        "dir": "目录",
+        "file-ref": "文件引用",
+        "ref": "引用",
+        "missing": "缺失",
+        "broken-link": "坏链",
+        "new": "待处理",
+        "defer": "稍后处理",
+        "ignore": "已忽略",
+        "app": "应用",
+        "mcp-wrapper": "MCP 包装器",
+        "agent-command": "Agent 命令",
+        "dashboard": "面板",
+        "runtime": "运行时",
+        "cli": "CLI",
+    }
+    raw_text = label or state
+    text = state_labels.get(raw_text, state_labels.get(state, raw_text))
     normalized = state.replace("_", "-")
     return f'<span class="state state-{h(normalized)}">{h(text)}</span>'
 
@@ -372,7 +396,7 @@ def render_mcp_rows(rows):
 def render_entrypoint_rows(rows):
     out = []
     for row in rows:
-        owner_text = ", ".join(row["owners"]) if row["owners"] else "unclaimed"
+        owner_text = ", ".join(row["owners"]) if row["owners"] else "未登记归属"
         out.append(f"""
         <tr class="searchable" data-section="entrypoints" data-text="{h(row["path"])} {h(owner_text)} {h(row["state"])} {h(row["kind"])}">
           <td>{chip(row["path"])}</td>
@@ -461,13 +485,13 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     live_attr = "true" if live else "false"
     scan_disabled = "" if live else "disabled"
-    scan_hint = "Live mode: click to rescan local CLI/MCP candidates." if live else "Static file is read-only. Open the live dashboard to scan from the browser."
+    scan_hint = "实时模式：点击后重新扫描本机 CLI / MCP 候选资产。" if live else "静态文件只读。打开 live dashboard 后，才能在浏览器里触发扫描。"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Agent Assets Dashboard</title>
+  <title>本机 Agent 资产面板</title>
   <style>
     :root {{
       color-scheme: light;
@@ -716,22 +740,22 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       <div class="brand">
         <div class="brand-mark">AA</div>
         <div>
-          <strong>Agent Assets</strong>
+          <strong>Agent 资产</strong>
           <p>本机工具总览</p>
         </div>
       </div>
       <nav class="nav" aria-label="dashboard sections">
-        <button class="active" data-tab="overview">Overview</button>
-        <button data-tab="assets">Assets</button>
+        <button class="active" data-tab="overview">总览</button>
+        <button data-tab="assets">资产</button>
         <button data-tab="mcp">MCP</button>
-        <button data-tab="entrypoints">Entrypoints</button>
-        <button data-tab="discovered">Discovered</button>
-        <button data-tab="skills">Skills</button>
-        <button data-tab="config">Config</button>
+        <button data-tab="entrypoints">入口</button>
+        <button data-tab="discovered">发现</button>
+        <button data-tab="skills">技能</button>
+        <button data-tab="config">配置</button>
       </nav>
       <div class="meta">
-        Generated: {h(generated)}<br>
-        Registry: {h(REGISTRY)}
+        生成时间：{h(generated)}<br>
+        总账：{h(REGISTRY)}
       </div>
     </aside>
     <main>
@@ -742,92 +766,92 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
         </div>
         <div class="actions">
           <input class="search" id="search" placeholder="搜索 gbrain、alice、mcp、skill、路径..." autocomplete="off">
-          <button class="primary-action" id="scanButton" data-live="{live_attr}" {scan_disabled}>一键扫描</button>
+          <button class="primary-action" id="scanButton" data-live="{live_attr}" {scan_disabled}>刷新扫描</button>
           <span class="scan-status" id="scanStatus">{h(scan_hint)}</span>
         </div>
       </div>
 
       <section class="section active" data-section="overview">
         <div class="summary">
-          <div class="metric"><b>{asset_count}</b><span>registered assets</span></div>
-          <div class="metric"><b>{mcp_connected}/{len(mcp_rows)}</b><span>MCP connected</span></div>
-          <div class="metric"><b>{entry_ok}/{len(entrypoints)}</b><span>valid entrypoints</span></div>
-          <div class="metric"><b>{needs_review_count}</b><span>needs review ({unregistered_count} unregistered)</span></div>
-          <div class="metric"><b>{skill_totals.get("unique", 0)}</b><span>unique skills ({skill_totals.get("paths", 0)} paths)</span></div>
+          <div class="metric"><b>{asset_count}</b><span>已登记资产</span></div>
+          <div class="metric"><b>{mcp_connected}/{len(mcp_rows)}</b><span>MCP 已连接</span></div>
+          <div class="metric"><b>{entry_ok}/{len(entrypoints)}</b><span>有效入口</span></div>
+          <div class="metric"><b>{needs_review_count}</b><span>待处理（共 {unregistered_count} 个未登记）</span></div>
+          <div class="metric"><b>{skill_totals.get("unique", 0)}</b><span>真实技能数（共 {skill_totals.get("paths", 0)} 条路径）</span></div>
         </div>
         <h2>给新 Agent 的一句话</h2>
         <table>
           <tbody>
             <tr>
-              <td><strong>Start file</strong></td>
+              <td><strong>起始文件</strong></td>
               <td>{chip(str(START_FILE))}</td>
             </tr>
             <tr>
-              <td><strong>Tell any agent</strong></td>
-              <td>Read <code>{h(START_FILE)}</code> first, then follow the local agent-assets rules.</td>
+              <td><strong>告诉新 Agent 的一句话</strong></td>
+              <td>先看 <code>{h(START_FILE)}</code>，按里面的本机资产规范办。</td>
             </tr>
           </tbody>
         </table>
-        <h2>Claude MCP Health</h2>
-        <pre class="raw-health">{h(health_raw or "No health output captured.")}</pre>
-        <h2>Discovery</h2>
+        <h2>Claude MCP 健康状态</h2>
+        <pre class="raw-health">{h(health_raw or "没有捕获到健康检查输出。")}</pre>
+        <h2>扫描结果</h2>
         <table>
           <tbody>
-            <tr><td><strong>Last scan</strong></td><td>{h(discovered_at or "not scanned")}</td></tr>
-            <tr><td><strong>Summary</strong></td><td><pre class="raw-health">{h(discovery_raw or "No discovery output captured.")}</pre></td></tr>
+            <tr><td><strong>上次扫描</strong></td><td>{h(discovered_at or "尚未扫描")}</td></tr>
+            <tr><td><strong>摘要</strong></td><td><pre class="raw-health">{h(discovery_raw or "当前没有扫描输出。")}</pre></td></tr>
           </tbody>
         </table>
       </section>
 
       <section class="section" data-section="assets">
-        <h2>Registered Assets</h2>
+        <h2>正式资产</h2>
         <div class="asset-grid">{render_asset_cards(agent_registry)}</div>
         <div class="empty">没有匹配的资产。</div>
       </section>
 
       <section class="section" data-section="mcp">
-        <h2>MCP Servers</h2>
+        <h2>MCP 服务</h2>
         <table>
-          <thead><tr><th>Name</th><th>Entry / URL</th><th>Health</th><th>Hosts</th><th>Note</th></tr></thead>
+          <thead><tr><th>名称</th><th>入口 / URL</th><th>健康状态</th><th>宿主</th><th>备注</th></tr></thead>
           <tbody>{render_mcp_rows(mcp_rows)}</tbody>
         </table>
         <div class="empty">没有匹配的 MCP。</div>
       </section>
 
       <section class="section" data-section="entrypoints">
-        <h2>Stable Entrypoints</h2>
+        <h2>稳定入口</h2>
         <table>
-          <thead><tr><th>Path</th><th>Kind</th><th>State</th><th>Owners</th></tr></thead>
+          <thead><tr><th>路径</th><th>类型</th><th>状态</th><th>归属资产</th></tr></thead>
           <tbody>{render_entrypoint_rows(entrypoints)}</tbody>
         </table>
         <div class="empty">没有匹配的入口。</div>
       </section>
 
       <section class="section" data-section="discovered">
-        <h2>Discovered CLI / Agent Candidates</h2>
-        <p>自动扫描常见入口目录。new 需要处理；defer 是先放着；ignore 是明确噪声。</p>
-        <p>当前：{needs_review_count} new / {deferred_count} deferred / {ignored_count} ignored / {unregistered_count} unregistered total。</p>
+        <h2>发现的 CLI / Agent 候选项</h2>
+        <p>自动扫描常见入口目录。待处理（new）需要判断是否登记；稍后处理（defer）先放着；已忽略（ignore）是明确噪声。</p>
+        <p>当前：{needs_review_count} 个待处理 / {deferred_count} 个稍后处理 / {ignored_count} 个已忽略 / 共 {unregistered_count} 个未登记。</p>
         <table>
-          <thead><tr><th>Name</th><th>Path</th><th>Registry</th><th>Review</th><th>Version</th></tr></thead>
+          <thead><tr><th>名称</th><th>路径</th><th>登记状态</th><th>处理状态</th><th>版本</th></tr></thead>
           <tbody>{render_discovered_rows(discovered_rows)}</tbody>
         </table>
         <div class="empty">没有匹配的候选项。</div>
       </section>
 
       <section class="section" data-section="skills">
-        <h2>Skill Roots</h2>
+        <h2>技能根目录</h2>
         <p>这里同时显示真实去重数量和路径数量。Finder 里的“替身”通常是 symlink，会让路径数量高于真实技能数量。</p>
         <table>
-          <thead><tr><th>Root</th><th>Path</th><th>Count</th><th>Examples</th></tr></thead>
+          <thead><tr><th>根目录</th><th>路径</th><th>数量</th><th>示例</th></tr></thead>
           <tbody>{render_skill_rows(skill_rows)}</tbody>
         </table>
         <div class="empty">没有匹配的 skill。</div>
       </section>
 
       <section class="section" data-section="config">
-        <h2>Config / Rules</h2>
+        <h2>配置 / 规则</h2>
         <table>
-          <thead><tr><th>Name</th><th>Path</th><th>State</th></tr></thead>
+          <thead><tr><th>名称</th><th>路径</th><th>状态</th></tr></thead>
           <tbody>{render_config_rows(agent_registry)}</tbody>
         </table>
         <div class="empty">没有匹配的配置。</div>
