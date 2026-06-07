@@ -21,6 +21,7 @@ SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 REGISTRY = pathlib.Path(os.environ.get("AGENT_ASSETS_REGISTRY", str(ASSETS_HOME / "registry.json"))).expanduser()
 MCP_REGISTRY = pathlib.Path(os.environ.get("AGENT_ASSETS_MCP_REGISTRY", str(MCP_HOME / "registry.json"))).expanduser()
 DISCOVERED = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVERED", str(ASSETS_HOME / "discovered.json"))).expanduser()
+REVIEW = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVERY_REVIEW", str(ASSETS_HOME / "discovery-review.json"))).expanduser()
 MCP_HEALTH_CACHE = pathlib.Path(os.environ.get("AGENT_ASSETS_MCP_HEALTH_CACHE", str(ASSETS_HOME / "mcp-health-cache.json"))).expanduser()
 OUT = pathlib.Path(os.environ.get("AGENT_ASSETS_DASHBOARD_HTML", str(ASSETS_HOME / "dashboard.html"))).expanduser()
 START_FILE = pathlib.Path(os.environ.get("AGENT_ASSETS_START_FILE", str(HOME / "AGENT_START_HERE.md"))).expanduser()
@@ -40,6 +41,13 @@ def load_json(path):
         return {}
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
 
 
 def h(value):
@@ -104,6 +112,257 @@ def listify(value):
     if isinstance(value, list):
         return [str(v) for v in value if v is not None]
     return [str(value)]
+
+
+def append_unique(target, key, values):
+    bucket = target.setdefault(key, [])
+    for value in values:
+        if value and value not in bucket:
+            bucket.append(value)
+
+
+def infer_source_path(raw_path, resolved_path, package_name):
+    candidate = pathlib.Path(resolved_path or raw_path)
+    if package_name and "node_modules" in candidate.parts:
+        parts = list(candidate.parts)
+        for idx, part in enumerate(parts):
+            if part != "node_modules" or idx + 1 >= len(parts):
+                continue
+            if package_name.startswith("@") and idx + 2 < len(parts):
+                joined = "/".join(parts[idx + 1 : idx + 3])
+                if joined == package_name:
+                    return str(pathlib.Path(*parts[: idx + 3]))
+            elif parts[idx + 1] == package_name:
+                return str(pathlib.Path(*parts[: idx + 2]))
+    if candidate.exists():
+        if candidate.is_dir():
+            return str(candidate)
+        return str(candidate.parent)
+    return str(pathlib.Path(raw_path).parent)
+
+
+def save_review_decision(path_value, status):
+    review = load_json(pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVERY_REVIEW", str(ASSETS_HOME / "discovery-review.json"))).expanduser())
+    review.setdefault("updated_at", dt.datetime.now().strftime("%Y-%m-%d"))
+    review.setdefault("purpose", "Review decisions for auto-discovered executable candidates. ignored items remain visible as known noise but do not count as needs-review.")
+    paths = review.setdefault("paths", {})
+    if status == "new":
+        paths.pop(path_value, None)
+    else:
+        action = {
+            "ignore": "leave_unregistered",
+            "defer": "review_later",
+        }.get(status, "")
+        note = {
+            "ignore": "Marked from dashboard as known noise.",
+            "defer": "Marked from dashboard for later review.",
+        }.get(status, "")
+        paths[path_value] = {
+            "status": status,
+            "action": action,
+            "note": note,
+        }
+    write_json(REVIEW, review)
+
+
+def register_discovered_candidate(path_value):
+    discovered = load_json(DISCOVERED)
+    rows = discovered.get("candidates", [])
+    row = next((item for item in rows if item.get("path") == path_value), None)
+    if not row:
+        raise ValueError(f"candidate not found: {path_value}")
+
+    registry = load_json(REGISTRY)
+    assets = registry.setdefault("assets", {})
+    asset_id = row.get("name") or pathlib.Path(path_value).name
+    asset = assets.setdefault(asset_id, {})
+
+    categories = []
+    if path_value.endswith(".app"):
+        categories.append("agent-app")
+    if "mcp-wrapper" in row.get("categories", []):
+        categories.extend(["mcp", "cli"])
+    elif "agent-candidate" in row.get("categories", []):
+        categories.extend(["agent-host", "cli"])
+    else:
+        categories.append("cli")
+    append_unique(asset, "category", categories)
+    append_unique(asset, "stable_entrypoints", [row.get("path")])
+    append_unique(asset, "source_paths", [infer_source_path(row.get("path"), row.get("resolved_path"), row.get("package_hint"))])
+
+    notes = [f"Registered from dashboard discovery on {dt.datetime.now().strftime('%Y-%m-%d')}."]
+    if not str(path_value).startswith(str(STABLE_BIN_DIR) + "/"):
+        notes.append(f"Entrypoint is outside {STABLE_BIN_DIR}; consider adding a stable wrapper.")
+    append_unique(asset, "notes", notes)
+
+    stable_bin = registry.setdefault("indexes", {}).setdefault("stable_bin_dir", {})
+    stable_bin.setdefault("path", str(STABLE_BIN_DIR))
+    current = stable_bin.setdefault("current_known_agent_entrypoints", [])
+    if str(path_value).startswith(str(STABLE_BIN_DIR) + "/") and path_value not in current:
+        current.append(path_value)
+
+    registry["updated_at"] = dt.datetime.now().strftime("%Y-%m-%d")
+    write_json(REGISTRY, registry)
+    save_review_decision(path_value, "new")
+
+
+def iter_mcp_servers(data, path_prefix=""):
+    if isinstance(data, dict):
+        for key, value in data.items():
+            next_prefix = f"{path_prefix}.{key}" if path_prefix else key
+            if key == "mcpServers" and isinstance(value, dict):
+                for server_name, config in value.items():
+                    yield next_prefix, server_name, config
+            else:
+                yield from iter_mcp_servers(value, next_prefix)
+    elif isinstance(data, list):
+        for idx, value in enumerate(data):
+            yield from iter_mcp_servers(value, f"{path_prefix}[{idx}]")
+
+
+def simplify_mcp_entry(config):
+    if not isinstance(config, dict):
+        return {"transport": "unknown", "entry": ""}
+    if config.get("url"):
+        return {"transport": "http", "entry": str(config.get("url"))}
+    command = config.get("command")
+    args = config.get("args") or []
+    entry = " ".join([str(command)] + [str(arg) for arg in args if arg is not None]).strip()
+    transport = "stdio" if command else str(config.get("type") or "unknown")
+    return {"transport": transport, "entry": entry}
+
+
+def collect_host_mcp_refs(agent_registry):
+    refs = []
+    host_configs = agent_registry.get("indexes", {}).get("host_configs", {})
+    for host_key in ("claude_mcp_config", "cursor_mcp_config", "workbuddy_mcp_config", "project_xz_mcp_config"):
+        config_path = host_configs.get(host_key)
+        if not config_path:
+            continue
+        path_obj = pathlib.Path(config_path)
+        if not path_obj.exists():
+            continue
+        try:
+            data = load_json(path_obj)
+        except Exception:
+            continue
+        for prefix, name, config in iter_mcp_servers(data):
+            simple = simplify_mcp_entry(config)
+            refs.append({
+                "host": host_key,
+                "path": config_path,
+                "location": f"{config_path}:{prefix}.{name}",
+                "name": name,
+                "transport": simple["transport"],
+                "entry": simple["entry"],
+                "config": config,
+            })
+    return refs
+
+
+def build_mcp_audit(agent_registry, mcp_registry, mcp_rows):
+    host_refs = collect_host_mcp_refs(agent_registry)
+    host_locations = {row["location"] for row in host_refs}
+    host_names = {row["name"] for row in host_refs}
+    registry_refs = []
+    for bucket_name in ("stdio_servers", "http_servers", "internal_servers"):
+        for name, server in sorted(mcp_registry.get(bucket_name, {}).items()):
+            for location in listify(server.get("hosts") or server.get("host")):
+                registry_refs.append({
+                    "registry_name": name,
+                    "location": location,
+                    "kind": bucket_name,
+                })
+    registry_locations = {row["location"] for row in registry_refs}
+    mcp_by_name = {row["name"]: row for row in mcp_rows}
+
+    host_only = []
+    for ref in host_refs:
+        if ref["location"] in registry_locations:
+            continue
+        health_row = mcp_by_name.get(ref["name"])
+        host_only.append({
+            "name": ref["name"],
+            "location": ref["location"],
+            "host": ref["host"],
+            "transport": ref["transport"],
+            "entry": ref["entry"],
+            "state": "new",
+            "health": health_row["health"] if health_row else "未登记",
+        })
+
+    registry_only = []
+    for ref in registry_refs:
+        if ref["location"] in host_locations:
+            continue
+        health_row = mcp_by_name.get(ref["registry_name"])
+        registry_only.append({
+            "name": ref["registry_name"],
+            "location": ref["location"],
+            "kind": ref["kind"],
+            "state": "defer",
+            "health": health_row["health"] if health_row else "registry-only",
+        })
+
+    failed = [row for row in mcp_rows if row["state"] == "failed"]
+    unregistered_connected = [row for row in host_only if row["name"] in host_names]
+
+    return {
+        "host_only": host_only,
+        "registry_only": registry_only,
+        "failed": failed,
+        "host_refs": host_refs,
+        "summary": {
+            "host_only": len(host_only),
+            "registry_only": len(registry_only),
+            "failed": len(failed),
+            "connected": sum(1 for row in mcp_rows if row["state"] == "connected"),
+            "total": len(mcp_rows),
+            "host_refs": len(host_refs),
+            "unregistered_connected": len(unregistered_connected),
+        },
+    }
+
+
+def register_mcp_from_host(location):
+    agent_registry = load_json(REGISTRY)
+    mcp_registry = load_json(MCP_REGISTRY)
+    refs = collect_host_mcp_refs(agent_registry)
+    ref = next((item for item in refs if item["location"] == location), None)
+    if not ref:
+        raise ValueError(f"host mcp config not found: {location}")
+
+    if ref["transport"] == "http":
+        bucket = mcp_registry.setdefault("http_servers", {})
+        server = bucket.setdefault(ref["name"], {})
+        if ref["entry"]:
+            server["url"] = ref["entry"]
+        append_unique(server, "hosts", [location])
+    else:
+        bucket = mcp_registry.setdefault("stdio_servers", {})
+        server = bucket.setdefault(ref["name"], {})
+        command = str((ref.get("config") or {}).get("command") or "")
+        if command:
+            if pathlib.Path(command).is_absolute():
+                server["wrapper"] = command
+            else:
+                server["underlying"] = ref["entry"]
+        append_unique(server, "hosts", [location])
+
+    mcp_registry["updated_at"] = dt.datetime.now().strftime("%Y-%m-%d")
+    write_json(MCP_REGISTRY, mcp_registry)
+
+
+def register_all_host_only_mcp():
+    agent_registry = load_json(REGISTRY)
+    mcp_registry = load_json(MCP_REGISTRY)
+    health, _health_raw = cached_mcp_health("cached")
+    mcp_rows = collect_mcp(mcp_registry, health)
+    audit = build_mcp_audit(agent_registry, mcp_registry, mcp_rows)
+    locations = [row["location"] for row in audit["host_only"]]
+    for location in locations:
+        register_mcp_from_host(location)
+    return locations
 
 
 def collect_entrypoints(agent_registry):
@@ -335,6 +594,14 @@ def refresh_discovery(include_versions=False, mode="daily"):
         return f"asset-discover failed: {exc}"
 
 
+def refresh_current_discovery():
+    current = load_json(DISCOVERED)
+    mode = current.get("scan_mode") or "daily"
+    if mode not in {"daily", "deep"}:
+        mode = "daily"
+    return refresh_discovery(mode=mode)
+
+
 def collect_discovered():
     data = load_json(DISCOVERED)
     return data.get("candidates", []), data.get("updated_at", ""), data
@@ -347,32 +614,129 @@ def render_chips(values, css_class=""):
     return "\n".join(chip(v, css_class) for v in values)
 
 
+def label_for_state(state):
+    state_labels = {
+        "registered": "已登记",
+        "connected": "已连接",
+        "failed": "失败",
+        "unknown": "未知",
+        "internal": "内部",
+        "exec": "可执行",
+        "file": "文件",
+        "dir": "目录",
+        "file-ref": "文件引用",
+        "ref": "引用",
+        "missing": "缺失",
+        "broken-link": "坏链",
+        "new": "待处理",
+        "defer": "稍后处理",
+        "ignore": "已忽略",
+        "app": "应用",
+        "mcp-wrapper": "MCP 包装器",
+        "agent-command": "Agent 命令",
+        "dashboard": "面板",
+        "runtime": "运行时",
+        "cli": "CLI",
+    }
+    return state_labels.get(state, state)
+
+
+def render_filter_bar(section, items):
+    visible_items = [(label, value, count) for label, value, count in items if count]
+    if not visible_items:
+        return ""
+    buttons = [f'<button class="filter-chip active" data-filter-section="{h(section)}" data-filter="">全部</button>']
+    for label, value, count in visible_items:
+        buttons.append(
+            f'<button class="filter-chip" data-filter-section="{h(section)}" data-filter="{h(value)}">{h(label)} <span>{count}</span></button>'
+        )
+    return f'<div class="filter-bar">{"".join(buttons)}</div>'
+
+
 def render_asset_cards(agent_registry):
-    cards = []
+    return "\n".join(render_asset_card(asset_id, asset) for asset_id, asset in sorted(agent_registry.get("assets", {}).items()))
+
+
+def asset_group(asset):
+    categories = set(asset.get("category", []))
+    if {"agent-host", "agent-app", "mcp", "mcp-server"} & categories:
+        return "agent-mcp", "Agent / MCP"
+    if {"cli", "project-tool"} & categories:
+        return "cli-project", "CLI / 项目工具"
+    if {"package-manager", "cli-runtime", "runtime"} & categories:
+        return "runtime", "运行时"
+    if {"workflow", "skill-pack", "skill-root"} & categories:
+        return "skills-workflow", "技能 / 工作流"
+    return "other", "其他"
+
+
+def render_asset_sections(agent_registry):
+    groups = {}
     for asset_id, asset in sorted(agent_registry.get("assets", {}).items()):
-        categories = ", ".join(asset.get("category", [])) or "未分类"
-        refs = []
-        for key in ("stable_entrypoints", "mcp_urls", "config_paths", "data_paths", "source_paths", "project_paths", "skill_roots", "registries"):
-            values = listify(asset.get(key))
-            if values:
-                refs.append(f'<div class="asset-row"><strong>{h(key)}</strong><div>{render_chips(values)}</div></div>')
-        status = asset.get("status") or ""
-        cards.append(f"""
-        <article class="asset-card searchable" data-section="assets" data-text="{h(asset_id)} {h(categories)} {h(json.dumps(asset, ensure_ascii=False))}">
-          <div class="asset-head">
-            <div>
-              <h3>{h(asset_id)}</h3>
-              <p>{h(categories)}</p>
-            </div>
-            <span class="badge">{h(asset.get("category", ["资产"])[0]) if asset.get("category") else "资产"}</span>
+        group_key, group_label = asset_group(asset)
+        groups.setdefault(group_key, {"label": group_label, "items": []})["items"].append((asset_id, asset))
+    order = ["agent-mcp", "cli-project", "skills-workflow", "runtime", "other"]
+    sections = []
+    for group_key in order:
+        group = groups.get(group_key)
+        if not group:
+            continue
+        items = group["items"]
+        if not items:
+            continue
+        cards = "\n".join(render_asset_card(asset_id, asset) for asset_id, asset in items)
+        sections.append(f"""
+        <div class="content-group">
+          <div class="content-group-head">
+            <h3>{h(group["label"])}</h3>
+            <span class="count-pill">{len(items)} 项</span>
           </div>
-          {'<p class="status-text">' + h(status) + '</p>' if status else ''}
-          <div class="asset-refs">
-            {''.join(refs)}
-          </div>
-        </article>
+          <div class="asset-grid">{cards}</div>
+        </div>
         """)
-    return "\n".join(cards)
+    return "\n".join(sections)
+
+
+def render_asset_filters(agent_registry):
+    counts = {}
+    for asset in agent_registry.get("assets", {}).values():
+        group_key, _group_label = asset_group(asset)
+        counts[group_key] = counts.get(group_key, 0) + 1
+    items = [
+        ("Agent / MCP", "agent-mcp", counts.get("agent-mcp", 0)),
+        ("CLI / 项目工具", "cli-project", counts.get("cli-project", 0)),
+        ("技能 / 工作流", "skills-workflow", counts.get("skills-workflow", 0)),
+        ("运行时", "runtime", counts.get("runtime", 0)),
+        ("其他", "other", counts.get("other", 0)),
+    ]
+    return render_filter_bar("assets", items)
+
+
+def render_asset_card(asset_id, asset):
+    categories = ", ".join(asset.get("category", [])) or "未分类"
+    group_key, _group_label = asset_group(asset)
+    filter_tags = " ".join([group_key] + listify(asset.get("category")))
+    refs = []
+    for key in ("stable_entrypoints", "mcp_urls", "config_paths", "data_paths", "source_paths", "project_paths", "skill_roots", "registries"):
+        values = listify(asset.get(key))
+        if values:
+            refs.append(f'<div class="asset-row"><strong>{h(key)}</strong><div>{render_chips(values)}</div></div>')
+    status = asset.get("status") or ""
+    return f"""
+    <article class="asset-card searchable" data-section="assets" data-filter-tags="{h(filter_tags)}" data-text="{h(asset_id)} {h(categories)} {h(json.dumps(asset, ensure_ascii=False))}">
+      <div class="asset-head">
+        <div>
+          <h3>{h(asset_id)}</h3>
+          <p>{h(categories)}</p>
+        </div>
+        <span class="badge">{h(asset.get("category", ["资产"])[0]) if asset.get("category") else "资产"}</span>
+      </div>
+      {'<p class="status-text">' + h(status) + '</p>' if status else ''}
+      <div class="asset-refs">
+        {''.join(refs)}
+      </div>
+    </article>
+    """
 
 
 def state_badge(state, label=None):
@@ -409,7 +773,7 @@ def render_mcp_rows(rows):
     out = []
     for row in rows:
         out.append(f"""
-        <tr class="searchable" data-section="mcp" data-text="{h(json.dumps(row, ensure_ascii=False))}">
+        <tr class="searchable" data-section="mcp" data-filter-tags="{h(row["state"])} {h(row["kind"])}" data-text="{h(json.dumps(row, ensure_ascii=False))}">
           <td><strong>{h(row["name"])}</strong><span class="subtle">{h(row["kind"])}</span></td>
           <td>{chip(row["entry"])}</td>
           <td>{state_badge(row["state"], row["health"])}</td>
@@ -425,7 +789,7 @@ def render_entrypoint_rows(rows):
     for row in rows:
         owner_text = ", ".join(row["owners"]) if row["owners"] else "未登记归属"
         out.append(f"""
-        <tr class="searchable" data-section="entrypoints" data-text="{h(row["path"])} {h(owner_text)} {h(row["state"])} {h(row["kind"])}">
+        <tr class="searchable" data-section="entrypoints" data-filter-tags="{h(row["kind"])} {h(row["state"])}" data-text="{h(row["path"])} {h(owner_text)} {h(row["state"])} {h(row["kind"])}">
           <td>{chip(row["path"])}</td>
           <td>{state_badge(row["kind"])}</td>
           <td>{state_badge(row["state"])}</td>
@@ -443,7 +807,7 @@ def render_skill_rows(rows):
         if row.get("nested_count"):
             alias = f' <span class="count-pill">{row["nested_count"]} 嵌套/递归</span>'
         out.append(f"""
-        <tr class="searchable" data-section="skills" data-text="{h(json.dumps(row, ensure_ascii=False))}">
+        <tr class="searchable" data-section="skills" data-filter-tags="{h(row["state"])}" data-text="{h(json.dumps(row, ensure_ascii=False))}">
           <td><strong>{h(row["name"])}</strong></td>
           <td>{chip(row["root"])}</td>
           <td>{state_badge(row["state"])} <span class="count-pill">{row["unique_count"]} 顶层</span> <span class="count-pill">{row["recursive_count"]} 递归</span>{alias}</td>
@@ -468,7 +832,7 @@ def render_config_rows(agent_registry):
             continue
         seen.add(value)
         out.append(f"""
-        <tr class="searchable" data-section="config" data-text="{h(label)} {h(value)}">
+        <tr class="searchable" data-section="config" data-filter-tags="{h(path_state(value))}" data-text="{h(label)} {h(value)}">
           <td><strong>{h(label)}</strong></td>
           <td>{chip(value)}</td>
           <td>{state_badge(path_state(value))}</td>
@@ -484,35 +848,158 @@ def render_discovered_rows(rows, empty_label="没有匹配的候选项。"):
         owners = ", ".join(row.get("owners", [])) or "unregistered"
         state = "registered" if row.get("registered") else row.get("review_status", "new")
         version = row.get("version") or ""
+        actions = []
+        if not row.get("registered"):
+            path_value = h(row.get("path", ""))
+            actions.append(f'<button class="table-action primary js-register-candidate" data-path="{path_value}">登记</button>')
+            if state != "defer":
+                actions.append(f'<button class="table-action js-review" data-path="{path_value}" data-status="defer">稍后</button>')
+            if state != "ignore":
+                actions.append(f'<button class="table-action js-review" data-path="{path_value}" data-status="ignore">忽略</button>')
+            if state in {"defer", "ignore"}:
+                actions.append(f'<button class="table-action js-review" data-path="{path_value}" data-status="new">恢复待处理</button>')
         review_bits = [state_badge(state)]
         if row.get("review_action"):
             review_bits.append(f'<span class="subtle">{h(row.get("review_action"))}</span>')
         if row.get("review_note"):
             review_bits.append(f'<span class="subtle">{h(row.get("review_note"))}</span>')
+        filter_tags = " ".join([state] + listify(row.get("categories")))
         out.append(f"""
-        <tr class="searchable" data-section="discovered" data-text="{h(json.dumps(row, ensure_ascii=False))}">
+        <tr class="searchable" data-section="discovered" data-filter-tags="{h(filter_tags)}" data-text="{h(json.dumps(row, ensure_ascii=False))}">
           <td><strong>{h(row.get("name", ""))}</strong><span class="subtle">{h(cats)}</span></td>
           <td>{chip(row.get("path", ""))}<span class="subtle">{h(row.get("package_hint") or "")}</span></td>
           <td>{state_badge(state)}<span class="subtle">{h(owners)}</span></td>
           <td>{''.join(review_bits)}</td>
           <td>{h(version)}</td>
+          <td class="action-cell">{''.join(actions) if actions else '<span class="muted">已入账</span>'}</td>
         </tr>
         """)
     if out:
         return "\n".join(out)
-    return f'<tr><td colspan="5" class="muted">{h(empty_label)}</td></tr>'
+    return f'<tr><td colspan="6" class="muted">{h(empty_label)}</td></tr>'
 
 
 def discovered_table(rows, empty_label):
     return f"""
         <table>
-          <thead><tr><th>名称</th><th>路径</th><th>登记状态</th><th>处理状态</th><th>版本</th></tr></thead>
+          <thead><tr><th>名称</th><th>路径</th><th>登记状态</th><th>处理状态</th><th>版本</th><th>动作</th></tr></thead>
           <tbody>{render_discovered_rows(rows, empty_label)}</tbody>
         </table>
     """
 
 
-def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, skill_totals, health_raw, discovered_rows, discovered_at, discovery_raw, discovered_meta=None, live=False):
+def render_mcp_audit_rows(rows, empty_label, include_action=False):
+    if not rows:
+        colspan = 6 if include_action else 5
+        return f'<tr><td colspan="{colspan}" class="muted">{h(empty_label)}</td></tr>'
+    out = []
+    for row in rows:
+        action = '<span class="muted">无</span>'
+        if include_action:
+            action = f'<button class="table-action primary js-register-mcp" data-location="{h(row["location"])}">纳入总账</button>'
+        out.append(f"""
+        <tr class="searchable" data-section="mcp" data-filter-tags="{h(row.get("state", "unknown"))} {h(row.get("transport") or row.get("kind") or "")} {h("host-only" if include_action else "registry-only")}" data-text="{h(json.dumps(row, ensure_ascii=False))}">
+          <td><strong>{h(row.get("name", ""))}</strong><span class="subtle">{h(row.get("host") or row.get("kind") or "")}</span></td>
+          <td>{state_badge(row.get("state", "unknown"), row.get("health"))}</td>
+          <td>{chip(row.get("entry") or row.get("location") or "")}</td>
+          <td>{h(row.get("transport") or row.get("kind") or "")}</td>
+          <td class="note-cell">{h(row.get("location") or "")}</td>
+          {f'<td class="action-cell">{action}</td>' if include_action else ''}
+        </tr>
+        """)
+    return "\n".join(out)
+
+
+def audit_table(rows, empty_label, include_action=False):
+    action_head = "<th>动作</th>" if include_action else ""
+    return f"""
+        <table>
+          <thead><tr><th>名称</th><th>状态</th><th>入口 / URL</th><th>类型</th><th>来源</th>{action_head}</tr></thead>
+          <tbody>{render_mcp_audit_rows(rows, empty_label, include_action=include_action)}</tbody>
+        </table>
+    """
+
+
+def render_mcp_filters(mcp_rows, mcp_audit):
+    counts = {}
+    for row in mcp_rows:
+        for key in (row["state"], row["kind"]):
+            counts[key] = counts.get(key, 0) + 1
+    counts["host-only"] = len(mcp_audit["host_only"])
+    counts["registry-only"] = len(mcp_audit["registry_only"])
+    return render_filter_bar("mcp", [
+        ("已连接", "connected", counts.get("connected", 0)),
+        ("失败", "failed", counts.get("failed", 0)),
+        ("stdio", "stdio", counts.get("stdio", 0)),
+        ("HTTP", "http", counts.get("http", 0)),
+        ("宿主未入账", "host-only", counts.get("host-only", 0)),
+        ("总账孤立", "registry-only", counts.get("registry-only", 0)),
+    ])
+
+
+def render_entrypoint_filters(entrypoints):
+    counts = {}
+    for row in entrypoints:
+        counts[row["kind"]] = counts.get(row["kind"], 0) + 1
+        counts[row["state"]] = counts.get(row["state"], 0) + 1
+    return render_filter_bar("entrypoints", [
+        (label_for_state("app"), "app", counts.get("app", 0)),
+        (label_for_state("mcp-wrapper"), "mcp-wrapper", counts.get("mcp-wrapper", 0)),
+        (label_for_state("agent-command"), "agent-command", counts.get("agent-command", 0)),
+        (label_for_state("dashboard"), "dashboard", counts.get("dashboard", 0)),
+        (label_for_state("runtime"), "runtime", counts.get("runtime", 0)),
+        (label_for_state("cli"), "cli", counts.get("cli", 0)),
+        ("可用", "exec", counts.get("exec", 0) + counts.get("dir", 0) + counts.get("file", 0)),
+        ("缺失", "missing", counts.get("missing", 0) + counts.get("broken-link", 0)),
+    ])
+
+
+def render_discovered_filters(discovered_rows):
+    counts = {}
+    for row in discovered_rows:
+        state = "registered" if row.get("registered") else row.get("review_status", "new")
+        counts[state] = counts.get(state, 0) + 1
+        for category in listify(row.get("categories")):
+            counts[category] = counts.get(category, 0) + 1
+    return render_filter_bar("discovered", [
+        ("待处理", "new", counts.get("new", 0)),
+        ("稍后", "defer", counts.get("defer", 0)),
+        ("已忽略", "ignore", counts.get("ignore", 0)),
+        ("已登记", "registered", counts.get("registered", 0)),
+        ("CLI 候选", "cli-candidate", counts.get("cli-candidate", 0)),
+        ("Agent 候选", "agent-candidate", counts.get("agent-candidate", 0)),
+        ("MCP 包装器", "mcp-wrapper", counts.get("mcp-wrapper", 0)),
+    ])
+
+
+def render_skill_filters(skill_rows):
+    counts = {}
+    for row in skill_rows:
+        counts[row["state"]] = counts.get(row["state"], 0) + 1
+    return render_filter_bar("skills", [
+        ("可用目录", "dir", counts.get("dir", 0)),
+        ("缺失", "missing", counts.get("missing", 0)),
+    ])
+
+
+def render_config_filters(agent_registry):
+    rows = [str(START_FILE)]
+    for key, value in agent_registry.get("policy", {}).items():
+        if isinstance(value, str) and value.startswith("/"):
+            rows.append(value)
+    for value in agent_registry.get("indexes", {}).get("host_configs", {}).values():
+        rows.append(value)
+    counts = {}
+    for value in rows:
+        state = path_state(value)
+        counts[state] = counts.get(state, 0) + 1
+    return render_filter_bar("config", [
+        ("可用", "file", counts.get("file", 0) + counts.get("dir", 0) + counts.get("exec", 0) + counts.get("file-ref", 0)),
+        ("缺失", "missing", counts.get("missing", 0) + counts.get("broken-link", 0)),
+    ])
+
+
+def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, skill_totals, health_raw, discovered_rows, discovered_at, discovery_raw, mcp_audit, discovered_meta=None, live=False):
     discovered_meta = discovered_meta or {}
     asset_count = len(agent_registry.get("assets", {}))
     mcp_connected = sum(1 for r in mcp_rows if r["state"] == "connected")
@@ -527,11 +1014,26 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
     registered_rows = [r for r in discovered_rows if r.get("registered")]
     scan_mode = discovered_meta.get("scan_mode") or "daily"
     scan_dirs = discovered_meta.get("scan_dirs") or []
-    scan_mode_label = "深度盘点" if scan_mode == "deep" else "日常扫描"
+    scan_mode_label = "全面盘点" if scan_mode == "deep" else "快速体检"
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     live_attr = "true" if live else "false"
     scan_disabled = "" if live else "disabled"
-    scan_hint = "实时模式：点击后重新扫描本机 CLI / MCP 候选资产。" if live else "静态文件只读。打开 live dashboard 后，才能在浏览器里触发扫描。"
+    scan_hint = "实时模式：扫描后会刷新候选项和 MCP 对账。" if live else "静态文件只读。打开 live dashboard 后，才能在浏览器里触发扫描。"
+    overview_issues = []
+    if mcp_audit["summary"]["host_only"]:
+        overview_issues.append(("new", f"{mcp_audit['summary']['host_only']} 个 MCP 已写进宿主配置，但还没纳入 MCP 总账。", "#mcp-host-only", "纳入 MCP 总账"))
+    if mcp_audit["summary"]["registry_only"]:
+        overview_issues.append(("defer", f"{mcp_audit['summary']['registry_only']} 条 MCP registry 引用在宿主配置里已经找不到。", "#mcp-registry-only", "查看差异"))
+    if mcp_audit["summary"]["failed"]:
+        overview_issues.append(("failed", f"{mcp_audit['summary']['failed']} 个 MCP 当前连接失败，需要排查宿主或运行时。", "#mcp-health", "查看连接"))
+    if needs_review_count:
+        overview_issues.append(("new", f"{needs_review_count} 个候选工具还没处理，扫描结果还没有形成资产决策。", "#discovered-pending", "处理候选"))
+    outside_stable = [
+        row for row in entrypoints
+        if row["path"] and row["state"] == "exec" and not row["path"].startswith(str(STABLE_BIN_DIR) + "/")
+    ]
+    if outside_stable:
+        overview_issues.append(("defer", f"{len(outside_stable)} 个已登记入口不在 {STABLE_BIN_DIR}，后续应统一成稳定 wrapper。", "#entrypoints", "查看入口"))
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -668,6 +1170,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       max-width: 320px;
       line-height: 1.35;
     }}
+    .search[hidden], .actions[hidden] {{ display: none; }}
     .metric {{
       background: var(--panel);
       border: 1px solid var(--line);
@@ -683,6 +1186,45 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
     }}
+    .content-group {{
+      margin: 18px 0 28px;
+    }}
+    .content-group-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 8px;
+    }}
+    .filter-bar {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 14px 0 16px;
+    }}
+    .filter-chip {{
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      min-height: 32px;
+      border-radius: 999px;
+      padding: 0 11px;
+      font: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }}
+    .filter-chip span {{
+      color: var(--muted);
+      margin-left: 4px;
+    }}
+    .filter-chip.active {{
+      border-color: #20242a;
+      background: #20242a;
+      color: #fff;
+    }}
+    .filter-chip.active span {{ color: #d8dadd; }}
     .asset-card {{
       background: var(--panel);
       border: 1px solid var(--line);
@@ -774,6 +1316,66 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       border-radius: 8px;
       padding: 18px;
     }}
+    .issue-list, .scan-card {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      margin: 16px 0;
+    }}
+    .issue-row {{
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      justify-content: space-between;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--line);
+    }}
+    .issue-row:last-child {{ border-bottom: 0; padding-bottom: 0; }}
+    .issue-main {{ min-width: 0; }}
+    .jump-link {{
+      color: var(--blue);
+      text-decoration: none;
+      font-size: 13px;
+      white-space: nowrap;
+    }}
+    .issue-actions {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }}
+    .quick-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 14px 0 4px;
+    }}
+    .action-cell {{
+      min-width: 180px;
+    }}
+    .table-action {{
+      min-height: 30px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      padding: 0 10px;
+      margin: 2px 6px 2px 0;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }}
+    .table-action.primary {{
+      border-color: #1d4ed8;
+      background: var(--blue);
+      color: #fff;
+    }}
+    .table-action:disabled {{
+      opacity: 0.65;
+      cursor: wait;
+    }}
     .raw-health {{
       white-space: pre-wrap;
       background: #22252a;
@@ -805,10 +1407,10 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       </div>
       <nav class="nav" aria-label="dashboard sections">
         <button class="active" data-tab="overview">总览</button>
+        <button data-tab="discovered">待处理</button>
         <button data-tab="assets">资产</button>
         <button data-tab="mcp">MCP</button>
         <button data-tab="entrypoints">入口</button>
-        <button data-tab="discovered">发现</button>
         <button data-tab="skills">技能</button>
         <button data-tab="config">配置</button>
       </nav>
@@ -821,13 +1423,13 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       <div class="topbar">
         <div>
           <h1 id="pageTitle">总览</h1>
-          <p id="pageSubtitle">看现在整体是否健康：资产数、MCP 连接、稳定入口、待处理扫描项和技能数量。</p>
+          <p id="pageSubtitle">先看问题和下一步动作，不在总览里堆列表。</p>
         </div>
         <div class="actions">
-          <input class="search" id="search" placeholder="搜索 gbrain、alice、mcp、skill、路径..." autocomplete="off">
+          <input class="search" id="search" placeholder="搜索当前列表页..." autocomplete="off" hidden>
           <div class="scan-action" id="scanAction">
-            <button class="primary-action scan-button" data-mode="daily" data-live="{live_attr}" {scan_disabled}>刷新日常扫描</button>
-            <button class="secondary-action scan-button" data-mode="deep" data-live="{live_attr}" {scan_disabled}>运行深度盘点</button>
+            <button class="primary-action scan-button" data-mode="daily" data-live="{live_attr}" {scan_disabled}>快速体检</button>
+            <button class="secondary-action scan-button" data-mode="deep" data-live="{live_attr}" {scan_disabled}>全面盘点</button>
             <span class="scan-status" id="scanStatus">{h(scan_hint)}</span>
           </div>
         </div>
@@ -836,10 +1438,29 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       <section class="section active" data-section="overview">
         <div class="summary">
           <div class="metric"><b>{asset_count}</b><span>已登记资产</span></div>
-          <div class="metric"><b>{mcp_connected}/{len(mcp_rows)}</b><span>MCP 已连接</span></div>
+          <div class="metric"><b>{mcp_connected}/{len(mcp_rows)}</b><span>MCP 当前连通</span></div>
           <div class="metric"><b>{entry_ok}/{len(entrypoints)}</b><span>有效入口</span></div>
-          <div class="metric"><b>{needs_review_count}</b><span>待处理（共 {unregistered_count} 个未登记）</span></div>
-          <div class="metric"><b>{skill_totals.get("unique", 0)}</b><span>顶层技能数（递归发现 {skill_totals.get("recursive_paths", 0)} 条）</span></div>
+          <div class="metric"><b>{needs_review_count}</b><span>候选工具待处理</span></div>
+          <div class="metric"><b>{mcp_audit['summary']['host_only'] + mcp_audit['summary']['registry_only']}</b><span>MCP 对账差异</span></div>
+        </div>
+        <h2>当前问题</h2>
+        <div class="issue-list">
+          {"".join(
+              f'<div class="issue-row searchable" data-section="overview" data-text="{h(text)}">'
+              f'<div class="issue-main">{state_badge(state)}<p>{h(text)}</p></div>'
+              f'<div class="issue-actions"><a class="jump-link js-jump" href="{h(target)}">{h(label)}</a></div></div>'
+              for state, text, target, label in overview_issues
+          ) if overview_issues else '<div class="issue-row"><div class="issue-main">' + state_badge('registered', '健康') + '<p>当前没有新的待办问题，系统更像一本总账而不是告警面板。</p></div></div>'}
+        </div>
+        <div class="scan-card">
+          <h2>体检说明</h2>
+          <p>`快速体检` 只复查已知入口目录、候选工具和 MCP 对账，适合日常使用。`全面盘点` 会扩大到常见 App / Agent 目录，适合抓漏，不应该当日常刷新。</p>
+          <p>最近一次体检模式：{h(scan_mode_label)}。最近一次扫描时间：{h(discovered_at or "尚未扫描")}。</p>
+          <div class="quick-actions">
+            {'<button class="table-action primary js-register-all-mcp">一键纳入新增 MCP</button>' if mcp_audit["summary"]["host_only"] else ''}
+            <a class="jump-link js-jump" href="#discovered-pending">处理候选工具</a>
+            <a class="jump-link js-jump" href="#entrypoints">查看入口规范</a>
+          </div>
         </div>
         <h2>给新 Agent 的一句话</h2>
         <table>
@@ -867,24 +1488,32 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
 
       <section class="section" data-section="assets">
         <h2>正式资产</h2>
-        <p>这里是已经纳入总账的工具、Agent 应用、MCP、项目和数据目录；Agent 应优先信这里，而不是临场乱翻 dotdir。</p>
-        <div class="asset-grid">{render_asset_cards(agent_registry)}</div>
+        <p>这里按资产用途分区，左侧菜单不拆层级，页面内部再看分类。</p>
+        {render_asset_filters(agent_registry)}
+        {render_asset_sections(agent_registry)}
         <div class="empty">没有匹配的资产。</div>
       </section>
 
       <section class="section" data-section="mcp">
-        <h2>MCP 服务</h2>
-        <p>这里看 MCP 服务本身、入口或 URL、连接状态，以及哪些宿主配置正在引用它。</p>
+        <h2 id="mcp-health">MCP 服务</h2>
+        <p>这里分开看三件事：总账里登记了什么、宿主配置实际在用什么、两边是否对得上。</p>
+        {render_mcp_filters(mcp_rows, mcp_audit)}
         <table>
           <thead><tr><th>名称</th><th>入口 / URL</th><th>健康状态</th><th>宿主</th><th>备注</th></tr></thead>
           <tbody>{render_mcp_rows(mcp_rows)}</tbody>
         </table>
+        <h3 id="mcp-host-only">宿主里已配置，但总账里还没有</h3>
+        {'<div class="quick-actions"><button class="table-action primary js-register-all-mcp">一键纳入新增 MCP</button></div>' if mcp_audit["summary"]["host_only"] else ''}
+        {audit_table(mcp_audit["host_only"], "当前没有发现新的 host-only MCP。", include_action=True)}
+        <h3 id="mcp-registry-only">总账里有，但宿主配置里已经找不到</h3>
+        {audit_table(mcp_audit["registry_only"], "当前没有 registry-only MCP 引用。")}
         <div class="empty">没有匹配的 MCP。</div>
       </section>
 
       <section class="section" data-section="entrypoints">
-        <h2>稳定入口</h2>
+        <h2 id="entrypoints">稳定入口</h2>
         <p>这里是 Agent 真正应该调用的命令入口，重点看路径是否存在、类型是否正确、归属到哪个资产。</p>
+        {render_entrypoint_filters(entrypoints)}
         <table>
           <thead><tr><th>路径</th><th>类型</th><th>状态</th><th>归属资产</th></tr></thead>
           <tbody>{render_entrypoint_rows(entrypoints)}</tbody>
@@ -893,16 +1522,17 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       </section>
 
       <section class="section" data-section="discovered">
-        <h2>发现的 CLI / Agent 候选项</h2>
-        <p>自动扫描常见入口目录。待处理（new）需要判断是否登记；稍后处理（defer）先放着；已忽略（ignore）是明确噪声。</p>
+        <h2>待处理候选项</h2>
+        <p>扫描的意义不是把路径堆出来，而是把“要不要入账”这件事做完。这里每个候选项都应该有决定：登记、稍后、忽略。</p>
         <p>当前模式：{h(scan_mode_label)}。当前：{needs_review_count} 个待处理 / {deferred_count} 个稍后处理 / {ignored_count} 个已忽略 / 共 {unregistered_count} 个未登记。</p>
+        {render_discovered_filters(discovered_rows)}
         <details>
           <summary>本次扫描目录（{len(scan_dirs)} 个）</summary>
           <div>{render_chips(scan_dirs)}</div>
         </details>
-        <h3>待我确认</h3>
+        <h3 id="discovered-pending">待我处理</h3>
         {discovered_table(pending_rows, "当前没有待确认候选项。")}
-        <h3>当前扫描结果</h3>
+        <h3>已登记或稍后</h3>
         {discovered_table(registered_rows + deferred_rows, "当前没有已登记或稍后处理候选项。")}
         <h3>已忽略</h3>
         {discovered_table(ignored_rows, "当前没有已忽略候选项。")}
@@ -911,6 +1541,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       <section class="section" data-section="skills">
         <h2>技能根目录</h2>
         <p>主数字按顶层技能库统计；递归数量只用于诊断嵌套副本、宿主镜像和 symlink，不再当成真实可用技能数。</p>
+        {render_skill_filters(skill_rows)}
         <table>
           <thead><tr><th>根目录</th><th>路径</th><th>数量</th><th>示例</th></tr></thead>
           <tbody>{render_skill_rows(skill_rows)}</tbody>
@@ -921,6 +1552,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       <section class="section" data-section="config">
         <h2>配置 / 规则</h2>
         <p>这里列出本机 Agent 资产规范、MCP 总账、宿主配置和启动文件，方便排查“规则到底写在哪里”。</p>
+        {render_config_filters(agent_registry)}
         <table>
           <thead><tr><th>名称</th><th>路径</th><th>状态</th></tr></thead>
           <tbody>{render_config_rows(agent_registry)}</tbody>
@@ -938,10 +1570,11 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
     const scanAction = document.getElementById("scanAction");
     const scanButtons = Array.from(document.querySelectorAll(".scan-button"));
     const scanStatus = document.getElementById("scanStatus");
+    const filterButtons = Array.from(document.querySelectorAll(".filter-chip"));
     const tabCopy = {{
       overview: {{
         title: "总览",
-        subtitle: "看现在整体是否健康：资产数、MCP 连接、稳定入口、待处理扫描项和技能数量。"
+        subtitle: "先看问题和下一步动作，不在总览里堆列表。"
       }},
       assets: {{
         title: "资产",
@@ -949,15 +1582,15 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       }},
       mcp: {{
         title: "MCP",
-        subtitle: "集中查看 MCP 服务入口、连接状态和宿主引用，判断 Claude Code、Codex 等能不能用。"
+        subtitle: "同时看 MCP 总账、宿主配置和连接状态，先对账，再排查。"
       }},
       entrypoints: {{
         title: "入口",
         subtitle: "Agent 应该调用的稳定命令和 wrapper；这里专门排查 PATH、坏链、归属不清。"
       }},
       discovered: {{
-        title: "发现",
-        subtitle: "从可信目录扫描出的 CLI / Agent 候选项，用来抓漏登记、误忽略和新的路径盲区。"
+        title: "待处理",
+        subtitle: "把候选工具真正处理掉，而不是只看见它们。"
       }},
       skills: {{
         title: "技能",
@@ -969,6 +1602,20 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       }}
     }};
     const scanTabs = new Set(["overview", "discovered"]);
+    const searchTabs = new Set(["assets", "mcp", "entrypoints", "skills", "config"]);
+    const hashTabs = {{
+      overview: "overview",
+      mcp: "mcp",
+      "mcp-health": "mcp",
+      "mcp-host-only": "mcp",
+      "mcp-registry-only": "mcp",
+      discovered: "discovered",
+      "discovered-pending": "discovered",
+      assets: "assets",
+      entrypoints: "entrypoints",
+      skills: "skills",
+      config: "config"
+    }};
 
     function activate(tab) {{
       buttons.forEach((button) => button.classList.toggle("active", button.dataset.tab === tab));
@@ -977,18 +1624,42 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       if (pageTitle) pageTitle.textContent = copy.title;
       if (pageSubtitle) pageSubtitle.textContent = copy.subtitle;
       if (scanAction) scanAction.hidden = !scanTabs.has(tab);
+      if (search) {{
+        search.hidden = !searchTabs.has(tab);
+        if (search.hidden) search.value = "";
+      }}
       filter();
+    }}
+
+    function activateFromHash() {{
+      const raw = location.hash ? location.hash.slice(1) : "overview";
+      const tab = hashTabs[raw] || raw || "overview";
+      if (!buttons.some((button) => button.dataset.tab === tab)) {{
+        activate("overview");
+        return;
+      }}
+      activate(tab);
+      if (raw && raw !== tab) {{
+        requestAnimationFrame(() => {{
+          const target = document.getElementById(raw);
+          if (target) target.scrollIntoView({{ block: "start", behavior: "smooth" }});
+        }});
+      }}
     }}
 
     function filter() {{
       const active = document.querySelector(".section.active");
       if (!active) return;
       const query = (search.value || "").trim().toLowerCase();
+      const activeFilter = active.dataset.activeFilter || "";
       const items = Array.from(active.querySelectorAll(".searchable"));
       let visible = 0;
       items.forEach((item) => {{
         const text = (item.dataset.text || item.textContent || "").toLowerCase();
-        const show = !query || text.includes(query);
+        const tags = (item.dataset.filterTags || "").toLowerCase();
+        const queryMatch = !query || text.includes(query);
+        const filterMatch = !activeFilter || tags.split(/\s+/).includes(activeFilter.toLowerCase());
+        const show = queryMatch && filterMatch;
         item.style.display = show ? "" : "none";
         if (show) visible += 1;
       }});
@@ -998,6 +1669,15 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
 
     buttons.forEach((button) => button.addEventListener("click", () => activate(button.dataset.tab)));
     search.addEventListener("input", filter);
+    filterButtons.forEach((button) => {{
+      button.addEventListener("click", () => {{
+        const section = document.querySelector(`.section[data-section="${{button.dataset.filterSection}}"]`);
+        if (!section) return;
+        section.dataset.activeFilter = button.dataset.filter || "";
+        section.querySelectorAll(".filter-chip").forEach((item) => item.classList.toggle("active", item === button));
+        filter();
+      }});
+    }});
     scanButtons.forEach((scanButton) => {{
       if (scanButton.dataset.live !== "true") return;
       scanButton.addEventListener("click", async () => {{
@@ -1008,7 +1688,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
           const response = await fetch(`/api/scan?mode=${{encodeURIComponent(mode)}}`, {{ method: "POST" }});
           if (!response.ok) throw new Error(await response.text());
           const result = await response.json();
-          scanStatus.textContent = `扫描完成（${{result.scan_mode}}）：${{result.candidates}} 个候选，${{result.unregistered}} 个未登记。正在刷新页面...`;
+          scanStatus.textContent = `体检完成（${{result.scan_mode}}）：${{result.candidates}} 个候选，${{result.unregistered}} 个未登记。正在刷新页面...`;
           setTimeout(() => window.location.reload(), 450);
         }} catch (error) {{
           scanStatus.textContent = `扫描失败：${{error.message || error}}`;
@@ -1016,10 +1696,71 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
         }}
       }});
     }});
-    if (location.hash) {{
-      const tab = location.hash.slice(1);
-      if (buttons.some((button) => button.dataset.tab === tab)) activate(tab);
+    async function postJson(url, payload, button) {{
+      if (button) {{
+        button.disabled = true;
+        button.dataset.originalText = button.textContent;
+        button.textContent = "处理中";
+      }}
+      const response = await fetch(url, {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(payload || {{}})
+      }});
+      if (!response.ok) throw new Error(await response.text());
+      return await response.json();
     }}
+    function resetActionButton(button) {{
+      if (!button) return;
+      button.disabled = false;
+      if (button.dataset.originalText) button.textContent = button.dataset.originalText;
+    }}
+    document.querySelectorAll(".js-review").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        try {{
+          await postJson("/api/review", {{ path: button.dataset.path, status: button.dataset.status }}, button);
+          window.location.reload();
+        }} catch (error) {{
+          scanStatus.textContent = `更新处理状态失败：${{error.message || error}}`;
+          resetActionButton(button);
+        }}
+      }});
+    }});
+    document.querySelectorAll(".js-register-candidate").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        try {{
+          await postJson("/api/register-candidate", {{ path: button.dataset.path }}, button);
+          window.location.reload();
+        }} catch (error) {{
+          scanStatus.textContent = `登记候选项失败：${{error.message || error}}`;
+          resetActionButton(button);
+        }}
+      }});
+    }});
+    document.querySelectorAll(".js-register-mcp").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        try {{
+          await postJson("/api/register-mcp", {{ location: button.dataset.location }}, button);
+          window.location.reload();
+        }} catch (error) {{
+          scanStatus.textContent = `纳入 MCP 总账失败：${{error.message || error}}`;
+          resetActionButton(button);
+        }}
+      }});
+    }});
+    document.querySelectorAll(".js-register-all-mcp").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        try {{
+          await postJson("/api/register-mcp-bulk", {{}}, button);
+          window.location.reload();
+        }} catch (error) {{
+          scanStatus.textContent = `批量纳入 MCP 失败：${{error.message || error}}`;
+          resetActionButton(button);
+        }}
+      }});
+    }});
+    window.addEventListener("hashchange", activateFromHash);
+    activateFromHash();
   </script>
 </body>
 </html>
@@ -1036,6 +1777,7 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, live=False, discovery_
     else:
         health, health_raw = cached_mcp_health("MCP health cache. Click one-key scan to refresh.")
     mcp_rows = collect_mcp(mcp_registry, health)
+    mcp_audit = build_mcp_audit(agent_registry, mcp_registry, mcp_rows)
     entrypoints = collect_entrypoints(agent_registry)
     skill_rows, skill_totals = collect_skills(agent_registry)
     html_text = build_html(
@@ -1049,6 +1791,7 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, live=False, discovery_
         discovered_rows,
         discovered_at,
         discovery_raw,
+        mcp_audit,
         discovered_meta,
         live=live,
     )
@@ -1071,6 +1814,8 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, live=False, discovery_
         "skills_nested": skill_totals.get("nested", 0),
         "discovered_at": discovered_at,
         "scan_mode": discovered_meta.get("scan_mode", "daily"),
+        "mcp_host_only": mcp_audit["summary"]["host_only"],
+        "mcp_registry_only": mcp_audit["summary"]["registry_only"],
     }
     return html_text, summary
 
@@ -1158,6 +1903,61 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 mode = "daily"
             try:
                 self.send_json(run_scan(include_versions=include_versions, mode=mode))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw_body = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        if parsed.path == "/api/review":
+            path_value = str(payload.get("path") or "")
+            status = str(payload.get("status") or "")
+            if not path_value or status not in {"new", "defer", "ignore"}:
+                self.send_json({"ok": False, "error": "invalid review payload"}, status=400)
+                return
+            try:
+                save_review_decision(path_value, status)
+                refresh_current_discovery()
+                write_dashboard(run_discovery=False, refresh_mcp=False, live=False)
+                self.send_json({"ok": True, "path": path_value, "status": status})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/register-candidate":
+            path_value = str(payload.get("path") or "")
+            if not path_value:
+                self.send_json({"ok": False, "error": "missing candidate path"}, status=400)
+                return
+            try:
+                register_discovered_candidate(path_value)
+                refresh_current_discovery()
+                write_dashboard(run_discovery=False, refresh_mcp=False, live=False)
+                self.send_json({"ok": True, "path": path_value})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/register-mcp":
+            location = str(payload.get("location") or "")
+            if not location:
+                self.send_json({"ok": False, "error": "missing mcp location"}, status=400)
+                return
+            try:
+                register_mcp_from_host(location)
+                refresh_current_discovery()
+                write_dashboard(run_discovery=False, refresh_mcp=False, live=False)
+                self.send_json({"ok": True, "location": location})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/register-mcp-bulk":
+            try:
+                locations = register_all_host_only_mcp()
+                refresh_current_discovery()
+                write_dashboard(run_discovery=False, refresh_mcp=False, live=False)
+                self.send_json({"ok": True, "locations": locations, "count": len(locations)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
