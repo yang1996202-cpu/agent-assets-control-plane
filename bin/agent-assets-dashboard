@@ -6,6 +6,7 @@ import html
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -22,6 +23,19 @@ REGISTRY = pathlib.Path(os.environ.get("AGENT_ASSETS_REGISTRY", str(ASSETS_HOME 
 MCP_REGISTRY = pathlib.Path(os.environ.get("AGENT_ASSETS_MCP_REGISTRY", str(MCP_HOME / "registry.json"))).expanduser()
 DISCOVERED = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVERED", str(ASSETS_HOME / "discovered.json"))).expanduser()
 REVIEW = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVERY_REVIEW", str(ASSETS_HOME / "discovery-review.json"))).expanduser()
+PROJECT_INDEX = pathlib.Path(
+    os.environ.get(
+        "AGENT_ASSETS_PROJECT_INDEX",
+        os.environ.get("AGENT_ASSETS_PROJECTS", str(ASSETS_HOME / "projects.json")),
+    )
+).expanduser()
+MACOS_SIGNALS = pathlib.Path(
+    os.environ.get(
+        "AGENT_ASSETS_MACOS_SIGNALS",
+        os.environ.get("AGENT_ASSETS_MACOS_SIGNALS_INDEX", str(ASSETS_HOME / "macos-signals.json")),
+    )
+).expanduser()
+MACOS_REVIEW = pathlib.Path(os.environ.get("AGENT_ASSETS_MACOS_REVIEW", str(ASSETS_HOME / "macos-signals-review.json"))).expanduser()
 MCP_HEALTH_CACHE = pathlib.Path(os.environ.get("AGENT_ASSETS_MCP_HEALTH_CACHE", str(ASSETS_HOME / "mcp-health-cache.json"))).expanduser()
 OUT = pathlib.Path(os.environ.get("AGENT_ASSETS_DASHBOARD_HTML", str(ASSETS_HOME / "dashboard.html"))).expanduser()
 START_FILE = pathlib.Path(os.environ.get("AGENT_ASSETS_START_FILE", str(HOME / "AGENT_START_HERE.md"))).expanduser()
@@ -34,6 +48,22 @@ if not ASSET_DISCOVER.exists():
         ASSET_DISCOVER = repo_local_discover
     elif legacy_discover.exists():
         ASSET_DISCOVER = legacy_discover
+ASSET_PROJECTS = pathlib.Path(os.environ.get("AGENT_ASSETS_PROJECTS_CMD", str(STABLE_BIN_DIR / "agent-assets-projects"))).expanduser()
+if not ASSET_PROJECTS.exists():
+    repo_local_projects = SCRIPT_DIR / "agent-assets-projects"
+    legacy_projects = STABLE_BIN_DIR / "asset-projects"
+    if repo_local_projects.exists():
+        ASSET_PROJECTS = repo_local_projects
+    elif legacy_projects.exists():
+        ASSET_PROJECTS = legacy_projects
+ASSET_MACOS_SIGNALS = pathlib.Path(os.environ.get("AGENT_ASSETS_MACOS_SIGNALS_CMD", str(STABLE_BIN_DIR / "agent-assets-macos-signals"))).expanduser()
+if not ASSET_MACOS_SIGNALS.exists():
+    repo_local_macos = SCRIPT_DIR / "agent-assets-macos-signals"
+    legacy_macos = STABLE_BIN_DIR / "asset-macos-signals"
+    if repo_local_macos.exists():
+        ASSET_MACOS_SIGNALS = repo_local_macos
+    elif legacy_macos.exists():
+        ASSET_MACOS_SIGNALS = legacy_macos
 
 
 def load_json(path):
@@ -165,6 +195,73 @@ def save_review_decision(path_value, status):
     write_json(REVIEW, review)
 
 
+MACOS_REVIEW_STATUS_LABELS = {
+    "new": "待处理",
+    "linked": "已关联",
+    "registered": "已登记",
+    "confirmed": "已确认",
+    "residual": "残留",
+    "not-agent": "非 Agent",
+    "ignore": "已忽略",
+}
+
+
+def save_macos_review_decision(item_id, status, note="", asset_id=""):
+    if status not in MACOS_REVIEW_STATUS_LABELS:
+        raise ValueError("invalid macOS review status")
+    review = load_json(MACOS_REVIEW)
+    review.setdefault("purpose", "Review decisions for macOS login/background/launchd/process traces. This file never disables, unloads, or deletes system items.")
+    review["updated_at"] = dt.datetime.now().strftime("%Y-%m-%d")
+    items = review.setdefault("items", {})
+    if status == "new":
+        items.pop(item_id, None)
+    else:
+        entry = {
+            "status": status,
+            "reviewed_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "review_action": {
+                "linked": "linked_to_registry",
+                "registered": "registered_asset",
+                "confirmed": "confirmed",
+                "residual": "marked_residual_candidate",
+                "not-agent": "marked_not_agent_related",
+                "ignore": "ignored",
+            }.get(status, status),
+            "note": note,
+        }
+        if asset_id:
+            entry["asset_id"] = asset_id
+        items[item_id] = entry
+    write_json(MACOS_REVIEW, review)
+
+
+def load_macos_review_items():
+    return load_json(MACOS_REVIEW).get("items", {})
+
+
+def apply_macos_review(rows):
+    decisions = load_macos_review_items()
+    for row in rows:
+        item_id = row.get("id") or row.get("label") or ""
+        decision = decisions.get(item_id, {})
+        linked = listify(row.get("linked_assets"))
+        status = decision.get("status") or ("linked" if linked else "new")
+        row["review_status"] = status
+        row["review_label"] = MACOS_REVIEW_STATUS_LABELS.get(status, status)
+        row["review_action"] = decision.get("review_action", "")
+        row["review_note"] = decision.get("note", "")
+        if decision.get("asset_id"):
+            review_link = f"{decision['asset_id']}:macos-review"
+            if review_link not in linked:
+                linked.append(review_link)
+            row["linked_assets"] = linked
+        tags = listify(row.get("tags"))
+        if status not in tags:
+            tags.append(status)
+        row["tags"] = tags
+    return rows
+
+
 def register_discovered_candidate(path_value):
     discovered = load_json(DISCOVERED)
     rows = discovered.get("candidates", [])
@@ -204,6 +301,127 @@ def register_discovered_candidate(path_value):
     registry["updated_at"] = dt.datetime.now().strftime("%Y-%m-%d")
     write_json(REGISTRY, registry)
     save_review_decision(path_value, "new")
+
+
+def slugify_asset_id(value, prefix="macos"):
+    raw = str(value or "system-trace").strip().lower()
+    raw = re.sub(r"[^a-z0-9._-]+", "-", raw)
+    raw = raw.strip(".-_") or "system-trace"
+    if not raw.startswith(prefix + "-"):
+        raw = f"{prefix}-{raw}"
+    return raw[:96]
+
+
+def macos_item_by_id(item_id):
+    rows, _updated_at, _meta = collect_macos_signals()
+    for row in rows:
+        if (row.get("id") or row.get("label")) == item_id:
+            return row
+    raise ValueError("macOS signal item not found")
+
+
+def executable_like(path_value):
+    if not path_value or not str(path_value).startswith("/"):
+        return False
+    if str(path_value).endswith(".plist"):
+        return False
+    path = pathlib.Path(path_value)
+    return path.exists() or "/Applications/" in str(path) or "/Library/PrivilegedHelperTools/" in str(path)
+
+
+def next_asset_id(registry, preferred):
+    assets = registry.setdefault("assets", {})
+    if preferred not in assets:
+        return preferred
+    index = 2
+    while f"{preferred}-{index}" in assets:
+        index += 1
+    return f"{preferred}-{index}"
+
+
+def categories_for_macos_item(item):
+    tags = set(listify(item.get("tags")))
+    categories = ["macos-signal"]
+    mapping = {
+        "agent-service": "agent-service",
+        "listening": "local-service",
+        "launch-agent": "launch-agent",
+        "launch-daemon": "launch-daemon",
+        "privileged": "privileged-helper",
+        "remote-control": "remote-control",
+        "network-proxy": "network-proxy",
+        "updater": "updater",
+        "input-method": "input-method",
+        "residual-candidate": "residual-candidate",
+    }
+    for tag, category in mapping.items():
+        if tag in tags and category not in categories:
+            categories.append(category)
+    return categories
+
+
+def register_macos_signal(item_id):
+    item = macos_item_by_id(item_id)
+    registry = load_json(REGISTRY)
+    existing_asset = ""
+    for value in listify(item.get("linked_assets")):
+        if ":" in value:
+            existing_asset = value.split(":", 1)[0]
+            break
+    asset_id = existing_asset or next_asset_id(registry, slugify_asset_id(item.get("label") or item.get("id")))
+    asset = registry.setdefault("assets", {}).setdefault(asset_id, {})
+
+    append_unique(asset, "category", categories_for_macos_item(item))
+    config_paths = []
+    source_paths = []
+    for path_value in listify(item.get("paths")):
+        if str(path_value).endswith(".plist"):
+            config_paths.append(path_value)
+        elif executable_like(path_value):
+            source_paths.append(path_value)
+    if item.get("launch_plist"):
+        config_paths.append(item.get("launch_plist"))
+    append_unique(asset, "config_paths", config_paths)
+    append_unique(asset, "source_paths", source_paths)
+
+    ports = sorted({listener.get("port") for listener in item.get("listeners", []) if listener.get("port")})
+    notes = [
+        f"Registered from macOS system trace: {item.get('label') or item_id}.",
+        f"Tags: {', '.join(listify(item.get('tags')))}.",
+    ]
+    if ports:
+        notes.append(f"Observed listening ports: {', '.join(ports)}.")
+    append_unique(asset, "notes", notes)
+
+    evidence = asset.setdefault("system_evidence", [])
+    evidence_item = {
+        "source": "macos-signals",
+        "id": item.get("id") or item_id,
+        "label": item.get("label") or item_id,
+        "tags": listify(item.get("tags")),
+        "ports": ports,
+        "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    if not any(isinstance(entry, dict) and entry.get("id") == evidence_item["id"] for entry in evidence):
+        evidence.append(evidence_item)
+    asset["status"] = "Registered from macOS system trace; verify owner and keep/remove policy in the dashboard."
+    registry["updated_at"] = dt.date.today().isoformat()
+    write_json(REGISTRY, registry)
+    save_macos_review_decision(item_id, "registered", "Registered from dashboard macOS system trace.", asset_id=asset_id)
+    return asset_id
+
+
+def register_unlinked_macos_agent_services():
+    rows, _updated_at, _meta = collect_macos_signals()
+    registered = []
+    for row in rows:
+        tags = set(listify(row.get("tags")))
+        if row.get("linked_assets") or row.get("review_status") != "new":
+            continue
+        if "agent-service" not in tags or not row.get("running"):
+            continue
+        registered.append(register_macos_signal(row.get("id") or row.get("label")))
+    return registered
 
 
 def iter_mcp_servers(data, path_prefix=""):
@@ -607,6 +825,49 @@ def collect_discovered():
     return data.get("candidates", []), data.get("updated_at", ""), data
 
 
+def refresh_projects():
+    if not ASSET_PROJECTS.exists():
+        return ""
+    try:
+        proc = subprocess.run(
+            [str(ASSET_PROJECTS)],
+            cwd=str(HOME),
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        return ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    except Exception as exc:
+        return f"agent-assets-projects failed: {exc}"
+
+
+def collect_projects():
+    data = load_json(PROJECT_INDEX)
+    return data.get("projects", []), data.get("updated_at", ""), data
+
+
+def refresh_macos_signals():
+    if not ASSET_MACOS_SIGNALS.exists():
+        return ""
+    try:
+        proc = subprocess.run(
+            [str(ASSET_MACOS_SIGNALS)],
+            cwd=str(HOME),
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        return ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    except Exception as exc:
+        return f"agent-assets-macos-signals failed: {exc}"
+
+
+def collect_macos_signals():
+    data = load_json(MACOS_SIGNALS)
+    rows = apply_macos_review(data.get("items", []))
+    return rows, data.get("updated_at", ""), data
+
+
 def render_chips(values, css_class=""):
     values = listify(values)
     if not values:
@@ -637,6 +898,42 @@ def label_for_state(state):
         "dashboard": "面板",
         "runtime": "运行时",
         "cli": "CLI",
+        "canonical": "标准项目",
+        "legacy": "旧位置",
+        "download_candidate": "下载候选",
+        "host_managed": "宿主管理",
+        "registered_source": "已登记源码",
+        "manual": "手动根目录",
+        "linked": "已关联资产",
+        "git-repo": "Git 仓库",
+        "node-package": "Node 包",
+        "python-package": "Python 包",
+        "go-module": "Go 模块",
+        "rust-package": "Rust 包",
+        "skill": "Skill",
+        "mcp-candidate": "MCP 候选",
+        "cli-candidate": "CLI 候选",
+        "documentation": "文档项目",
+        "enabled": "已启用",
+        "disabled": "已关闭",
+        "running": "运行中",
+        "not-running": "未运行",
+        "listening": "监听端口",
+        "privileged": "高权限",
+        "attention": "需关注",
+        "residual-candidate": "残留候选",
+        "launch-agent": "LaunchAgent",
+        "launch-daemon": "LaunchDaemon",
+        "global-agent": "全局 Agent",
+        "remote-control": "远控类",
+        "network-proxy": "代理/网络",
+        "agent-service": "Agent 服务",
+        "updater": "更新器",
+        "input-method": "输入法",
+        "error": "异常",
+        "confirmed": "已确认",
+        "residual": "残留",
+        "not-agent": "非 Agent",
     }
     return state_labels.get(state, state)
 
@@ -659,8 +956,12 @@ def render_asset_cards(agent_registry):
 
 def asset_group(asset):
     categories = set(asset.get("category", []))
-    if {"agent-host", "agent-app", "mcp", "mcp-server"} & categories:
-        return "agent-mcp", "Agent / MCP"
+    # Primary grouping: an asset is an agent host first, an MCP service second,
+    # a CLI/project tool third, then runtime/skill/other.
+    if {"agent-host", "agent-app"} & categories:
+        return "agent", "Agent 宿主"
+    if {"mcp", "mcp-server", "mcp-host", "mcp-wrapper", "local-http", "remote-http"} & categories:
+        return "mcp", "MCP 服务"
     if {"cli", "project-tool"} & categories:
         return "cli-project", "CLI / 项目工具"
     if {"package-manager", "cli-runtime", "runtime"} & categories:
@@ -675,7 +976,7 @@ def render_asset_sections(agent_registry):
     for asset_id, asset in sorted(agent_registry.get("assets", {}).items()):
         group_key, group_label = asset_group(asset)
         groups.setdefault(group_key, {"label": group_label, "items": []})["items"].append((asset_id, asset))
-    order = ["agent-mcp", "cli-project", "skills-workflow", "runtime", "other"]
+    order = ["agent", "mcp", "cli-project", "skills-workflow", "runtime", "other"]
     sections = []
     for group_key in order:
         group = groups.get(group_key)
@@ -703,7 +1004,8 @@ def render_asset_filters(agent_registry):
         group_key, _group_label = asset_group(asset)
         counts[group_key] = counts.get(group_key, 0) + 1
     items = [
-        ("Agent / MCP", "agent-mcp", counts.get("agent-mcp", 0)),
+        ("Agent 宿主", "agent", counts.get("agent", 0)),
+        ("MCP 服务", "mcp", counts.get("mcp", 0)),
         ("CLI / 项目工具", "cli-project", counts.get("cli-project", 0)),
         ("技能 / 工作流", "skills-workflow", counts.get("skills-workflow", 0)),
         ("运行时", "runtime", counts.get("runtime", 0)),
@@ -762,11 +1064,219 @@ def state_badge(state, label=None):
         "dashboard": "面板",
         "runtime": "运行时",
         "cli": "CLI",
+        "canonical": "标准项目",
+        "legacy": "旧位置",
+        "download_candidate": "下载候选",
+        "host_managed": "宿主管理",
+        "registered_source": "已登记源码",
+        "manual": "手动根目录",
+        "linked": "已关联资产",
+        "git-repo": "Git 仓库",
+        "node-package": "Node 包",
+        "python-package": "Python 包",
+        "go-module": "Go 模块",
+        "rust-package": "Rust 包",
+        "skill": "Skill",
+        "mcp-candidate": "MCP 候选",
+        "cli-candidate": "CLI 候选",
+        "documentation": "文档项目",
+        "enabled": "已启用",
+        "disabled": "已关闭",
+        "running": "运行中",
+        "not-running": "未运行",
+        "listening": "监听端口",
+        "privileged": "高权限",
+        "attention": "需关注",
+        "residual-candidate": "残留候选",
+        "launch-agent": "LaunchAgent",
+        "launch-daemon": "LaunchDaemon",
+        "global-agent": "全局 Agent",
+        "remote-control": "远控类",
+        "network-proxy": "代理/网络",
+        "agent-service": "Agent 服务",
+        "updater": "更新器",
+        "input-method": "输入法",
+        "error": "异常",
+        "confirmed": "已确认",
+        "residual": "残留",
+        "not-agent": "非 Agent",
     }
     raw_text = label or state
     text = state_labels.get(raw_text, state_labels.get(state, raw_text))
     normalized = state.replace("_", "-")
     return f'<span class="state state-{h(normalized)}">{h(text)}</span>'
+
+
+def render_project_filters(project_rows):
+    counts = {}
+    for row in project_rows:
+        role = row.get("root_role", "")
+        if role:
+            counts[role] = counts.get(role, 0) + 1
+        if row.get("linked_assets"):
+            counts["linked"] = counts.get("linked", 0) + 1
+        for kind in listify(row.get("kind")):
+            counts[kind] = counts.get(kind, 0) + 1
+    return render_filter_bar("projects", [
+        ("标准项目", "canonical", counts.get("canonical", 0)),
+        ("旧位置", "legacy", counts.get("legacy", 0)),
+        ("下载候选", "download_candidate", counts.get("download_candidate", 0)),
+        ("宿主管理", "host_managed", counts.get("host_managed", 0)),
+        ("已关联", "linked", counts.get("linked", 0)),
+        ("Git 仓库", "git-repo", counts.get("git-repo", 0)),
+        ("CLI 候选", "cli-candidate", counts.get("cli-candidate", 0)),
+        ("MCP 候选", "mcp-candidate", counts.get("mcp-candidate", 0)),
+    ])
+
+
+def render_kind_badges(kinds):
+    values = listify(kinds)
+    if not values:
+        return '<span class="muted">未识别</span>'
+    return " ".join(state_badge(value) for value in values[:5])
+
+
+def render_project_rows(rows):
+    if not rows:
+        return '<tr><td colspan="6" class="muted">还没有项目索引。点击“刷新项目索引”生成第一版。</td></tr>'
+    out = []
+    for row in rows:
+        role = row.get("root_role") or "legacy"
+        linked = listify(row.get("linked_assets"))
+        status = "linked" if linked else role
+        kinds = listify(row.get("kind"))
+        signals = listify(row.get("signals"))
+        entries = listify(row.get("entrypoint_candidates"))
+        filter_tags = " ".join([role, status] + kinds + signals)
+        remote = row.get("git_remote") or ""
+        signal_text = ", ".join(signals[:8]) if signals else "无"
+        if len(signals) > 8:
+            signal_text += f" +{len(signals) - 8}"
+        out.append(f"""
+        <tr class="searchable" data-section="projects" data-filter-tags="{h(filter_tags)}" data-text="{h(json.dumps(row, ensure_ascii=False))}">
+          <td><strong>{h(row.get("name", ""))}</strong><span class="subtle">{render_kind_badges(kinds)}</span></td>
+          <td>{chip(row.get("path", ""))}<span class="subtle">{h(remote) if remote else "无 remote"}</span></td>
+          <td>{state_badge(status)}</td>
+          <td><span class="subtle">信号：{h(signal_text)}</span><div>{render_chips(entries) if entries else '<span class="muted">无入口候选</span>'}</div></td>
+          <td>{render_chips(linked) if linked else '<span class="muted">未关联</span>'}</td>
+          <td class="note-cell">{h(row.get("action_hint") or "")}</td>
+        </tr>
+        """)
+    return "\n".join(out)
+
+
+def render_macos_filters(rows):
+    counts = {}
+    for row in rows:
+        for tag in listify(row.get("tags")):
+            counts[tag] = counts.get(tag, 0) + 1
+    return render_filter_bar("system", [
+        ("需关注", "attention", counts.get("attention", 0)),
+        ("运行中", "running", counts.get("running", 0)),
+        ("监听端口", "listening", counts.get("listening", 0)),
+        ("高权限", "privileged", counts.get("privileged", 0)),
+        ("残留候选", "residual-candidate", counts.get("residual-candidate", 0)),
+        ("远控类", "remote-control", counts.get("remote-control", 0)),
+        ("代理/网络", "network-proxy", counts.get("network-proxy", 0)),
+        ("Agent 服务", "agent-service", counts.get("agent-service", 0)),
+        ("异常", "error", counts.get("error", 0)),
+        ("已关联", "linked", counts.get("linked", 0)),
+        ("已登记", "registered", counts.get("registered", 0)),
+        ("已确认", "confirmed", counts.get("confirmed", 0)),
+        ("非 Agent", "not-agent", counts.get("not-agent", 0)),
+        ("已忽略", "ignore", counts.get("ignore", 0)),
+    ])
+
+
+def macos_open_review_rows(rows):
+    open_rows = []
+    for row in rows:
+        if row.get("review_status") != "new":
+            continue
+        tags = set(listify(row.get("tags")))
+        if tags & {"attention", "agent-service", "listening", "privileged", "residual-candidate"}:
+            open_rows.append(row)
+    return open_rows
+
+
+def macos_unlinked_agent_services(rows):
+    out = []
+    for row in rows:
+        tags = set(listify(row.get("tags")))
+        if row.get("linked_assets") or row.get("review_status") != "new":
+            continue
+        if "agent-service" in tags and row.get("running"):
+            out.append(row)
+    return out
+
+
+def macos_status(row):
+    tags = set(listify(row.get("tags")))
+    if "error" in tags:
+        return "error"
+    if "residual-candidate" in tags:
+        return "residual-candidate"
+    if "listening" in tags:
+        return "listening"
+    if "running" in tags:
+        return "running"
+    if "privileged" in tags:
+        return "privileged"
+    if "attention" in tags:
+        return "attention"
+    if "disabled" in tags:
+        return "disabled"
+    return "not-running"
+
+
+def render_macos_rows(rows):
+    if not rows:
+        return '<tr><td colspan="8" class="muted">还没有 macOS 系统痕迹索引。点击“刷新系统痕迹”生成第一版。</td></tr>'
+    out = []
+    for row in rows:
+        tags = listify(row.get("tags"))
+        status = row.get("review_status", "new")
+        paths = listify(row.get("paths"))[:5]
+        listeners = row.get("listeners") or []
+        ports = [f"{listener.get('name', '')}" for listener in listeners[:4]]
+        processes = row.get("processes") or []
+        process_text = processes[0].get("args", "") if processes else ""
+        if len(process_text) > 140:
+            process_text = process_text[:137] + "..."
+        linked = listify(row.get("linked_assets"))
+        source_text = ", ".join(listify(row.get("sources")))
+        launch_bits = []
+        if row.get("launch_state"):
+            launch_bits.append(f"state={row.get('launch_state')}")
+        if row.get("launch_pid"):
+            launch_bits.append(f"pid={row.get('launch_pid')}")
+        if row.get("launch_last_exit_code"):
+            launch_bits.append(f"exit={row.get('launch_last_exit_code')}")
+        filter_tags = " ".join(tags + listify(row.get("sources")) + [row.get("launch_role") or ""])
+        item_id = h(row.get("id") or row.get("label") or "")
+        actions = []
+        if status in {"ignore", "not-agent", "residual", "confirmed", "registered"}:
+            actions.append(f'<button class="table-action js-macos-review" data-id="{item_id}" data-status="new">恢复</button>')
+        else:
+            if not row.get("linked_assets") and ({"agent-service", "listening", "privileged"} & set(tags)):
+                actions.append(f'<button class="table-action primary js-macos-register" data-id="{item_id}">登记资产</button>')
+            actions.append(f'<button class="table-action js-macos-review" data-id="{item_id}" data-status="confirmed">确认</button>')
+            actions.append(f'<button class="table-action js-macos-review" data-id="{item_id}" data-status="residual">残留</button>')
+            actions.append(f'<button class="table-action js-macos-review" data-id="{item_id}" data-status="not-agent">非 Agent</button>')
+            actions.append(f'<button class="table-action js-macos-review" data-id="{item_id}" data-status="ignore">忽略</button>')
+        out.append(f"""
+        <tr class="searchable" data-section="system" data-filter-tags="{h(filter_tags)}" data-text="{h(json.dumps(row, ensure_ascii=False))}">
+          <td><strong>{h(row.get("label") or row.get("id") or "")}</strong><span class="subtle">{h(row.get("developer") or row.get("identifier") or "")}</span></td>
+          <td>{state_badge(status)} {state_badge(macos_status(row))}<span class="subtle">{h(" / ".join(launch_bits) or source_text or "无 launchctl 状态")}</span></td>
+          <td class="action-cell">{''.join(actions) if actions else '<span class="muted">无</span>'}</td>
+          <td>{render_kind_badges(tags[:6])}</td>
+          <td>{render_chips(paths) if paths else '<span class="muted">无路径</span>'}</td>
+          <td>{render_chips(ports) if ports else '<span class="muted">无监听</span>'}<span class="subtle">{h(process_text)}</span></td>
+          <td>{render_chips(linked) if linked else '<span class="muted">未关联</span>'}</td>
+          <td class="note-cell">{h(row.get("action_hint") or "")}</td>
+        </tr>
+        """)
+    return "\n".join(out)
 
 
 def render_mcp_rows(rows):
@@ -999,10 +1509,27 @@ def render_config_filters(agent_registry):
     ])
 
 
-def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, skill_totals, health_raw, discovered_rows, discovered_at, discovery_raw, mcp_audit, discovered_meta=None, live=False):
+def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, skill_totals, health_raw, discovered_rows, discovered_at, discovery_raw, mcp_audit, project_rows, project_at, project_meta, macos_rows, macos_at, macos_meta, project_raw="", macos_raw="", discovered_meta=None, live=False):
     discovered_meta = discovered_meta or {}
-    asset_count = len(agent_registry.get("assets", {}))
+    project_meta = project_meta or {}
+    assets = agent_registry.get("assets", {})
+    asset_count = len(assets)
+    agent_app_count = 0
+    agent_host_count = 0
+    agent_subject_count = 0
+    for asset in assets.values():
+        categories = set(listify(asset.get("category")))
+        is_agent_app = "agent-app" in categories
+        is_agent_host = "agent-host" in categories
+        if is_agent_app:
+            agent_app_count += 1
+        if is_agent_host:
+            agent_host_count += 1
+        if is_agent_app or is_agent_host:
+            agent_subject_count += 1
     mcp_connected = sum(1 for r in mcp_rows if r["state"] == "connected")
+    mcp_failed_count = mcp_audit["summary"].get("failed", 0)
+    mcp_delta_count = mcp_audit["summary"].get("host_only", 0) + mcp_audit["summary"].get("registry_only", 0)
     entry_ok = sum(1 for r in entrypoints if r["state"] in {"exec", "file", "dir"})
     unregistered_count = sum(1 for r in discovered_rows if not r.get("registered"))
     needs_review_count = sum(1 for r in discovered_rows if not r.get("registered") and r.get("review_status", "new") == "new")
@@ -1015,10 +1542,29 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
     scan_mode = discovered_meta.get("scan_mode") or "daily"
     scan_dirs = discovered_meta.get("scan_dirs") or []
     scan_mode_label = "全面盘点" if scan_mode == "deep" else "快速体检"
+    project_summary = project_meta.get("summary", {})
+    project_total = project_summary.get("total", len(project_rows))
+    project_legacy = project_summary.get("legacy", 0)
+    project_downloads = project_summary.get("download_candidate", 0)
+    project_host_managed = project_summary.get("host_managed", 0)
+    project_linked = project_summary.get("linked", 0)
+    macos_summary = macos_meta.get("summary", {})
+    macos_total = macos_summary.get("total", len(macos_rows))
+    macos_attention = macos_summary.get("attention", 0)
+    macos_running = macos_summary.get("running", 0)
+    macos_listening = macos_summary.get("listening", 0)
+    macos_privileged = macos_summary.get("privileged", 0)
+    macos_residual = macos_summary.get("residual_candidates", 0)
+    macos_open_rows = macos_open_review_rows(macos_rows)
+    macos_open_count = len(macos_open_rows)
+    macos_unlinked_agents = macos_unlinked_agent_services(macos_rows)
+    decision_count = needs_review_count + len(macos_unlinked_agents)
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     live_attr = "true" if live else "false"
     scan_disabled = "" if live else "disabled"
     scan_hint = "实时模式：扫描后会刷新候选项和 MCP 对账。" if live else "静态文件只读。打开 live dashboard 后，才能在浏览器里触发扫描。"
+    project_scan_hint = "刷新会重建项目索引，不移动、不删除任何文件。" if live else "静态文件只读。打开 live dashboard 后，才能刷新项目索引。"
+    macos_scan_hint = "刷新会重建 macOS 登录项、launchd、进程和端口痕迹索引，只读不清理。" if live else "静态文件只读。打开 live dashboard 后，才能刷新系统痕迹。"
     overview_issues = []
     if mcp_audit["summary"]["host_only"]:
         overview_issues.append(("new", f"{mcp_audit['summary']['host_only']} 个 MCP 已写进宿主配置，但还没纳入 MCP 总账。", "#mcp-host-only", "纳入 MCP 总账"))
@@ -1028,6 +1574,10 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
         overview_issues.append(("failed", f"{mcp_audit['summary']['failed']} 个 MCP 当前连接失败，需要排查宿主或运行时。", "#mcp-health", "查看连接"))
     if needs_review_count:
         overview_issues.append(("new", f"{needs_review_count} 个候选工具还没处理，扫描结果还没有形成资产决策。", "#discovered-pending", "处理候选"))
+    if project_legacy or project_downloads:
+        overview_issues.append(("legacy", f"{project_legacy + project_downloads} 个项目还在旧位置或下载目录，需要判断是否收编到 {PROJECTS_DIR}。", "#projects-legacy", "查看项目"))
+    if macos_open_count:
+        overview_issues.append(("attention", f"{macos_open_count} 条 macOS 后台/登录/服务痕迹还没处理，需要确认来源、状态或是否入账。", "#system-signals", "查看系统痕迹"))
     outside_stable = [
         row for row in entrypoints
         if row["path"] and row["state"] == "exec" and not row["path"].startswith(str(STABLE_BIN_DIR) + "/")
@@ -1068,6 +1618,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       display: grid;
       grid-template-columns: 248px minmax(0, 1fr);
       min-height: 100vh;
+      min-width: 0;
     }}
     aside {{
       border-right: 1px solid var(--line);
@@ -1076,8 +1627,10 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       position: sticky;
       top: 0;
       height: 100vh;
+      min-width: 0;
+      max-width: 100%;
     }}
-    main {{ padding: 28px 32px 60px; }}
+    main {{ padding: 28px 32px 60px; min-width: 0; max-width: 100%; }}
     h1 {{ margin: 0; font-size: 30px; line-height: 1.15; }}
     h2 {{ margin: 28px 0 14px; font-size: 18px; }}
     h3 {{ margin: 0; font-size: 16px; }}
@@ -1110,6 +1663,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       border-bottom: 1px solid var(--line);
       padding-bottom: 20px;
       margin-bottom: 20px;
+      min-width: 0;
     }}
     .search {{
       width: min(440px, 100%);
@@ -1179,7 +1733,14 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
     }}
     .metric b {{ display: block; font-size: 26px; margin-bottom: 4px; }}
     .metric span {{ color: var(--muted); font-size: 13px; }}
-    .section {{ display: none; }}
+    .metric small {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      margin-top: 5px;
+    }}
+    .section {{ display: none; min-width: 0; max-width: 100%; }}
     .section.active {{ display: block; }}
     .asset-grid {{
       display: grid;
@@ -1250,12 +1811,12 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       font-size: 12px;
       white-space: nowrap;
     }}
-    .state-connected, .state-exec, .state-file, .state-dir, .state-file-ref {{ color: var(--green); background: #e8f2ea; }}
-    .state-failed, .state-missing, .state-broken-link {{ color: var(--red); background: #fbeaea; }}
-    .state-registered, .state-ref, .state-internal {{ color: var(--blue); background: #e9eefb; }}
-    .state-unregistered, .state-new, .state-cli-candidate, .state-agent-candidate, .state-mcp-wrapper {{ color: var(--violet); background: #f1eafb; }}
-    .state-defer {{ color: var(--amber); background: #fff5d6; }}
-    .state-ignore {{ color: var(--muted); background: #eceee8; }}
+    .state-connected, .state-exec, .state-file, .state-dir, .state-file-ref, .state-canonical, .state-linked, .state-running, .state-enabled, .state-confirmed {{ color: var(--green); background: #e8f2ea; }}
+    .state-failed, .state-missing, .state-broken-link, .state-error {{ color: var(--red); background: #fbeaea; }}
+    .state-registered, .state-ref, .state-internal, .state-host-managed, .state-registered-source, .state-git-repo, .state-node-package, .state-python-package, .state-go-module, .state-rust-package, .state-launch-agent, .state-launch-daemon, .state-global-agent, .state-agent-service {{ color: var(--blue); background: #e9eefb; }}
+    .state-unregistered, .state-new, .state-cli-candidate, .state-agent-candidate, .state-mcp-wrapper, .state-mcp-candidate, .state-skill, .state-listening, .state-remote-control, .state-network-proxy {{ color: var(--violet); background: #f1eafb; }}
+    .state-defer, .state-legacy, .state-download-candidate, .state-documentation, .state-attention, .state-privileged, .state-residual-candidate, .state-residual {{ color: var(--amber); background: #fff5d6; }}
+    .state-ignore, .state-not-running, .state-disabled, .state-updater, .state-input-method, .state-not-agent {{ color: var(--muted); background: #eceee8; }}
     .state-unknown {{ color: var(--amber); background: #fff5d6; }}
     .asset-row {{ margin: 9px 0; }}
     .asset-row strong {{ display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }}
@@ -1289,6 +1850,15 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       border: 1px solid var(--line);
       border-radius: 8px;
       overflow: hidden;
+    }}
+    .table-scroll {{
+      width: 100%;
+      max-width: 100%;
+      overflow-x: auto;
+      border-radius: 8px;
+    }}
+    .table-scroll table {{
+      min-width: 900px;
     }}
     th, td {{
       text-align: left;
@@ -1352,6 +1922,37 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       gap: 10px;
       margin: 14px 0 4px;
     }}
+    .evidence-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin: 16px 0 22px;
+    }}
+    .evidence-card {{
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 150px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      text-decoration: none;
+      color: var(--text);
+    }}
+    .evidence-card strong {{
+      font-size: 16px;
+    }}
+    .evidence-card b {{
+      display: block;
+      font-size: 28px;
+      margin: 12px 0 2px;
+    }}
+    .evidence-card span {{
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }}
     .action-cell {{
       min-width: 180px;
     }}
@@ -1389,6 +1990,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       .shell {{ grid-template-columns: 1fr; }}
       aside {{ position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }}
       .summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .evidence-grid {{ grid-template-columns: 1fr; }}
       .asset-grid {{ grid-template-columns: 1fr; }}
       .topbar {{ flex-direction: column; }}
       main {{ padding: 20px; }}
@@ -1409,10 +2011,8 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
         <button class="active" data-tab="overview">总览</button>
         <button data-tab="discovered">待处理</button>
         <button data-tab="assets">资产</button>
-        <button data-tab="mcp">MCP</button>
-        <button data-tab="entrypoints">入口</button>
-        <button data-tab="skills">技能</button>
-        <button data-tab="config">配置</button>
+        <button data-tab="evidence">发现</button>
+        <button data-tab="config">设置</button>
       </nav>
       <div class="meta">
         生成时间：{h(generated)}<br>
@@ -1437,12 +2037,13 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
 
       <section class="section active" data-section="overview">
         <div class="summary">
-          <div class="metric"><b>{asset_count}</b><span>已登记资产</span></div>
-          <div class="metric"><b>{mcp_connected}/{len(mcp_rows)}</b><span>MCP 当前连通</span></div>
-          <div class="metric"><b>{entry_ok}/{len(entrypoints)}</b><span>有效入口</span></div>
-          <div class="metric"><b>{needs_review_count}</b><span>候选工具待处理</span></div>
-          <div class="metric"><b>{mcp_audit['summary']['host_only'] + mcp_audit['summary']['registry_only']}</b><span>MCP 对账差异</span></div>
+          <div class="metric"><b>{agent_subject_count}</b><span>Agent 主体</span><small>App {agent_app_count} / Host {agent_host_count}</small></div>
+          <div class="metric"><b>{mcp_connected}/{len(mcp_rows)}</b><span>MCP 可用性</span><small>{mcp_failed_count} 个连接失败</small></div>
+          <div class="metric"><b>{decision_count}</b><span>待处理决策</span><small>候选 {needs_review_count} / Agent 服务 {len(macos_unlinked_agents)}</small></div>
+          <div class="metric"><b>{mcp_delta_count}</b><span>台账差异</span><small>MCP 宿主配置和 registry 不一致</small></div>
+          <div class="metric"><b>{entry_ok}/{len(entrypoints)}</b><span>入口健康</span><small>Agent 可调用 wrapper / 路径</small></div>
         </div>
+        <p>资产台账共有 {asset_count} 条，里面包含 Agent 主体、MCP、CLI、技能根目录、项目工具和系统支撑项；它不是 Agent 数。</p>
         <h2>当前问题</h2>
         <div class="issue-list">
           {"".join(
@@ -1458,7 +2059,13 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
           <p>最近一次体检模式：{h(scan_mode_label)}。最近一次扫描时间：{h(discovered_at or "尚未扫描")}。</p>
           <div class="quick-actions">
             {'<button class="table-action primary js-register-all-mcp">一键纳入新增 MCP</button>' if mcp_audit["summary"]["host_only"] else ''}
+            <button class="table-action primary full-update-button" data-live="{live_attr}" {scan_disabled}>一键更新全部索引</button>
+            <button class="table-action crosscheck-button" data-live="{live_attr}" {scan_disabled}>一键交叉校验</button>
+            <button class="table-action project-scan-button" data-live="{live_attr}" {scan_disabled}>刷新项目目录</button>
+            <button class="table-action macos-scan-button" data-live="{live_attr}" {scan_disabled}>刷新系统痕迹</button>
             <a class="jump-link js-jump" href="#discovered-pending">处理候选工具</a>
+            <a class="jump-link js-jump" href="#projects-legacy">查看旧项目</a>
+            <a class="jump-link js-jump" href="#system-signals">查看系统痕迹</a>
             <a class="jump-link js-jump" href="#entrypoints">查看入口规范</a>
           </div>
         </div>
@@ -1475,15 +2082,94 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
             </tr>
           </tbody>
         </table>
-        <h2>Claude MCP 健康状态</h2>
-        <pre class="raw-health">{h(health_raw or "没有捕获到健康检查输出。")}</pre>
-        <h2>扫描结果</h2>
-        <table>
-          <tbody>
-            <tr><td><strong>上次扫描</strong></td><td>{h(discovered_at or "尚未扫描")}</td></tr>
-            <tr><td><strong>摘要</strong></td><td><pre class="raw-health">{h(discovery_raw or "当前没有扫描输出。")}</pre></td></tr>
-          </tbody>
-        </table>
+        <details>
+          <summary>原始体检输出</summary>
+          <h2>Claude MCP 健康状态</h2>
+          <pre class="raw-health">{h(health_raw or "没有捕获到健康检查输出。")}</pre>
+          <h2>扫描结果</h2>
+          <table>
+            <tbody>
+              <tr><td><strong>上次扫描</strong></td><td>{h(discovered_at or "尚未扫描")}</td></tr>
+              <tr><td><strong>摘要</strong></td><td><pre class="raw-health">{h(discovery_raw or "当前没有扫描输出。")}</pre></td></tr>
+            </tbody>
+          </table>
+        </details>
+      </section>
+
+      <section class="section" data-section="evidence">
+        <h2>发现来源</h2>
+        <p>这里不是正式资产台账，只是证据入口。日常先处理“待处理”，需要追来源时再从这里进入细项。</p>
+        <div class="evidence-grid">
+          <a class="evidence-card" href="#projects">
+            <strong>项目目录</strong>
+            <b>{project_total}</b>
+            <span>{project_legacy + project_downloads} 个旧位置/下载候选，{project_linked} 个已关联资产。</span>
+          </a>
+          <a class="evidence-card" href="#system">
+            <strong>系统痕迹</strong>
+            <b>{macos_open_count}</b>
+            <span>{macos_total} 条登录项、后台项、launchd、进程和端口痕迹，当前待处理 {macos_open_count} 条。</span>
+          </a>
+          <a class="evidence-card" href="#mcp">
+            <strong>MCP 对账</strong>
+            <b>{mcp_audit['summary']['host_only'] + mcp_audit['summary']['registry_only']}</b>
+            <span>{mcp_connected}/{len(mcp_rows)} 当前连通，查看宿主配置和总账差异。</span>
+          </a>
+          <a class="evidence-card" href="#entrypoints">
+            <strong>稳定入口</strong>
+            <b>{entry_ok}/{len(entrypoints)}</b>
+            <span>Agent 真正应该调用的命令、wrapper、PATH 和坏链检查。</span>
+          </a>
+          <a class="evidence-card" href="#skills">
+            <strong>技能根目录</strong>
+            <b>{skill_totals.get("unique", 0)}</b>
+            <span>按顶层技能库看真实数量，递归数量只用于诊断重复和镜像。</span>
+          </a>
+          <a class="evidence-card" href="#config">
+            <strong>规则来源</strong>
+            <b>{len(agent_registry.get("indexes", {}).get("host_configs", {}))}</b>
+            <span>查看 registry、MCP registry、宿主配置和启动文件在哪里。</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="section" data-section="projects">
+        <h2 id="projects-legacy">项目索引</h2>
+        <p>这里专门看 GitHub 下载、历史 clone、源码包和宿主管理工作区；索引只记录位置和信号，不搬迁、不删除文件。</p>
+        <p>当前：{project_total} 个项目 / {project_legacy} 个旧位置 / {project_downloads} 个下载候选 / {project_host_managed} 个宿主管理 / {project_linked} 个已关联资产。更新时间：{h(project_at or "尚未生成")}。</p>
+        <div class="quick-actions">
+          <button class="table-action primary project-scan-button" data-live="{live_attr}" {scan_disabled}>刷新项目索引</button>
+          <span class="scan-status" id="projectStatus">{h(project_scan_hint)}</span>
+        </div>
+        {render_project_filters(project_rows)}
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>项目</th><th>路径 / remote</th><th>状态</th><th>信号 / 入口候选</th><th>关联资产</th><th>下一步</th></tr></thead>
+            <tbody>{render_project_rows(project_rows)}</tbody>
+          </table>
+        </div>
+        <div class="empty">没有匹配的项目。</div>
+        {'<h2>项目索引输出</h2><pre class="raw-health">' + h(project_raw) + '</pre>' if project_raw else ''}
+      </section>
+
+      <section class="section" data-section="system">
+        <h2 id="system-signals">macOS 系统痕迹</h2>
+        <p>这里聚合登录项与扩展、BackgroundTaskManagement、LaunchAgents/Daemons、launchctl、进程、监听端口和高权限 helper。索引只读，不卸载、不禁用、不删除。</p>
+        <p>当前：{macos_open_count} 条待处理 / {macos_total} 条痕迹 / {macos_running} 条运行中 / {macos_listening} 条监听端口 / {macos_privileged} 条高权限 / {macos_residual} 条残留候选。更新时间：{h(macos_at or "尚未生成")}。</p>
+        <div class="quick-actions">
+          <button class="table-action primary macos-scan-button" data-live="{live_attr}" {scan_disabled}>刷新系统痕迹</button>
+          {'<button class="table-action primary js-macos-register-agent-services">一键登记未入账 Agent 服务</button>' if macos_unlinked_agents else ''}
+          <span class="scan-status" id="macosStatus">{h(macos_scan_hint)}</span>
+        </div>
+        {render_macos_filters(macos_rows)}
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>名称</th><th>状态</th><th>处理</th><th>标签</th><th>路径</th><th>端口 / 进程</th><th>关联资产</th><th>下一步</th></tr></thead>
+            <tbody>{render_macos_rows(macos_rows)}</tbody>
+          </table>
+        </div>
+        <div class="empty">没有匹配的系统痕迹。</div>
+        {'<h2>系统痕迹输出</h2><pre class="raw-health">' + h(macos_raw) + '</pre>' if macos_raw else ''}
       </section>
 
       <section class="section" data-section="assets">
@@ -1522,8 +2208,18 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       </section>
 
       <section class="section" data-section="discovered">
-        <h2>待处理候选项</h2>
-        <p>扫描的意义不是把路径堆出来，而是把“要不要入账”这件事做完。这里每个候选项都应该有决定：登记、稍后、忽略。</p>
+        <h2>待处理</h2>
+        <p>这里集中放需要你做决定的事项。项目、系统、MCP、入口这些来源都只是证据，真正要做的是登记、确认、忽略或稍后。</p>
+        <div class="issue-list">
+          {"".join(
+              f'<div class="issue-row searchable" data-section="discovered" data-text="{h(text)}">'
+              f'<div class="issue-main">{state_badge(state)}<p>{h(text)}</p></div>'
+              f'<div class="issue-actions"><a class="jump-link js-jump" href="{h(target)}">{h(label)}</a></div></div>'
+              for state, text, target, label in overview_issues
+          ) if overview_issues else '<div class="issue-row"><div class="issue-main">' + state_badge('registered', '已清空') + '<p>当前没有跨来源待办。</p></div></div>'}
+        </div>
+        <h2>候选工具</h2>
+        <p>候选工具只是一类待办。每个候选项都应该有决定：登记、稍后、忽略。</p>
         <p>当前模式：{h(scan_mode_label)}。当前：{needs_review_count} 个待处理 / {deferred_count} 个稍后处理 / {ignored_count} 个已忽略 / 共 {unregistered_count} 个未登记。</p>
         {render_discovered_filters(discovered_rows)}
         <details>
@@ -1550,7 +2246,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       </section>
 
       <section class="section" data-section="config">
-        <h2>配置 / 规则</h2>
+        <h2>设置 / 规则</h2>
         <p>这里列出本机 Agent 资产规范、MCP 总账、宿主配置和启动文件，方便排查“规则到底写在哪里”。</p>
         {render_config_filters(agent_registry)}
         <table>
@@ -1570,6 +2266,12 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
     const scanAction = document.getElementById("scanAction");
     const scanButtons = Array.from(document.querySelectorAll(".scan-button"));
     const scanStatus = document.getElementById("scanStatus");
+    const projectButtons = Array.from(document.querySelectorAll(".project-scan-button"));
+    const projectStatus = document.getElementById("projectStatus");
+    const macosButtons = Array.from(document.querySelectorAll(".macos-scan-button"));
+    const macosStatus = document.getElementById("macosStatus");
+    const fullUpdateButtons = Array.from(document.querySelectorAll(".full-update-button"));
+    const crosscheckButtons = Array.from(document.querySelectorAll(".crosscheck-button"));
     const filterButtons = Array.from(document.querySelectorAll(".filter-chip"));
     const tabCopy = {{
       overview: {{
@@ -1580,31 +2282,54 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
         title: "资产",
         subtitle: "正式登记过的本机 Agent 资产；这里回答“这个工具归谁、入口在哪、配置在哪”。"
       }},
+      evidence: {{
+        title: "发现",
+        subtitle: "所有扫描来源都收在这里。先当证据看，只有处理后才进入正式资产。"
+      }},
       mcp: {{
-        title: "MCP",
-        subtitle: "同时看 MCP 总账、宿主配置和连接状态，先对账，再排查。"
+        title: "发现 / MCP",
+        subtitle: "MCP 是证据来源之一：同时看总账、宿主配置和连接状态，先对账，再排查。"
       }},
       entrypoints: {{
-        title: "入口",
-        subtitle: "Agent 应该调用的稳定命令和 wrapper；这里专门排查 PATH、坏链、归属不清。"
+        title: "发现 / 入口",
+        subtitle: "入口是证据来源之一：Agent 应该调用的稳定命令和 wrapper；这里专门排查 PATH、坏链、归属不清。"
       }},
       discovered: {{
         title: "待处理",
         subtitle: "把候选工具真正处理掉，而不是只看见它们。"
       }},
+      projects: {{
+        title: "发现 / 项目",
+        subtitle: "项目是证据来源之一：历史下载、GitHub clone、源码包和宿主管理工作区；先索引，再决定是否收编。"
+      }},
+      system: {{
+        title: "发现 / 系统",
+        subtitle: "系统痕迹是证据来源之一：macOS 登录项、后台项、launchd、进程和端口痕迹；先验证，再决定是否清理或入账。"
+      }},
       skills: {{
-        title: "技能",
-        subtitle: "统计本机 skill 根目录、真实去重数量和路径数量，解释 Finder 里替身为什么看起来很多。"
+        title: "发现 / 技能",
+        subtitle: "技能是证据来源之一：统计本机 skill 根目录、真实去重数量和路径数量，解释 Finder 里替身为什么看起来很多。"
       }},
       config: {{
-        title: "配置",
+        title: "设置",
         subtitle: "本机规则、总账、宿主配置和启动文件的位置；新 Agent 接入时先从这里找源头。"
       }}
     }};
     const scanTabs = new Set(["overview", "discovered"]);
-    const searchTabs = new Set(["assets", "mcp", "entrypoints", "skills", "config"]);
+    const searchTabs = new Set(["assets", "projects", "system", "mcp", "entrypoints", "skills", "config"]);
+    const tabParents = {{
+      projects: "evidence",
+      system: "evidence",
+      mcp: "evidence",
+      entrypoints: "evidence",
+      skills: "evidence"
+    }};
     const hashTabs = {{
       overview: "overview",
+      projects: "projects",
+      "projects-legacy": "projects",
+      system: "system",
+      "system-signals": "system",
       mcp: "mcp",
       "mcp-health": "mcp",
       "mcp-host-only": "mcp",
@@ -1612,13 +2337,15 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
       discovered: "discovered",
       "discovered-pending": "discovered",
       assets: "assets",
+      evidence: "evidence",
       entrypoints: "entrypoints",
       skills: "skills",
       config: "config"
     }};
 
     function activate(tab) {{
-      buttons.forEach((button) => button.classList.toggle("active", button.dataset.tab === tab));
+      const navTab = tabParents[tab] || tab;
+      buttons.forEach((button) => button.classList.toggle("active", button.dataset.tab === navTab));
       sections.forEach((section) => section.classList.toggle("active", section.dataset.section === tab));
       const copy = tabCopy[tab] || tabCopy.overview;
       if (pageTitle) pageTitle.textContent = copy.title;
@@ -1634,7 +2361,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
     function activateFromHash() {{
       const raw = location.hash ? location.hash.slice(1) : "overview";
       const tab = hashTabs[raw] || raw || "overview";
-      if (!buttons.some((button) => button.dataset.tab === tab)) {{
+      if (!sections.some((section) => section.dataset.section === tab)) {{
         activate("overview");
         return;
       }}
@@ -1693,6 +2420,74 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
         }} catch (error) {{
           scanStatus.textContent = `扫描失败：${{error.message || error}}`;
           scanButtons.forEach((button) => button.disabled = false);
+        }}
+      }});
+    }});
+    projectButtons.forEach((projectButton) => {{
+      if (projectButton.dataset.live !== "true") return;
+      projectButton.addEventListener("click", async () => {{
+        projectButtons.forEach((button) => button.disabled = true);
+        if (projectStatus) projectStatus.textContent = "正在刷新项目索引，不移动、不删除文件...";
+        try {{
+          const response = await fetch("/api/projects/scan", {{ method: "POST" }});
+          if (!response.ok) throw new Error(await response.text());
+          const result = await response.json();
+          if (projectStatus) projectStatus.textContent = `项目索引完成：${{result.projects}} 个项目，${{result.legacy + result.download_candidate}} 个旧位置/下载候选。正在刷新页面...`;
+          setTimeout(() => window.location.reload(), 450);
+        }} catch (error) {{
+          if (projectStatus) projectStatus.textContent = `项目索引失败：${{error.message || error}}`;
+          projectButtons.forEach((button) => button.disabled = false);
+        }}
+      }});
+    }});
+    macosButtons.forEach((macosButton) => {{
+      if (macosButton.dataset.live !== "true") return;
+      macosButton.addEventListener("click", async () => {{
+        macosButtons.forEach((button) => button.disabled = true);
+        if (macosStatus) macosStatus.textContent = "正在刷新 macOS 系统痕迹，只读不清理...";
+        try {{
+          const response = await fetch("/api/macos/scan", {{ method: "POST" }});
+          if (!response.ok) throw new Error(await response.text());
+          const result = await response.json();
+          if (macosStatus) macosStatus.textContent = `系统痕迹完成：${{result.items}} 条，${{result.attention}} 条需关注，${{result.residual_candidates}} 条残留候选。正在刷新页面...`;
+          setTimeout(() => window.location.reload(), 450);
+        }} catch (error) {{
+          if (macosStatus) macosStatus.textContent = `系统痕迹刷新失败：${{error.message || error}}`;
+          macosButtons.forEach((button) => button.disabled = false);
+        }}
+      }});
+    }});
+    fullUpdateButtons.forEach((fullUpdateButton) => {{
+      if (fullUpdateButton.dataset.live !== "true") return;
+      fullUpdateButton.addEventListener("click", async () => {{
+        fullUpdateButtons.forEach((button) => button.disabled = true);
+        if (scanStatus) scanStatus.textContent = "正在更新候选工具、项目索引、系统痕迹和 MCP 状态...";
+        try {{
+          const response = await fetch("/api/reconcile?mode=daily", {{ method: "POST" }});
+          if (!response.ok) throw new Error(await response.text());
+          const result = await response.json();
+          if (scanStatus) scanStatus.textContent = `更新完成：${{result.candidates}} 个候选，${{result.projects}} 个项目，${{result.macos_signals}} 条系统痕迹。正在刷新页面...`;
+          setTimeout(() => window.location.reload(), 450);
+        }} catch (error) {{
+          if (scanStatus) scanStatus.textContent = `一键更新失败：${{error.message || error}}`;
+          fullUpdateButtons.forEach((button) => button.disabled = false);
+        }}
+      }});
+    }});
+    crosscheckButtons.forEach((crosscheckButton) => {{
+      if (crosscheckButton.dataset.live !== "true") return;
+      crosscheckButton.addEventListener("click", async () => {{
+        crosscheckButtons.forEach((button) => button.disabled = true);
+        if (scanStatus) scanStatus.textContent = "正在用现有快照交叉校验资产、MCP、项目和系统痕迹...";
+        try {{
+          const response = await fetch("/api/crosscheck", {{ method: "POST" }});
+          if (!response.ok) throw new Error(await response.text());
+          const result = await response.json();
+          if (scanStatus) scanStatus.textContent = `交叉校验完成：MCP 差异 ${{result.mcp_delta}}，系统待处理 ${{result.macos_open_review}}，未入账 Agent 服务 ${{result.macos_unlinked_agent_services}}。正在刷新页面...`;
+          setTimeout(() => window.location.reload(), 450);
+        }} catch (error) {{
+          if (scanStatus) scanStatus.textContent = `交叉校验失败：${{error.message || error}}`;
+          crosscheckButtons.forEach((button) => button.disabled = false);
         }}
       }});
     }});
@@ -1759,6 +2554,40 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
         }}
       }});
     }});
+    document.querySelectorAll(".js-macos-review").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        try {{
+          await postJson("/api/macos/review", {{ id: button.dataset.id, status: button.dataset.status }}, button);
+          window.location.reload();
+        }} catch (error) {{
+          if (macosStatus) macosStatus.textContent = `更新系统痕迹状态失败：${{error.message || error}}`;
+          resetActionButton(button);
+        }}
+      }});
+    }});
+    document.querySelectorAll(".js-macos-register").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        try {{
+          await postJson("/api/macos/register", {{ id: button.dataset.id }}, button);
+          window.location.reload();
+        }} catch (error) {{
+          if (macosStatus) macosStatus.textContent = `登记系统痕迹失败：${{error.message || error}}`;
+          resetActionButton(button);
+        }}
+      }});
+    }});
+    document.querySelectorAll(".js-macos-register-agent-services").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        try {{
+          const result = await postJson("/api/macos/register-agent-services", {{}}, button);
+          if (macosStatus) macosStatus.textContent = `已登记 ${{result.count}} 个未入账 Agent 服务，正在刷新页面...`;
+          setTimeout(() => window.location.reload(), 450);
+        }} catch (error) {{
+          if (macosStatus) macosStatus.textContent = `批量登记 Agent 服务失败：${{error.message || error}}`;
+          resetActionButton(button);
+        }}
+      }});
+    }});
     window.addEventListener("hashchange", activateFromHash);
     activateFromHash();
   </script>
@@ -1767,11 +2596,15 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, skill_rows, 
 """
 
 
-def build_dashboard(run_discovery=True, refresh_mcp=True, live=False, discovery_mode="daily"):
+def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, run_macos=True, live=False, discovery_mode="daily"):
     agent_registry = load_json(REGISTRY)
     mcp_registry = load_json(MCP_REGISTRY)
     discovery_raw = refresh_discovery(mode=discovery_mode) if run_discovery else ""
+    project_raw = refresh_projects() if run_projects else ""
+    macos_raw = refresh_macos_signals() if run_macos else ""
     discovered_rows, discovered_at, discovered_meta = collect_discovered()
+    project_rows, project_at, project_meta = collect_projects()
+    macos_rows, macos_at, macos_meta = collect_macos_signals()
     if refresh_mcp:
         health, health_raw = parse_claude_mcp_health()
     else:
@@ -1792,18 +2625,65 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, live=False, discovery_
         discovered_at,
         discovery_raw,
         mcp_audit,
+        project_rows,
+        project_at,
+        project_meta,
+        macos_rows,
+        macos_at,
+        macos_meta,
+        project_raw,
+        macos_raw,
         discovered_meta,
         live=live,
     )
+    project_summary = project_meta.get("summary", {})
+    macos_summary = macos_meta.get("summary", {})
+    assets = agent_registry.get("assets", {})
+    agent_app_count = 0
+    agent_host_count = 0
+    agent_subject_count = 0
+    for asset in assets.values():
+        categories = set(listify(asset.get("category")))
+        is_agent_app = "agent-app" in categories
+        is_agent_host = "agent-host" in categories
+        if is_agent_app:
+            agent_app_count += 1
+        if is_agent_host:
+            agent_host_count += 1
+        if is_agent_app or is_agent_host:
+            agent_subject_count += 1
+    needs_review = sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status", "new") == "new")
+    macos_unlinked_agent_count = len(macos_unlinked_agent_services(macos_rows))
     summary = {
-        "assets": len(agent_registry.get("assets", {})),
+        "assets": len(assets),
+        "agent_subjects": agent_subject_count,
+        "agent_apps": agent_app_count,
+        "agent_hosts": agent_host_count,
+        "decision_count": needs_review + macos_unlinked_agent_count,
+        "projects": project_summary.get("total", len(project_rows)),
+        "project_canonical": project_summary.get("canonical", 0),
+        "project_legacy": project_summary.get("legacy", 0),
+        "project_download_candidate": project_summary.get("download_candidate", 0),
+        "project_host_managed": project_summary.get("host_managed", 0),
+        "project_linked": project_summary.get("linked", 0),
+        "project_unlinked": sum(1 for row in project_rows if not row.get("linked_assets")),
+        "projects_updated_at": project_at,
+        "macos_signals": macos_summary.get("total", len(macos_rows)),
+        "macos_running": macos_summary.get("running", 0),
+        "macos_listening": macos_summary.get("listening", 0),
+        "macos_privileged": macos_summary.get("privileged", 0),
+        "macos_attention": macos_summary.get("attention", 0),
+        "macos_open_review": len(macos_open_review_rows(macos_rows)),
+        "macos_unlinked_agent_services": macos_unlinked_agent_count,
+        "macos_residual_candidates": macos_summary.get("residual_candidates", 0),
+        "macos_updated_at": macos_at,
         "mcp_total": len(mcp_rows),
         "mcp_connected": sum(1 for row in mcp_rows if row["state"] == "connected"),
         "entrypoints": len(entrypoints),
         "valid_entrypoints": sum(1 for row in entrypoints if row["state"] in {"exec", "file", "dir"}),
         "candidates": len(discovered_rows),
         "unregistered": sum(1 for row in discovered_rows if not row.get("registered")),
-        "needs_review": sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status", "new") == "new"),
+        "needs_review": needs_review,
         "deferred": sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status") == "defer"),
         "ignored": sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status") == "ignore"),
         "skills_unique": skill_totals.get("unique", 0),
@@ -1820,11 +2700,29 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, live=False, discovery_
     return html_text, summary
 
 
-def write_dashboard(run_discovery=True, refresh_mcp=True, live=False):
-    html_text, summary = build_dashboard(run_discovery=run_discovery, refresh_mcp=refresh_mcp, live=live)
+def write_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, run_macos=True, live=False):
+    html_text, summary = build_dashboard(run_discovery=run_discovery, refresh_mcp=refresh_mcp, run_projects=run_projects, run_macos=run_macos, live=live)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(html_text, encoding="utf-8")
     return summary
+
+
+def run_crosscheck():
+    summary = write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
+    return {
+        "ok": True,
+        "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "assets": summary.get("assets", 0),
+        "projects": summary.get("projects", 0),
+        "project_unlinked": summary.get("project_unlinked", 0),
+        "macos_signals": summary.get("macos_signals", 0),
+        "macos_open_review": summary.get("macos_open_review", 0),
+        "macos_unlinked_agent_services": summary.get("macos_unlinked_agent_services", 0),
+        "mcp_delta": summary.get("mcp_host_only", 0) + summary.get("mcp_registry_only", 0),
+        "mcp_host_only": summary.get("mcp_host_only", 0),
+        "mcp_registry_only": summary.get("mcp_registry_only", 0),
+        "needs_review": summary.get("needs_review", 0),
+    }
 
 
 def run_scan(include_versions=False, mode="daily"):
@@ -1833,7 +2731,7 @@ def run_scan(include_versions=False, mode="daily"):
     mcp_registry = load_json(MCP_REGISTRY)
     health, health_raw = parse_claude_mcp_health()
     mcp_rows = collect_mcp(mcp_registry, health)
-    write_dashboard(run_discovery=False, refresh_mcp=False, live=False)
+    write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
     return {
         "ok": True,
         "updated_at": discovered_at,
@@ -1846,6 +2744,76 @@ def run_scan(include_versions=False, mode="daily"):
         "mcp_total": len(mcp_rows),
         "mcp_connected": sum(1 for row in mcp_rows if row["state"] == "connected"),
         "discovery_output": discovery_raw,
+        "mcp_output": health_raw,
+    }
+
+
+def run_project_scan():
+    project_raw = refresh_projects()
+    project_rows, project_at, project_meta = collect_projects()
+    write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
+    summary = project_meta.get("summary", {})
+    return {
+        "ok": True,
+        "updated_at": project_at,
+        "projects": summary.get("total", len(project_rows)),
+        "canonical": summary.get("canonical", 0),
+        "legacy": summary.get("legacy", 0),
+        "download_candidate": summary.get("download_candidate", 0),
+        "host_managed": summary.get("host_managed", 0),
+        "linked": summary.get("linked", 0),
+        "output": project_raw,
+    }
+
+
+def run_macos_scan():
+    macos_raw = refresh_macos_signals()
+    macos_rows, macos_at, macos_meta = collect_macos_signals()
+    write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
+    summary = macos_meta.get("summary", {})
+    return {
+        "ok": True,
+        "updated_at": macos_at,
+        "items": summary.get("total", len(macos_rows)),
+        "running": summary.get("running", 0),
+        "listening": summary.get("listening", 0),
+        "privileged": summary.get("privileged", 0),
+        "attention": summary.get("attention", 0),
+        "residual_candidates": summary.get("residual_candidates", 0),
+        "output": macos_raw,
+    }
+
+
+def run_reconcile(mode="daily"):
+    if mode not in {"daily", "deep"}:
+        mode = "daily"
+    discovery_raw = refresh_discovery(mode=mode)
+    project_raw = refresh_projects()
+    macos_raw = refresh_macos_signals()
+    health, health_raw = parse_claude_mcp_health()
+    discovered_rows, discovered_at, discovered_meta = collect_discovered()
+    project_rows, project_at, project_meta = collect_projects()
+    macos_rows, macos_at, macos_meta = collect_macos_signals()
+    mcp_registry = load_json(MCP_REGISTRY)
+    mcp_rows = collect_mcp(mcp_registry, health)
+    write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
+    return {
+        "ok": True,
+        "scan_mode": discovered_meta.get("scan_mode", mode),
+        "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "candidates": len(discovered_rows),
+        "unregistered": sum(1 for row in discovered_rows if not row.get("registered")),
+        "projects": project_meta.get("summary", {}).get("total", len(project_rows)),
+        "projects_updated_at": project_at,
+        "macos_signals": macos_meta.get("summary", {}).get("total", len(macos_rows)),
+        "macos_open_review": len(macos_open_review_rows(macos_rows)),
+        "macos_updated_at": macos_at,
+        "mcp_total": len(mcp_rows),
+        "mcp_connected": sum(1 for row in mcp_rows if row["state"] == "connected"),
+        "discovered_at": discovered_at,
+        "discovery_output": discovery_raw,
+        "project_output": project_raw,
+        "macos_output": macos_raw,
         "mcp_output": health_raw,
     }
 
@@ -1869,14 +2837,14 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path in {"/", "/dashboard.html"}:
-            html_text, _summary = build_dashboard(run_discovery=False, refresh_mcp=False, live=True)
+            html_text, _summary = build_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=True)
             self.send_text(html_text, "text/html; charset=utf-8")
             return
         if parsed.path == "/favicon.ico":
             self.send_text("", "image/x-icon", status=204)
             return
         if parsed.path == "/api/status":
-            _html_text, summary = build_dashboard(run_discovery=False, refresh_mcp=False, live=True)
+            _html_text, summary = build_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=True)
             self.send_json(summary)
             return
         self.send_json({"ok": False, "error": "not found"}, status=404)
@@ -1884,11 +2852,11 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path in {"/", "/dashboard.html"}:
-            html_text, _summary = build_dashboard(run_discovery=False, refresh_mcp=False, live=True)
+            html_text, _summary = build_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=True)
             self.send_text(html_text, "text/html; charset=utf-8", include_body=False)
             return
         if parsed.path == "/api/status":
-            _html_text, summary = build_dashboard(run_discovery=False, refresh_mcp=False, live=True)
+            _html_text, summary = build_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=True)
             self.send_text(json.dumps(summary, ensure_ascii=False) + "\n", "application/json; charset=utf-8", include_body=False)
             return
         self.send_text("", status=404, include_body=False)
@@ -1903,6 +2871,32 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 mode = "daily"
             try:
                 self.send_json(run_scan(include_versions=include_versions, mode=mode))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/reconcile":
+            query = urllib.parse.parse_qs(parsed.query)
+            mode = query.get("mode", ["daily"])[0]
+            try:
+                self.send_json(run_reconcile(mode=mode))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/crosscheck":
+            try:
+                self.send_json(run_crosscheck())
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/projects/scan":
+            try:
+                self.send_json(run_project_scan())
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/macos/scan":
+            try:
+                self.send_json(run_macos_scan())
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
@@ -1921,8 +2915,42 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             try:
                 save_review_decision(path_value, status)
                 refresh_current_discovery()
-                write_dashboard(run_discovery=False, refresh_mcp=False, live=False)
+                write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
                 self.send_json({"ok": True, "path": path_value, "status": status})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/macos/review":
+            item_id = str(payload.get("id") or "")
+            status = str(payload.get("status") or "")
+            note = str(payload.get("note") or "")
+            if not item_id or status not in MACOS_REVIEW_STATUS_LABELS:
+                self.send_json({"ok": False, "error": "invalid macOS review payload"}, status=400)
+                return
+            try:
+                save_macos_review_decision(item_id, status, note=note)
+                write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
+                self.send_json({"ok": True, "id": item_id, "status": status})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/macos/register":
+            item_id = str(payload.get("id") or "")
+            if not item_id:
+                self.send_json({"ok": False, "error": "missing macOS signal id"}, status=400)
+                return
+            try:
+                asset_id = register_macos_signal(item_id)
+                write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
+                self.send_json({"ok": True, "id": item_id, "asset_id": asset_id})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/macos/register-agent-services":
+            try:
+                asset_ids = register_unlinked_macos_agent_services()
+                write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
+                self.send_json({"ok": True, "asset_ids": asset_ids, "count": len(asset_ids)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
@@ -1934,7 +2962,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             try:
                 register_discovered_candidate(path_value)
                 refresh_current_discovery()
-                write_dashboard(run_discovery=False, refresh_mcp=False, live=False)
+                write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
                 self.send_json({"ok": True, "path": path_value})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
@@ -1947,7 +2975,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             try:
                 register_mcp_from_host(location)
                 refresh_current_discovery()
-                write_dashboard(run_discovery=False, refresh_mcp=False, live=False)
+                write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
                 self.send_json({"ok": True, "location": location})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
@@ -1956,7 +2984,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             try:
                 locations = register_all_host_only_mcp()
                 refresh_current_discovery()
-                write_dashboard(run_discovery=False, refresh_mcp=False, live=False)
+                write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_macos=False, live=False)
                 self.send_json({"ok": True, "locations": locations, "count": len(locations)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)

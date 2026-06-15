@@ -25,6 +25,8 @@
       "stable_entrypoints": [
         "__BIN_DIR__/agent-assets-dashboard",
         "__BIN_DIR__/agent-assets-discover",
+        "__BIN_DIR__/agent-assets-projects",
+        "__BIN_DIR__/agent-assets-macos-signals",
         "__BIN_DIR__/agent-assets-register",
         "__BIN_DIR__/agent-assets-list",
         "__BIN_DIR__/agent-assets-contract"
@@ -33,6 +35,9 @@
         "__ASSETS_HOME__/README.md",
         "__ASSETS_HOME__/AGENT_CONTRACT.md",
         "__ASSETS_HOME__/registry.json",
+        "__ASSETS_HOME__/projects.json",
+        "__ASSETS_HOME__/macos-signals.json",
+        "__ASSETS_HOME__/macos-signals-review.json",
         "__ASSETS_HOME__/discovery-review.json",
         "__HOME__/AGENT_START_HERE.md"
       ],
@@ -42,4 +47,3 @@
     }
   }
 }
-

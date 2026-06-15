@@ -15,6 +15,9 @@ If you are an agent, this is enough context. Do not ask the user to manually exp
 - Start file: `__HOME__/AGENT_START_HERE.md`
 - Agent contract: `__ASSETS_HOME__/AGENT_CONTRACT.md`
 - Asset registry: `__ASSETS_HOME__/registry.json`
+- Project index: `__ASSETS_HOME__/projects.json`
+- macOS system trace index: `__ASSETS_HOME__/macos-signals.json`
+- macOS system trace review: `__ASSETS_HOME__/macos-signals-review.json`
 - Discovery output: `__ASSETS_HOME__/discovered.json`
 - Discovery review: `__ASSETS_HOME__/discovery-review.json`
 - Human guide: `__ASSETS_HOME__/README.md`
@@ -33,6 +36,8 @@ If you are an agent, this is enough context. Do not ask the user to manually exp
 4. Read `__MCP_HOME__/registry.json` before changing MCP host configs.
 5. Register new agent-facing CLIs, MCPs, agent apps, skill packs, and downloaded tools during setup.
 6. If a new asset is an MCP server, update the MCP registry too.
-7. If the user wants a visual inventory, start `agent-assets-dashboard --serve --open`.
-8. Never write tokens, API keys, Authorization headers, cookies, passwords, or private keys into registries.
-
+7. When looking for old GitHub clones, downloaded repos, source packages, or scattered project folders, inspect `__ASSETS_HOME__/projects.json` or run `agent-assets-projects`.
+8. When checking macOS login items, background items, launchd jobs, privileged helpers, running services, or local listening ports, inspect `__ASSETS_HOME__/macos-signals.json` or run `agent-assets-macos-signals`.
+9. New durable clones, downloaded repos, and project outputs still belong under `__PROJECTS_DIR__`.
+10. If the user wants a visual inventory, start `agent-assets-dashboard --serve --open`.
+11. Never write tokens, API keys, Authorization headers, cookies, passwords, or private keys into registries.

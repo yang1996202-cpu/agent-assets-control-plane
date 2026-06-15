@@ -11,6 +11,9 @@ This project does **not** move package-manager internals into one directory. npm
 
 - stable wrappers in `~/.local/bin`
 - registry files in `~/.config/agent-assets`
+- historical project index in `~/.config/agent-assets/projects.json`
+- macOS login/background/service trace index in `~/.config/agent-assets/macos-signals.json`
+- macOS trace review decisions in `~/.config/agent-assets/macos-signals-review.json`
 - MCP registry in `~/.config/mcp`
 - durable projects under `~/projects`
 - local dashboard at `http://127.0.0.1:17654/`
@@ -43,6 +46,12 @@ agent-assets-dashboard --serve --open
 # Scan from CLI
 agent-assets-discover
 
+# Index downloaded / cloned / legacy project folders without moving files
+agent-assets-projects
+
+# Index macOS login/background/launchd/process traces without changing them
+agent-assets-macos-signals
+
 # List registered assets
 agent-assets-list
 agent-assets-list mcp
@@ -70,4 +79,4 @@ The dashboard is for localhost only. Do not expose it on a public interface.
 
 ## Status
 
-Early v0. File-based registry, local scanner, local dashboard. Planned: dashboard actions, schema validation, packaged install.
+Early v0. File-based registry, local scanner, local dashboard, project index, macOS trace index, dashboard review actions, and one-click cross-check. Planned: schema validation and packaged install.

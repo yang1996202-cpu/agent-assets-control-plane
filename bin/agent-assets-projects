@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import urllib.parse
+
+HOME = pathlib.Path(os.environ.get("AGENT_ASSETS_USER_HOME", str(pathlib.Path.home()))).expanduser()
+CONFIG_HOME = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config"))).expanduser()
+ASSETS_HOME = pathlib.Path(os.environ.get("AGENT_ASSETS_HOME", str(CONFIG_HOME / "agent-assets"))).expanduser()
+PROJECTS_DIR = pathlib.Path(os.environ.get("AGENT_ASSETS_PROJECTS_DIR", str(HOME / "projects"))).expanduser()
+REGISTRY = pathlib.Path(os.environ.get("AGENT_ASSETS_REGISTRY", str(ASSETS_HOME / "registry.json"))).expanduser()
+OUT = pathlib.Path(
+    os.environ.get(
+        "AGENT_ASSETS_PROJECT_INDEX",
+        os.environ.get("AGENT_ASSETS_PROJECTS", str(ASSETS_HOME / "projects.json")),
+    )
+).expanduser()
+
+MANIFEST_FILES = {
+    "package.json",
+    "pyproject.toml",
+    "Cargo.toml",
+    "go.mod",
+    "Gemfile",
+    "composer.json",
+    "requirements.txt",
+    "uv.lock",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "package-lock.json",
+    "Makefile",
+    "justfile",
+    "README.md",
+    "README.mdx",
+    "SKILL.md",
+    ".mcp.json",
+}
+
+STRONG_MANIFESTS = {
+    ".git",
+    "package.json",
+    "pyproject.toml",
+    "Cargo.toml",
+    "go.mod",
+    "Gemfile",
+    "composer.json",
+    "SKILL.md",
+    ".mcp.json",
+}
+
+EXCLUDED_DIR_NAMES = {
+    ".Trash",
+    ".cache",
+    ".npm",
+    ".pnpm-store",
+    ".bun",
+    ".cargo",
+    ".rustup",
+    ".venv",
+    ".virtualenvs",
+    ".local",
+    ".config",
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    "target",
+    ".next",
+    ".turbo",
+    ".parcel-cache",
+    ".pytest_cache",
+    ".mypy_cache",
+    "Library",
+    "Movies",
+    "Music",
+    "Pictures",
+    "Public",
+}
+
+HOME_CHILD_SKIP = EXCLUDED_DIR_NAMES | {
+    "Applications",
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "projects",
+}
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def load_json(path):
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def listify(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v is not None]
+    return [str(value)]
+
+
+def safe_resolve(path):
+    try:
+        return pathlib.Path(path).expanduser().resolve(strict=False)
+    except Exception:
+        return pathlib.Path(path).expanduser().absolute()
+
+
+def is_under(path, parent):
+    try:
+        safe_resolve(path).relative_to(safe_resolve(parent))
+        return True
+    except ValueError:
+        return False
+
+
+def add_root(roots, seen, path, role, max_depth):
+    path = pathlib.Path(path).expanduser()
+    key = str(safe_resolve(path))
+    if key in seen:
+        return
+    seen.add(key)
+    roots.append({
+        "path": str(path),
+        "role": role,
+        "max_depth": max_depth,
+        "exists": path.exists() and path.is_dir(),
+    })
+
+
+def default_roots(registry):
+    roots = []
+    seen = set()
+    add_root(roots, seen, PROJECTS_DIR, "canonical", 2)
+
+    for name, role in (
+        ("Downloads", "download_candidate"),
+        ("Desktop", "legacy"),
+        ("Documents", "legacy"),
+        ("tools", "legacy"),
+        ("code", "legacy"),
+        ("packages", "legacy"),
+        ("AI-Skills", "legacy"),
+        ("客户咨询", "legacy"),
+        ("generated-assets", "legacy"),
+        ("history", "legacy"),
+        ("memory", "legacy"),
+        ("bin", "legacy"),
+    ):
+        add_root(roots, seen, HOME / name, role, 2)
+
+    for rel in (
+        ".openclaw/workspace",
+        ".openclaw/workspace-claude",
+        ".openclaw/workspace-codex",
+        ".openclaw-autoclaw/workspace",
+        ".qclaw/workspace",
+        ".hermes/hermes-agent",
+        ".claude/skill-gallery",
+        ".codex/memories",
+        ".opencli",
+    ):
+        add_root(roots, seen, HOME / rel, "host_managed", 2)
+
+    # Old user-level project folders are common on this machine. Scan direct
+    # children only so we catch obvious repos without crawling the whole home.
+    add_root(roots, seen, HOME, "legacy_home_direct", 1)
+
+    for asset in registry.get("assets", {}).values():
+        for key in ("source_paths", "project_paths"):
+            for value in listify(asset.get(key)):
+                path = pathlib.Path(value).expanduser()
+                if path.exists() and path.is_dir():
+                    role = "canonical" if is_under(path, PROJECTS_DIR) else "registered_source"
+                    add_root(roots, seen, path, role, 1)
+
+    return roots
+
+
+def has_project_signal(path):
+    signals = project_signals(path)
+    if not signals:
+        return False
+    if any(signal in STRONG_MANIFESTS for signal in signals):
+        return True
+    if "bin/*" in signals or "scripts/*" in signals:
+        return True
+    # README-only folders are still useful for old downloaded projects, but only
+    # at shallow depth where the user can decide whether they should be kept.
+    return any(signal.startswith("README") for signal in signals)
+
+
+def project_signals(path):
+    path = pathlib.Path(path)
+    signals = []
+    if (path / ".git").is_dir():
+        signals.append(".git")
+    for filename in sorted(MANIFEST_FILES):
+        if filename == ".git":
+            continue
+        if (path / filename).is_file():
+            signals.append(filename)
+    if has_entrypoint_dir(path / "bin"):
+        signals.append("bin/*")
+    if has_entrypoint_dir(path / "scripts"):
+        signals.append("scripts/*")
+    return signals
+
+
+def has_entrypoint_dir(path):
+    if not path.is_dir():
+        return False
+    try:
+        for child in path.iterdir():
+            if child.is_file() and (os.access(child, os.X_OK) or child.suffix in {".sh", ".py", ".js", ".mjs", ".ts"}):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def should_skip_child(child, parent):
+    name = child.name
+    if safe_resolve(parent) == safe_resolve(HOME):
+        if name.startswith(".") or name in HOME_CHILD_SKIP:
+            return True
+    if name in EXCLUDED_DIR_NAMES:
+        return True
+    if name.startswith(".") and name not in {".github"}:
+        return True
+    return False
+
+
+def iter_candidate_dirs(root, role, max_depth, max_nodes):
+    root = pathlib.Path(root).expanduser()
+    if not root.exists() or not root.is_dir():
+        return
+    queue = [(root, 0)]
+    visited = 0
+    while queue and visited < max_nodes:
+        current, depth = queue.pop(0)
+        visited += 1
+        if has_project_signal(current) and not (role == "legacy_home_direct" and safe_resolve(current) == safe_resolve(HOME)):
+            yield current
+        if depth >= max_depth:
+            continue
+        try:
+            children = sorted((child for child in current.iterdir() if child.is_dir()), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+        for child in children:
+            if should_skip_child(child, current):
+                continue
+            queue.append((child, depth + 1))
+
+
+def read_package_bin(path):
+    package_json = pathlib.Path(path) / "package.json"
+    if not package_json.is_file():
+        return []
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    bins = data.get("bin")
+    out = []
+    if isinstance(bins, str):
+        out.append(f"npm bin -> {bins}")
+    elif isinstance(bins, dict):
+        for name, target in sorted(bins.items()):
+            out.append(f"npm bin:{name} -> {target}")
+    return out
+
+
+def entrypoint_candidates(path, limit=12):
+    path = pathlib.Path(path)
+    entries = []
+    entries.extend(read_package_bin(path))
+    for rel in ("bin", "scripts"):
+        entry_dir = path / rel
+        if not entry_dir.is_dir():
+            continue
+        try:
+            children = sorted(entry_dir.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_file():
+                continue
+            if os.access(child, os.X_OK) or child.suffix in {".sh", ".py", ".js", ".mjs", ".ts"}:
+                entries.append(str(child))
+            if len(entries) >= limit:
+                break
+        if len(entries) >= limit:
+            break
+    return entries[:limit]
+
+
+def redact_remote(url):
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except Exception:
+        return url
+    if parsed.scheme and parsed.netloc:
+        netloc = parsed.netloc
+        if "@" in netloc:
+            netloc = "***@" + netloc.rsplit("@", 1)[1]
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    return url
+
+
+def git_remote(path):
+    if not (pathlib.Path(path) / ".git").exists():
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return redact_remote((proc.stdout or "").strip())
+
+
+def infer_kind(path, signals, entries):
+    kinds = []
+    name = pathlib.Path(path).name.lower()
+    if ".git" in signals:
+        kinds.append("git-repo")
+    if "package.json" in signals:
+        kinds.append("node-package")
+    if "pyproject.toml" in signals or "requirements.txt" in signals:
+        kinds.append("python-package")
+    if "go.mod" in signals:
+        kinds.append("go-module")
+    if "Cargo.toml" in signals:
+        kinds.append("rust-package")
+    if "SKILL.md" in signals:
+        kinds.append("skill")
+    if ".mcp.json" in signals or "mcp" in name:
+        kinds.append("mcp-candidate")
+    if entries:
+        kinds.append("cli-candidate")
+    if any(signal.startswith("README") for signal in signals) and not kinds:
+        kinds.append("documentation")
+    if not kinds:
+        kinds.append("project")
+    return kinds
+
+
+def registry_refs(registry):
+    refs = []
+    for asset_id, asset in registry.get("assets", {}).items():
+        for key in ("source_paths", "project_paths", "stable_entrypoints", "config_paths", "data_paths", "skill_roots"):
+            for value in listify(asset.get(key)):
+                if value.startswith("/"):
+                    refs.append((asset_id, key, pathlib.Path(value).expanduser()))
+    return refs
+
+
+def linked_assets(path, refs):
+    path = safe_resolve(path)
+    linked = []
+    for asset_id, key, ref in refs:
+        ref = safe_resolve(ref)
+        if path == ref or is_under(ref, path) or is_under(path, ref):
+            item = f"{asset_id}:{key}"
+            if item not in linked:
+                linked.append(item)
+    return linked
+
+
+def project_action(root_role, linked, kinds):
+    if root_role == "canonical" and linked:
+        return "已在项目层和资产总账之间建立联系。"
+    if root_role == "canonical":
+        return "在标准项目目录内；如果 Agent 需要调用，再登记为资产。"
+    if root_role == "download_candidate":
+        return "下载目录里的候选项目；确认有价值后收编到项目目录或登记入口。"
+    if root_role == "host_managed":
+        return "宿主或工具自己管理的工作区；通常只记录，不搬迁。"
+    if "registered_source" == root_role:
+        return "已登记资产引用到的源码目录；优先保持当前路径并补全说明。"
+    if "cli-candidate" in kinds or "mcp-candidate" in kinds:
+        return "旧位置里的可调用候选；优先判断是否需要稳定 wrapper。"
+    return "旧位置里的项目候选；先确认用途，再决定是否收编。"
+
+
+def summarize(projects):
+    summary = {
+        "total": len(projects),
+        "canonical": 0,
+        "legacy": 0,
+        "download_candidate": 0,
+        "host_managed": 0,
+        "registered_source": 0,
+        "linked": 0,
+        "git_repos": 0,
+        "cli_candidates": 0,
+        "mcp_candidates": 0,
+        "with_entrypoints": 0,
+    }
+    for project in projects:
+        role = project.get("root_role")
+        if role in summary:
+            summary[role] += 1
+        if role == "legacy_home_direct":
+            summary["legacy"] += 1
+        if project.get("linked_assets"):
+            summary["linked"] += 1
+        kinds = set(project.get("kind", []))
+        if "git-repo" in kinds:
+            summary["git_repos"] += 1
+        if "cli-candidate" in kinds:
+            summary["cli_candidates"] += 1
+        if "mcp-candidate" in kinds:
+            summary["mcp_candidates"] += 1
+        if project.get("entrypoint_candidates"):
+            summary["with_entrypoints"] += 1
+    return summary
+
+
+def normalize_role(role):
+    if role == "legacy_home_direct":
+        return "legacy"
+    return role
+
+
+def scan_projects(extra_roots=None, max_depth=None, max_nodes=5000):
+    registry = load_json(REGISTRY)
+    roots = default_roots(registry)
+    seen_roots = {str(safe_resolve(item["path"])) for item in roots}
+    for root in extra_roots or []:
+        path = pathlib.Path(root).expanduser()
+        key = str(safe_resolve(path))
+        if key not in seen_roots:
+            roots.append({"path": str(path), "role": "manual", "max_depth": max_depth or 2, "exists": path.exists() and path.is_dir()})
+            seen_roots.add(key)
+
+    refs = registry_refs(registry)
+    seen_projects = set()
+    projects = []
+    for root in roots:
+        depth = max_depth if max_depth is not None else int(root.get("max_depth") or 2)
+        for path in iter_candidate_dirs(root["path"], root["role"], depth, max_nodes):
+            key = str(safe_resolve(path))
+            if key in seen_projects:
+                continue
+            seen_projects.add(key)
+            signals = project_signals(path)
+            entries = entrypoint_candidates(path)
+            kinds = infer_kind(path, signals, entries)
+            role = normalize_role(root["role"])
+            linked = linked_assets(path, refs)
+            project = {
+                "name": path.name,
+                "path": str(path),
+                "root_role": role,
+                "signals": signals,
+                "kind": kinds,
+                "git_remote": git_remote(path),
+                "entrypoint_candidates": entries,
+                "linked_assets": linked,
+                "review_status": "linked" if linked else role,
+                "action_hint": project_action(role, linked, kinds),
+            }
+            projects.append(project)
+
+    projects.sort(key=lambda item: (item["root_role"], item["name"].lower(), item["path"]))
+    roots_out = [{**root, "role": normalize_role(root["role"])} for root in roots]
+    payload = {
+        "updated_at": now_iso(),
+        "source": "agent-assets-projects",
+        "policy": {
+            "durable_projects_dir": str(PROJECTS_DIR),
+            "does_not_move_files": True,
+            "does_not_delete_files": True,
+        },
+        "roots": roots_out,
+        "projects": projects,
+        "summary": summarize(projects),
+    }
+    return payload
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Index local GitHub/downloaded/project folders without moving files.")
+    parser.add_argument("--root", action="append", default=[], help="Additional root to scan.")
+    parser.add_argument("--max-depth", type=int, default=None, help="Override per-root scan depth.")
+    parser.add_argument("--max-nodes", type=int, default=5000, help="Maximum directories to visit per root.")
+    parser.add_argument("--json", action="store_true", help="Print the full JSON payload.")
+    parser.add_argument("--no-write", action="store_true", help="Do not write projects.json.")
+    args = parser.parse_args()
+
+    payload = scan_projects(extra_roots=args.root, max_depth=args.max_depth, max_nodes=args.max_nodes)
+    if not args.no_write:
+        write_json(OUT, payload)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        summary = payload["summary"]
+        destination = "not written" if args.no_write else str(OUT)
+        print(
+            "projects indexed: "
+            f"{summary['total']} total, "
+            f"{summary['canonical']} canonical, "
+            f"{summary['legacy']} legacy, "
+            f"{summary['download_candidate']} downloads, "
+            f"{summary['host_managed']} host-managed, "
+            f"{summary['linked']} linked. "
+            f"output: {destination}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

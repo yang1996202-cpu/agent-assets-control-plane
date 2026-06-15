@@ -1,0 +1,5 @@
+{
+  "updated_at": "bootstrap",
+  "purpose": "Review decisions for macOS login/background/launchd/process traces. This file never disables, unloads, or deletes system items.",
+  "items": {}
+}
