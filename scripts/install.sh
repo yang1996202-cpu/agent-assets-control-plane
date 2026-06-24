@@ -14,7 +14,6 @@ mkdir -p "$BIN_DIR" "$ASSETS_HOME" "$MCP_HOME" "$PROJECTS_DIR"
 install -m 0755 "$ROOT/bin/agent-assets-dashboard" "$BIN_DIR/agent-assets-dashboard"
 install -m 0755 "$ROOT/bin/agent-assets-discover" "$BIN_DIR/agent-assets-discover"
 install -m 0755 "$ROOT/bin/agent-assets-projects" "$BIN_DIR/agent-assets-projects"
-install -m 0755 "$ROOT/bin/agent-assets-macos-signals" "$BIN_DIR/agent-assets-macos-signals"
 install -m 0755 "$ROOT/bin/agent-assets-register" "$BIN_DIR/agent-assets-register"
 install -m 0755 "$ROOT/bin/agent-assets-list" "$BIN_DIR/agent-assets-list"
 install -m 0755 "$ROOT/bin/agent-assets-contract" "$BIN_DIR/agent-assets-contract"
@@ -41,7 +40,6 @@ render_template "$ROOT/templates/agent-assets/AGENT_CONTRACT.md" "$ASSETS_HOME/A
 render_template "$ROOT/templates/agent-assets/README.md" "$ASSETS_HOME/README.md"
 render_template "$ROOT/templates/agent-assets/registry.example.json" "$ASSETS_HOME/registry.json"
 render_template "$ROOT/templates/agent-assets/discovery-review.example.json" "$ASSETS_HOME/discovery-review.json"
-render_template "$ROOT/templates/agent-assets/macos-signals-review.example.json" "$ASSETS_HOME/macos-signals-review.json"
 render_template "$ROOT/templates/mcp/registry.example.json" "$MCP_HOME/registry.json"
 
 printf '\nInstalled Agent Assets Control Plane.\n'
