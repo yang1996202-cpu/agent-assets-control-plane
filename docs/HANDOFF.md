@@ -1,6 +1,6 @@
 # Agent Assets Control Plane — 维护交接
 
-更新时间：2026-06-26
+更新时间：2026-07-03
 
 给新窗口、新 Agent 或未来的自己接着维护本项目用。先读 `README.md` 和 `docs/architecture.md`，本文件补「怎么维护」。
 
@@ -25,12 +25,23 @@
 
 **命名约定**：默认长名 `agent-assets-*`；`asset-runtime` 和 `asset-macos-signals` 用短名（运行态观测旁路系列，与 dashboard 的 runtime / 系统信号 tab 对应）。dashboard 代码对短名有 legacy 回退。改功能时只需改 `bin/` 源文件，`install.sh` 重装即生效；本机若额外做了指向 `~/.local/bin/agent-assets-*` 的短名 wrapper，会自动跟进。
 
+### `lib/`（公共 Python 模块，install.sh 装到 `~/.local/lib/agent-assets`）
+
+| 模块 | 职责 |
+|---|---|
+| `agent_assets_common.py` | 跨脚本工具函数：JSON IO、路径判断、HTML chip、host config 键 |
+| `agent_assets_dashboard_paths.py` | dashboard 路径常量 + 外部命令发现 |
+| `agent_assets_dashboard_data.py` | dashboard 数据加载与业务模型（MCP audit、runtime、projects） |
+| `agent_assets_dashboard_render.py` | dashboard HTML 渲染函数 |
+| `agent_assets_dashboard_html.py` | dashboard 页面骨架、CSS、JS |
+| `agent_assets_dashboard_api.py` | dashboard HTTP handler、路由、`serve()` |
+
 ### 其他
 
 - `scripts/install.sh` — 装命令 + 渲染 `templates/` 到 `~/AGENT_START_HERE.md`、`~/.config/agent-assets/`、`~/.config/mcp/`（用 `__HOME__` 等占位符 sed 替换）。
 - `templates/` — `AGENT_START_HERE.md`、`AGENT_CONTRACT.md`、`registry.example.json`、`discovery-review.example.json` 等占位符模板。
 - `tests/smoke.sh` — `py_compile` + install + 各命令 dry-run，打印 `smoke-ok`。
-- `docs/` — `architecture`（怎么工作）、`concept-model`（8 分类定义）、`publish` / `open-source-boundary`（发布边界）、`wechat-post`（对外文案草稿，勿动）。
+- `docs/` — `architecture`（怎么工作）、`concept-model`（8 分类定义）、`PRD` / `FEATURES` / `CHANGELOG` / `RELEASE_NOTES` / `METHODOLOGY`（产品与发布文档）、`publish` / `open-source-boundary`（发布边界）、`wechat-post`（对外文案草稿，勿动）。
 
 ## 数据流（两条，不交叉）
 
@@ -51,7 +62,8 @@ registry 在 runtime 旁路里**不被写入**。观测不靠维护纪律：跑�
 ## 验证命令
 
 ```bash
-python3 -m py_compile bin/agent-assets-*
+python3 -m py_compile bin/agent-assets-* lib/*.py
+PYTHONPATH="$PWD/lib" python3 -m unittest discover -s tests -p 'test_*.py'
 ./tests/smoke.sh
 python3 bin/agent-assets-macos-signals --no-write      # 采集但不写文件
 python3 bin/agent-assets-runtime --json | python3 -m json.tool
@@ -66,15 +78,16 @@ curl -sS http://127.0.0.1:17654/api/status | python3 -m json.tool
 - **registry 永不存 secret**（`register` 脚本对带 secret 的输入自动拒绝）。
 - **仓库不内置 launchd plist**；常驻 dashboard 由用户自配（本机可在 `~/Library/LaunchAgents` 手配）。
 - **registry 登记已退役为可选**；核心是 runtime 观测，不是台账完整性。不要把"登记越全越好"当目标。
-- 改 `bin/` 功能后跑 `py_compile` + `smoke.sh`；改 `templates/` 占位符要和 `install.sh` 的 sed 替换键一致。
+- 改 `bin/` 或 `lib/` 后跑 `py_compile bin/agent-assets-* lib/*.py` + `PYTHONPATH="$PWD/lib" python3 -m unittest discover -s tests` + `./tests/smoke.sh`。
+- 改 `templates/` 占位符要和 `install.sh` 的 sed 替换键一致。
 
 ## 最近提交
 
+- `3fa9d32` checkpoint: runtime observation landing + 8-category dashboard before refactor
 - `aba5f85` Redo dashboard: 8-category model, system signals, launchd toggle
 - `e2e2d62` Refine agent assets dashboard workflow
 - `87072fa` Improve dashboard workflow and filters
 - `6c9d854` Add project handoff document
-- `f6c0f54` Add deep audit scan and fix skill counts
 
 ## 接手一句话
 

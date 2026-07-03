@@ -8,9 +8,9 @@
 |---|---|
 | **问题/需求** | 项目定位已演进为「本机运行态观测台」，但代码组织仍停留在原型阶段：dashboard 单文件近 2800 行、工具函数跨脚本复制、无单元测试、缺少 AGENTS.md 要求的强制文档。 |
 | **根因/方案** | 预登记模式被证明不可维护，核心转向只读运行态扫描；通过提取公共模块、拆分 dashboard、补单元测试、补齐文档，使工程实现与新的产品定位对齐。 |
-| **改动范围** | `.gitignore`、`scripts/install.sh`、`bin/*`、`lib/*`、`tests/*`、`docs/*` |
+| **改动范围** | `.gitignore`、`scripts/install.sh`、`bin/*`、`lib/*`、`tests/*`、`docs/*`；新增 `lib/agent_assets_dashboard_{paths,data,render,html,api}.py`；`bin/agent-assets-dashboard` 缩减为入口脚本；`bin/agent-assets-macos-signals` 的 host 识别改用 `lib.host_config_keys()`。 |
 | **影响面** | 所有 CLI 脚本改为 import `lib/agent_assets_common.py`；dashboard 内部模块化但外部行为不变；install.sh 新增安装 `~/.local/lib/agent-assets/`；已有本机安装需重新运行 install。 |
-| **状态** | ⏳ 进行中 |
+| **状态** | ✅ 已完成 |
 
 ## 2026-06-26
 

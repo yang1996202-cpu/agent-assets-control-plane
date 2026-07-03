@@ -5,7 +5,19 @@ import argparse
 import pathlib
 import re
 import subprocess
+import sys
 import time
+
+_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+_LIB_CANDIDATES = [
+    os.environ.get("AGENT_ASSETS_LIB_DIR"),
+    str(_SCRIPT_DIR.parent / "lib"),
+    str(pathlib.Path.home() / ".local/lib/agent-assets"),
+]
+for _P in _LIB_CANDIDATES:
+    if _P and _P not in sys.path:
+        sys.path.insert(0, _P)
+import agent_assets_common as lib
 
 HOME = pathlib.Path(os.environ.get("AGENT_ASSETS_USER_HOME", str(pathlib.Path.home()))).expanduser()
 CONFIG_HOME = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config"))).expanduser()

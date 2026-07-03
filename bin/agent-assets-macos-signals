@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import datetime as dt
 import json
 import os
 import pathlib
@@ -8,7 +7,17 @@ import plistlib
 import re
 import subprocess
 import sys
-import urllib.parse
+
+_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+_LIB_CANDIDATES = [
+    os.environ.get("AGENT_ASSETS_LIB_DIR"),
+    str(_SCRIPT_DIR.parent / "lib"),
+    str(pathlib.Path.home() / ".local/lib/agent-assets"),
+]
+for _P in _LIB_CANDIDATES:
+    if _P and _P not in sys.path:
+        sys.path.insert(0, _P)
+import agent_assets_common as lib
 
 HOME = pathlib.Path(os.environ.get("AGENT_ASSETS_USER_HOME", str(pathlib.Path.home()))).expanduser()
 CONFIG_HOME = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config"))).expanduser()
@@ -31,7 +40,12 @@ PRIVILEGED_HELPERS = pathlib.Path("/Library/PrivilegedHelperTools")
 
 REMOTE_PATTERNS = re.compile(r"todesk|awesun|oray|sunlogin|向日葵|remote|screenconnect|anydesk", re.I)
 PROXY_PATTERNS = re.compile(r"clash|mihomo|proxy|vortex|vpn|tailscale|wireguard", re.I)
-AGENT_PATTERNS = re.compile(r"gbrain|mcp|agent-assets|openclaw|hermes|cc-connect|new-api|newapi|edict|ai-writing|codex|claude", re.I)
+_HOST_IDENTIFIERS = [k.replace("_mcp_config", "") for k in lib.host_config_keys()]
+_AGENT_PATTERN_TERMS = [
+    "gbrain", "mcp", "agent-assets", "openclaw", "hermes", "cc-connect",
+    "new-api", "newapi", "edict", "ai-writing", "codex",
+] + _HOST_IDENTIFIERS
+AGENT_PATTERNS = re.compile("|".join(re.escape(t) for t in _AGENT_PATTERN_TERMS), re.I)
 UPDATER_PATTERNS = re.compile(r"updater|keystone|shipit|update", re.I)
 INPUT_METHOD_PATTERNS = re.compile(r"sogou|input method|输入法", re.I)
 GENERIC_PROCESS_NAMES = {
@@ -54,10 +68,6 @@ GENERIC_PROCESS_NAMES = {
 }
 
 
-def now_iso():
-    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
 def run_command(command, timeout=10):
     try:
         proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
@@ -66,71 +76,6 @@ def run_command(command, timeout=10):
     except Exception as exc:
         return "", str(exc), 1
     return proc.stdout or "", proc.stderr or "", proc.returncode
-
-
-def load_json(path):
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def write_json(path, payload):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
-def listify(value):
-    if not value:
-        return []
-    if isinstance(value, list):
-        return [str(v) for v in value if v is not None]
-    return [str(value)]
-
-
-def safe_resolve(path):
-    try:
-        return pathlib.Path(path).expanduser().resolve(strict=False)
-    except Exception:
-        return pathlib.Path(path).expanduser().absolute()
-
-
-def is_under(path, parent):
-    try:
-        safe_resolve(path).relative_to(safe_resolve(parent))
-        return True
-    except ValueError:
-        return False
-
-
-def url_to_path(value):
-    if not value or not str(value).startswith("file://"):
-        return ""
-    parsed = urllib.parse.urlsplit(str(value))
-    return urllib.parse.unquote(parsed.path)
-
-
-def normalize_identifier(value):
-    value = str(value or "").strip()
-    value = re.sub(r"^\d+\.", "", value)
-    return value
-
-
-def item_key(*values):
-    for value in values:
-        value = normalize_identifier(value)
-        if value and value not in {"(null)", "Unknown Developer"}:
-            return value
-    return "unknown"
-
-
-def append_unique(target, key, values):
-    bucket = target.setdefault(key, [])
-    for value in values:
-        if value and not value in bucket:
-            bucket.append(value)
 
 
 def parse_btm():
@@ -185,7 +130,7 @@ def parse_launch_plists():
             continue
         for path in sorted(root.glob("*.plist")):
             data = parse_plist(path)
-            args = listify(data.get("ProgramArguments"))
+            args = lib.listify(data.get("ProgramArguments"))
             program = str(data.get("Program") or (args[0] if args else ""))
             label = str(data.get("Label") or path.stem)
             rows.append({
@@ -322,11 +267,11 @@ def parse_login_items():
 
 
 def registry_refs():
-    registry = load_json(REGISTRY)
+    registry = lib.load_json(REGISTRY)
     refs = []
     for asset_id, asset in registry.get("assets", {}).items():
         for key in ("stable_entrypoints", "source_paths", "project_paths", "config_paths", "host_configs"):
-            for value in listify(asset.get(key)):
+            for value in lib.listify(asset.get(key)):
                 if str(value).startswith("/"):
                     refs.append((asset_id, key, value))
     return refs
@@ -335,13 +280,13 @@ def registry_refs():
 def linked_assets(paths, text, refs):
     linked = []
     text_l = (text or "").lower()
-    resolved_paths = [safe_resolve(path) for path in paths if path and str(path).startswith("/")]
+    resolved_paths = [lib.safe_resolve(path) for path in paths if path and str(path).startswith("/")]
     for asset_id, key, value in refs:
         value_s = str(value)
         matched = False
         if value_s.startswith("/"):
-            ref = safe_resolve(value_s)
-            matched = any(path == ref or is_under(path, ref) or is_under(ref, path) for path in resolved_paths)
+            ref = lib.safe_resolve(value_s)
+            matched = any(path == ref or lib.is_under(path, ref) or lib.is_under(ref, path) for path in resolved_paths)
         if matched:
             item = f"{asset_id}:{key}"
             if item not in linked:
@@ -352,7 +297,7 @@ def linked_assets(paths, text, refs):
 def match_processes(item, processes):
     patterns = []
     for value in (item.get("label"), item.get("name"), item.get("identifier")):
-        value = normalize_identifier(value)
+        value = lib.normalize_identifier(value)
         if value and len(value) >= 4:
             patterns.append(value.lower())
     for path in item.get("paths", []):
@@ -450,8 +395,8 @@ def upsert(items, key, **values):
         value = values.get(scalar)
         if value and not item.get(scalar):
             item[scalar] = value
-    append_unique(item, "paths", values.get("paths", []))
-    append_unique(item, "sources", values.get("sources", []))
+    lib.append_unique(item, "paths", values.get("paths", []))
+    lib.append_unique(item, "sources", values.get("sources", []))
     if "btm_enabled" in values:
         item["btm_enabled"] = item.get("btm_enabled", False) or bool(values["btm_enabled"])
     if "btm_disabled" in values:
@@ -467,10 +412,10 @@ def build_items(raw):
     refs = registry_refs()
     items = {}
     for record in raw["btm"]["records"]:
-        identifier = normalize_identifier(record.get("Identifier"))
+        identifier = lib.normalize_identifier(record.get("Identifier"))
         name = record.get("Name") if record.get("Name") != "(null)" else ""
-        executable = record.get("Executable Path") or url_to_path(record.get("URL")) or ""
-        key = item_key(identifier, name, pathlib.Path(executable).name if executable else "")
+        executable = record.get("Executable Path") or lib.url_to_path(record.get("URL")) or ""
+        key = lib.item_key(identifier, name, pathlib.Path(executable).name if executable else "")
         disposition = record.get("Disposition", "")
         upsert(
             items,
@@ -487,7 +432,7 @@ def build_items(raw):
         )
     for row in raw["launch_plists"]:
         label = row["label"]
-        key = item_key(label, row.get("program"), pathlib.Path(row["plist"]).stem)
+        key = lib.item_key(label, row.get("program"), pathlib.Path(row["plist"]).stem)
         paths = [row["plist"]]
         if row.get("program"):
             paths.append(row["program"])
@@ -511,7 +456,7 @@ def build_items(raw):
     for helper in raw["privileged_helpers"]:
         if helper["name"].lower() in helper_names:
             continue
-        key = item_key(helper["name"])
+        key = lib.item_key(helper["name"])
         upsert(items, key, label=helper["name"], identifier=helper["name"], paths=[helper["path"]], sources=["privileged-helper"])
 
     processes = raw["processes"]
@@ -586,7 +531,7 @@ def scan():
     }
     items = build_items(raw)
     return {
-        "updated_at": now_iso(),
+        "updated_at": lib.now_iso(),
         "source": "agent-assets-macos-signals",
         "policy": {
             "read_only": True,
@@ -613,7 +558,7 @@ def main():
 
     payload = scan()
     if not args.no_write:
-        write_json(OUT, payload)
+        lib.write_json(OUT, payload)
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

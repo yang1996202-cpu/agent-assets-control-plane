@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 import argparse
-import datetime as dt
 import json
 import os
 import pathlib
 import subprocess
 import sys
 import urllib.parse
+
+_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+_LIB_CANDIDATES = [
+    os.environ.get("AGENT_ASSETS_LIB_DIR"),
+    str(_SCRIPT_DIR.parent / "lib"),
+    str(pathlib.Path.home() / ".local/lib/agent-assets"),
+]
+for _P in _LIB_CANDIDATES:
+    if _P and _P not in sys.path:
+        sys.path.insert(0, _P)
+import agent_assets_common as lib
 
 HOME = pathlib.Path(os.environ.get("AGENT_ASSETS_USER_HOME", str(pathlib.Path.home()))).expanduser()
 CONFIG_HOME = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config"))).expanduser()
@@ -94,50 +104,9 @@ HOME_CHILD_SKIP = EXCLUDED_DIR_NAMES | {
 }
 
 
-def now_iso():
-    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def load_json(path):
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def write_json(path, payload):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
-def listify(value):
-    if not value:
-        return []
-    if isinstance(value, list):
-        return [str(v) for v in value if v is not None]
-    return [str(value)]
-
-
-def safe_resolve(path):
-    try:
-        return pathlib.Path(path).expanduser().resolve(strict=False)
-    except Exception:
-        return pathlib.Path(path).expanduser().absolute()
-
-
-def is_under(path, parent):
-    try:
-        safe_resolve(path).relative_to(safe_resolve(parent))
-        return True
-    except ValueError:
-        return False
-
-
 def add_root(roots, seen, path, role, max_depth):
     path = pathlib.Path(path).expanduser()
-    key = str(safe_resolve(path))
+    key = str(lib.safe_resolve(path))
     if key in seen:
         return
     seen.add(key)
@@ -189,10 +158,10 @@ def default_roots(registry):
 
     for asset in registry.get("assets", {}).values():
         for key in ("source_paths", "project_paths"):
-            for value in listify(asset.get(key)):
+            for value in lib.listify(asset.get(key)):
                 path = pathlib.Path(value).expanduser()
                 if path.exists() and path.is_dir():
-                    role = "canonical" if is_under(path, PROJECTS_DIR) else "registered_source"
+                    role = "canonical" if lib.is_under(path, PROJECTS_DIR) else "registered_source"
                     add_root(roots, seen, path, role, 1)
 
     return roots
@@ -242,7 +211,7 @@ def has_entrypoint_dir(path):
 
 def should_skip_child(child, parent):
     name = child.name
-    if safe_resolve(parent) == safe_resolve(HOME):
+    if lib.safe_resolve(parent) == lib.safe_resolve(HOME):
         if name.startswith(".") or name in HOME_CHILD_SKIP:
             return True
     if name in EXCLUDED_DIR_NAMES:
@@ -261,7 +230,7 @@ def iter_candidate_dirs(root, role, max_depth, max_nodes):
     while queue and visited < max_nodes:
         current, depth = queue.pop(0)
         visited += 1
-        if has_project_signal(current) and not (role == "legacy_home_direct" and safe_resolve(current) == safe_resolve(HOME)):
+        if has_project_signal(current) and not (role == "legacy_home_direct" and lib.safe_resolve(current) == lib.safe_resolve(HOME)):
             yield current
         if depth >= max_depth:
             continue
@@ -379,18 +348,18 @@ def registry_refs(registry):
     refs = []
     for asset_id, asset in registry.get("assets", {}).items():
         for key in ("source_paths", "project_paths", "stable_entrypoints", "config_paths", "data_paths", "skill_roots"):
-            for value in listify(asset.get(key)):
+            for value in lib.listify(asset.get(key)):
                 if value.startswith("/"):
                     refs.append((asset_id, key, pathlib.Path(value).expanduser()))
     return refs
 
 
 def linked_assets(path, refs):
-    path = safe_resolve(path)
+    path = lib.safe_resolve(path)
     linked = []
     for asset_id, key, ref in refs:
-        ref = safe_resolve(ref)
-        if path == ref or is_under(ref, path) or is_under(path, ref):
+        ref = lib.safe_resolve(ref)
+        if path == ref or lib.is_under(ref, path) or lib.is_under(path, ref):
             item = f"{asset_id}:{key}"
             if item not in linked:
                 linked.append(item)
@@ -454,12 +423,12 @@ def normalize_role(role):
 
 
 def scan_projects(extra_roots=None, max_depth=None, max_nodes=5000):
-    registry = load_json(REGISTRY)
+    registry = lib.load_json(REGISTRY)
     roots = default_roots(registry)
-    seen_roots = {str(safe_resolve(item["path"])) for item in roots}
+    seen_roots = {str(lib.safe_resolve(item["path"])) for item in roots}
     for root in extra_roots or []:
         path = pathlib.Path(root).expanduser()
-        key = str(safe_resolve(path))
+        key = str(lib.safe_resolve(path))
         if key not in seen_roots:
             roots.append({"path": str(path), "role": "manual", "max_depth": max_depth or 2, "exists": path.exists() and path.is_dir()})
             seen_roots.add(key)
@@ -470,7 +439,7 @@ def scan_projects(extra_roots=None, max_depth=None, max_nodes=5000):
     for root in roots:
         depth = max_depth if max_depth is not None else int(root.get("max_depth") or 2)
         for path in iter_candidate_dirs(root["path"], root["role"], depth, max_nodes):
-            key = str(safe_resolve(path))
+            key = str(lib.safe_resolve(path))
             if key in seen_projects:
                 continue
             seen_projects.add(key)
@@ -496,7 +465,7 @@ def scan_projects(extra_roots=None, max_depth=None, max_nodes=5000):
     projects.sort(key=lambda item: (item["root_role"], item["name"].lower(), item["path"]))
     roots_out = [{**root, "role": normalize_role(root["role"])} for root in roots]
     payload = {
-        "updated_at": now_iso(),
+        "updated_at": lib.now_iso(),
         "source": "agent-assets-projects",
         "policy": {
             "durable_projects_dir": str(PROJECTS_DIR),
@@ -521,7 +490,7 @@ def main():
 
     payload = scan_projects(extra_roots=args.root, max_depth=args.max_depth, max_nodes=args.max_nodes)
     if not args.no_write:
-        write_json(OUT, payload)
+        lib.write_json(OUT, payload)
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

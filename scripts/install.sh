@@ -8,8 +8,14 @@ ASSETS_HOME="${AGENT_ASSETS_HOME:-$CONFIG_HOME/agent-assets}"
 MCP_HOME="${AGENT_ASSETS_MCP_HOME:-$CONFIG_HOME/mcp}"
 BIN_DIR="${AGENT_ASSETS_BIN_DIR:-$HOME_DIR/.local/bin}"
 PROJECTS_DIR="${AGENT_ASSETS_PROJECTS_DIR:-$HOME_DIR/projects}"
+LIB_DIR="${AGENT_ASSETS_LIB_DIR:-$HOME_DIR/.local/lib/agent-assets}"
 
-mkdir -p "$BIN_DIR" "$ASSETS_HOME" "$MCP_HOME" "$PROJECTS_DIR"
+mkdir -p "$BIN_DIR" "$ASSETS_HOME" "$MCP_HOME" "$PROJECTS_DIR" "$LIB_DIR"
+
+for libfile in "$ROOT/lib"/*.py; do
+  [ -e "$libfile" ] || continue
+  install -m 0644 "$libfile" "$LIB_DIR/$(basename "$libfile")"
+done
 
 install -m 0755 "$ROOT/bin/agent-assets-dashboard" "$BIN_DIR/agent-assets-dashboard"
 install -m 0755 "$ROOT/bin/agent-assets-discover" "$BIN_DIR/agent-assets-discover"

@@ -13,6 +13,17 @@ import subprocess
 import sys
 from collections import defaultdict
 
+_SCRIPT_DIR = __import__("pathlib").Path(__file__).resolve().parent
+_LIB_CANDIDATES = [
+    os.environ.get("AGENT_ASSETS_LIB_DIR"),
+    str(_SCRIPT_DIR.parent / "lib"),
+    str(__import__("pathlib").Path.home() / ".local/lib/agent-assets"),
+]
+for _P in _LIB_CANDIDATES:
+    if _P and _P not in sys.path:
+        sys.path.insert(0, _P)
+import agent_assets_common as lib
+
 # --- classification rules -------------------------------------------------
 
 # IDE / system UI / GUI app noise — not runtime blind spots, drop entirely.

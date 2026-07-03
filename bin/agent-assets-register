@@ -7,6 +7,17 @@ import re
 import sys
 from pathlib import Path
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_LIB_CANDIDATES = [
+    os.environ.get("AGENT_ASSETS_LIB_DIR"),
+    str(_SCRIPT_DIR.parent / "lib"),
+    str(Path.home() / ".local/lib/agent-assets"),
+]
+for _P in _LIB_CANDIDATES:
+    if _P and _P not in sys.path:
+        sys.path.insert(0, _P)
+import agent_assets_common as lib
+
 HOME = Path(os.environ.get("AGENT_ASSETS_USER_HOME", str(Path.home()))).expanduser()
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config"))).expanduser()
 ASSETS_HOME = Path(os.environ.get("AGENT_ASSETS_HOME", str(CONFIG_HOME / "agent-assets"))).expanduser()
@@ -23,15 +34,6 @@ def reject_secret(value):
     lower = value.lower()
     if any(hint in lower for hint in SECRET_HINTS) or OPENAI_KEY_RE.search(value):
         raise SystemExit("Refusing to write likely secret material into the registry.")
-
-
-def append_unique(target, key, values):
-    if not values:
-        return
-    existing = target.setdefault(key, [])
-    for value in values:
-        if value not in existing:
-            existing.append(value)
 
 
 def main():
@@ -72,16 +74,16 @@ def main():
     assets = data.setdefault("assets", {})
     asset = assets.setdefault(args.id, {})
 
-    append_unique(asset, "category", args.category)
-    append_unique(asset, "stable_entrypoints", args.entrypoint)
-    append_unique(asset, "mcp_urls", args.url)
-    append_unique(asset, "source_paths", args.source)
-    append_unique(asset, "data_paths", args.data)
-    append_unique(asset, "config_paths", args.config)
-    append_unique(asset, "host_configs", args.host)
-    append_unique(asset, "registries", args.registry)
-    append_unique(asset, "health_checks", args.health)
-    append_unique(asset, "notes", args.note)
+    lib.append_unique(asset, "category", args.category)
+    lib.append_unique(asset, "stable_entrypoints", args.entrypoint)
+    lib.append_unique(asset, "mcp_urls", args.url)
+    lib.append_unique(asset, "source_paths", args.source)
+    lib.append_unique(asset, "data_paths", args.data)
+    lib.append_unique(asset, "config_paths", args.config)
+    lib.append_unique(asset, "host_configs", args.host)
+    lib.append_unique(asset, "registries", args.registry)
+    lib.append_unique(asset, "health_checks", args.health)
+    lib.append_unique(asset, "notes", args.note)
     if args.status:
         asset["status"] = args.status
 
