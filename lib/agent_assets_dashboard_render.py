@@ -596,7 +596,7 @@ def _render_linked_assets(linked):
     return f'{first}<span class="linked-more" title="{lib.h(full)}">+{len(values) - 1}</span>'
 
 
-def _signal_row_html(row, disabled, resource_html):
+def _signal_row_html(row, disabled, resource_html, show_title=True):
     title, note = row.get("_human") or humanize_signal(row)
     raw_label = row.get("label") or row.get("name") or row.get("identifier") or "未命名"
     kind = row.get("_signal_kind") or "其他"
@@ -610,7 +610,7 @@ def _signal_row_html(row, disabled, resource_html):
     elif plist:
         state, state_label = "not-running", "未运行"
     else:
-        state, state_label = "registered", "已登记"
+        state, state_label = "registered", "登录项/扩展"
     listeners = row.get("listeners") or []
     if listeners:
         port_text = ", ".join(str(l.get("name", "")) for l in listeners[:3])
@@ -653,9 +653,12 @@ def _signal_row_html(row, disabled, resource_html):
         actions = '<span class="muted">系统设置管理</span>'
     else:
         actions = '<span class="muted">—</span>'
-    name_cell = f'<div><strong>{lib.h(title)}</strong></div>'
-    if str(title) != str(raw_label):
-        name_cell += f'<div class="subtle">{lib.h(raw_label)}</div>'
+    if show_title:
+        name_cell = f'<div><strong>{lib.h(title)}</strong></div>'
+        if str(title) != str(raw_label):
+            name_cell += f'<div class="subtle">{lib.h(raw_label)}</div>'
+    else:
+        name_cell = f'<div class="subtle group-subname">{lib.h(raw_label)}</div>'
     if plist:
         name_cell += f'<div class="subtle plist-path">{lib.h(plist)}</div>'
     if note:
@@ -709,7 +712,7 @@ def render_macos_signals_rows(rows, process_list=None):
         f'<button class="filter active" data-state-filter="">全部状态</button>',
         f'<button class="filter" data-state-filter="running">运行中 ({state_counts.get("running", 0)})</button>',
         f'<button class="filter" data-state-filter="not-running">未运行 ({state_counts.get("not-running", 0)})</button>',
-        f'<button class="filter" data-state-filter="registered">已登记 ({state_counts.get("registered", 0)})</button>',
+        f'<button class="filter" data-state-filter="registered">登录项/扩展 ({state_counts.get("registered", 0)})</button>',
     ]
 
     parts = [
@@ -727,9 +730,20 @@ def render_macos_signals_rows(rows, process_list=None):
           <thead><tr><th class="col-name">名称</th><th class="col-type">类型</th><th class="col-state">状态</th><th class="col-resource">资源</th><th class="col-ports">端口</th><th class="col-linked">关联</th><th class="action-cell">操作</th></tr></thead>
           <tbody>
         """)
+        # 预计算每个展示标题出现的次数，用于判断是否需要分组
+        from collections import Counter
+        title_counts = Counter(str((r.get("_human") or humanize_signal(r))[0]) for r in grp)
+        current_group_title = None
         for row in grp:
+            title, _ = row.get("_human") or humanize_signal(row)
+            group_title = str(title)
+            if group_title != current_group_title:
+                if title_counts[group_title] > 1:
+                    parts.append(f'<tr class="signal-group-header"><td colspan="7"><strong>{lib.h(group_title)}</strong></td></tr>')
+                current_group_title = group_title
             resource_html = _signal_resource_text(row, process_lookup)
-            parts.append(_signal_row_html(row, disabled, resource_html))
+            # 如果该标题只有一行，仍显示标题；多行时组内行只显示服务名
+            parts.append(_signal_row_html(row, disabled, resource_html, show_title=(title_counts[group_title] <= 1)))
         parts.append("</tbody></table>")
     return "\n".join(parts)
 

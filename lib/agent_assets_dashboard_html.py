@@ -268,6 +268,15 @@ CSS = """    :root {
     .signal-table td:first-child { word-break: break-word; }
     .signal-table td:first-child > div { margin-bottom: 2px; }
     .signal-table td:first-child .plist-path { font-family: ui-monospace, monospace; font-size: 12px; }
+    .signal-table .signal-group-header td {
+      background: #f9f9f7;
+      padding: 8px;
+      font-weight: 600;
+      color: var(--text);
+      border-bottom: 1px solid var(--soft);
+    }
+    .signal-table .signal-group-header + tr td { padding-top: 8px; }
+    .signal-table .group-subname { font-family: ui-monospace, monospace; font-size: 12px; }
     .action-stack { display: inline-flex; flex-direction: column; gap: 3px; align-items: flex-start; }
     .action-stack .table-action { white-space: nowrap; }
     .auto-state {
