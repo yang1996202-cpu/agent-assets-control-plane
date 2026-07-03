@@ -16,6 +16,8 @@ install -m 0755 "$ROOT/bin/agent-assets-discover" "$BIN_DIR/agent-assets-discove
 install -m 0755 "$ROOT/bin/agent-assets-projects" "$BIN_DIR/agent-assets-projects"
 install -m 0755 "$ROOT/bin/agent-assets-register" "$BIN_DIR/agent-assets-register"
 install -m 0755 "$ROOT/bin/agent-assets-list" "$BIN_DIR/agent-assets-list"
+install -m 0755 "$ROOT/bin/agent-assets-runtime" "$BIN_DIR/asset-runtime"
+install -m 0755 "$ROOT/bin/agent-assets-macos-signals" "$BIN_DIR/asset-macos-signals"
 install -m 0755 "$ROOT/bin/agent-assets-contract" "$BIN_DIR/agent-assets-contract"
 
 render_template() {

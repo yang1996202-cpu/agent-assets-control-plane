@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本机运行态 — 原型</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f7f7f4;
+      color: #1f2328;
+    }
+    .shell {
+      display: grid;
+      grid-template-columns: 200px 1fr;
+      min-height: 100vh;
+    }
+    aside {
+      background: #fbfbf8;
+      border-right: 1px solid #deded8;
+      padding: 20px 14px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 28px;
+      font-weight: 700;
+    }
+    .brand-mark {
+      width: 32px; height: 32px; border-radius: 8px;
+      background: #20242a; color: #fff;
+      display: grid; place-items: center;
+    }
+    nav a {
+      display: block;
+      padding: 10px 12px;
+      border-radius: 8px;
+      color: inherit;
+      text-decoration: none;
+      margin-bottom: 4px;
+      font-size: 14px;
+    }
+    nav a.active { background: #eceee8; font-weight: 650; }
+    nav a.muted { color: #6b6f76; }
+    main { padding: 28px 32px 60px; }
+    h1 { margin: 0 0 6px; font-size: 28px; }
+    .sub { color: #6b6f76; font-size: 14px; }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 20px;
+    }
+    .btn {
+      border: 1px solid #deded8;
+      background: #fff;
+      border-radius: 8px;
+      padding: 8px 14px;
+      font: inherit;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .btn.primary { background: #2458d3; color: #fff; border-color: #2458d3; }
+    .filters {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 20px;
+    }
+    .filter {
+      padding: 6px 14px;
+      border-radius: 999px;
+      background: #fff;
+      border: 1px solid #deded8;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .filter.active { background: #20242a; color: #fff; border-color: #20242a; }
+    .card {
+      background: #fff;
+      border: 1px solid #deded8;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .card-title {
+      font-weight: 650;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .alert-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+    .alert-item {
+      padding: 14px;
+      border-radius: 8px;
+      background: #fffbeb;
+      border: 1px solid #fcd34d;
+    }
+    .alert-item.ok { background: #f0fdf4; border-color: #86efac; }
+    .alert-item b { display: block; font-size: 26px; }
+    .alert-item span { color: #6b6f76; font-size: 13px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid #deded8;
+      color: #6b6f76;
+      font-weight: 500;
+      font-size: 13px;
+    }
+    td {
+      padding: 12px 8px;
+      border-bottom: 1px solid #f0f1ed;
+      vertical-align: top;
+    }
+    tr:hover td { background: #f9f9f7; }
+    .name { font-weight: 600; }
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      background: #eff6ff;
+      color: #1e40af;
+    }
+    .tag.agent { background: #f3e8ff; color: #6b21a8; }
+    .tag.mcp { background: #dcfce7; color: #166534; }
+    .tag.dev { background: #ffedd5; color: #9a3412; }
+    .path {
+      color: #6b6f76;
+      font-size: 13px;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+    }
+    .actions { display: flex; gap: 6px; }
+    .action {
+      padding: 5px 10px;
+      border-radius: 6px;
+      border: 1px solid #deded8;
+      background: #fff;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .action.danger { border-color: #fca5a5; color: #b42318; }
+    .ports {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .port {
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: #f0f1ed;
+      font-size: 13px;
+      font-family: ui-monospace, monospace;
+    }
+    .hidden { display: none; }
+    .toggle { color: #2458d3; cursor: pointer; font-size: 13px; margin-left: auto; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <div class="brand">
+        <div class="brand-mark">RT</div>
+        <div>运行态</div>
+      </div>
+      <nav>
+        <a class="active" href="#">运行态</a>
+        <a href="#signals">系统信号</a>
+        <a href="#settings" class="muted">设置</a>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="topbar">
+        <div>
+          <h1>本机运行态</h1>
+          <div class="sub">只看现在有什么在跑 · 上次刷新 14:32:05</div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <label style="font-size:13px;color:#6b6f76;"><input type="checkbox" checked> 自动刷新</label>
+          <button class="btn primary">刷新</button>
+        </div>
+      </div>
+
+      <div class="filters">
+        <span class="filter active">全部</span>
+        <span class="filter">Agent / MCP</span>
+        <span class="filter">Dev Server</span>
+        <span class="filter">其他</span>
+      </div>
+
+      <div class="card" style="background:#fffbeb;border-color:#fcd34d;">
+        <div class="card-title">⚠️ 需要关注</div>
+        <div class="alert-grid">
+          <div class="alert-item">
+            <b>2</b>
+            <span>泄漏（重复实例）</span>
+          </div>
+          <div class="alert-item">
+            <b>1</b>
+            <span>僵尸 dev server</span>
+          </div>
+          <div class="alert-item ok">
+            <b>0</b>
+            <span>异常 daemon</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          🤖 Agent / MCP 正在运行
+          <span class="toggle" onclick="toggle('agent-mcp-body')">收起</span>
+        </div>
+        <div id="agent-mcp-body">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>PID</th>
+                <th>端口</th>
+                <th>项目路径</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="name">context7-mcp</span> <span class="tag mcp">MCP</span></td>
+                <td>93337</td>
+                <td>—</td>
+                <td class="path">/Users/yang/code</td>
+                <td><div class="actions"><button class="action">终止</button><button class="action danger">强制</button></div></td>
+              </tr>
+              <tr>
+                <td><span class="name">gbrain serve</span> <span class="tag mcp">MCP</span></td>
+                <td>47335</td>
+                <td>14243</td>
+                <td class="path">/Users/yang/.bun/bin</td>
+                <td><div class="actions"><button class="action">终止</button><button class="action danger">强制</button></div></td>
+              </tr>
+              <tr>
+                <td><span class="name">hermes gateway</span> <span class="tag agent">Agent</span></td>
+                <td>890</td>
+                <td>8642</td>
+                <td class="path">/Users/yang/.hermes/hermes-agent</td>
+                <td><div class="actions"><button class="action">终止</button><button class="action danger">强制</button></div></td>
+              </tr>
+              <tr>
+                <td><span class="name">openclaw gateway</span> <span class="tag agent">Agent</span></td>
+                <td>68661</td>
+                <td>18790</td>
+                <td class="path">/Users/yang/.npm-global/lib/node_modules/openclaw</td>
+                <td><div class="actions"><button class="action">终止</button><button class="action danger">强制</button></div></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          ⚙️ 其他运行中
+          <span class="toggle" onclick="toggle('other-body')">展开</span>
+        </div>
+        <div id="other-body" class="hidden">
+          <table>
+            <thead>
+              <tr><th>名称</th><th>PID</th><th>端口</th><th>项目路径</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="name">http.server</span> <span class="tag dev">Dev</span></td>
+                <td>36782</td>
+                <td>8888</td>
+                <td class="path">/Users/yang/.alice/workspaces/53305c39...</td>
+                <td><div class="actions"><button class="action">终止</button><button class="action danger">强制</button></div></td>
+              </tr>
+              <tr>
+                <td><span class="name">dashboard</span> <span class="tag">Support</span></td>
+                <td>89971</td>
+                <td>17654</td>
+                <td class="path">/Users/yang/projects/build/sandbox/agent-assets-control-plane</td>
+                <td><div class="actions"><button class="action">终止</button></div></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🔌 端口占用</div>
+        <div class="ports">
+          <span class="port">17654 dashboard</span>
+          <span class="port">14243 gbrain</span>
+          <span class="port">8888 http.server</span>
+          <span class="port">3457 skill-dashboard</span>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    function toggle(id) {
+      const el = document.getElementById(id);
+      const link = event.target;
+      if (el.classList.contains('hidden')) {
+        el.classList.remove('hidden');
+        link.textContent = '收起';
+      } else {
+        el.classList.add('hidden');
+        link.textContent = '展开';
+      }
+    }
+  </script>
+</body>
+</html>

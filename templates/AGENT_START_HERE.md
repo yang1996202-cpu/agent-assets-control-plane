@@ -32,8 +32,8 @@ If you are an agent, this is enough context. Do not ask the user to manually exp
 2. If the command is missing, PATH-dependent, ambiguous, or appears to be installed but not callable, read the registry or run `agent-assets-list` before saying it is unavailable.
 3. If the registry does not contain the tool, run `agent-assets-discover` before asking the user to identify paths manually.
 4. Read `__MCP_HOME__/registry.json` before changing MCP host configs.
-5. For GBrain memory, prefer the configured GBrain MCP tool/server. Do not use `gbrain search` as an automatic fallback; the CLI may be degraded even when the HTTP MCP is healthy.
-6. Register new agent-facing CLIs, MCPs, agent apps, skill packs, and downloaded tools during setup.
+5. For runtime blind spots (process leaks, zombie dev servers, resident daemons, port occupation), run `asset-runtime` and `asset-macos-signals` instead of guessing. These are read-only snapshots; rerun when stale.
+6. Registration is optional: `__ASSETS_HOME__/registry.json` is a historical snapshot, not a mandatory index. For a new tool, prefer making a stable entrypoint (wrapper or symlink in `__BIN_DIR__`); register only if you want it tracked.
 7. If a new asset is an MCP server, update the MCP registry too.
 8. When looking for old GitHub clones, downloaded repos, source packages, or scattered project folders, inspect `__ASSETS_HOME__/projects.json` or run `agent-assets-projects`.
 9. New durable clones, downloaded repos, and project outputs still belong under `__PROJECTS_DIR__`.

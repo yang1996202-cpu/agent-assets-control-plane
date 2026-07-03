@@ -50,6 +50,11 @@ if not ASSET_PROJECTS.exists():
         ASSET_PROJECTS = repo_local_projects
     elif legacy_projects.exists():
         ASSET_PROJECTS = legacy_projects
+ASSET_RUNTIME = pathlib.Path(os.environ.get("AGENT_ASSETS_RUNTIME_CMD", str(STABLE_BIN_DIR / "asset-runtime"))).expanduser()
+if not ASSET_RUNTIME.exists():
+    repo_local_runtime = SCRIPT_DIR / "agent-assets-runtime"
+    if repo_local_runtime.exists():
+        ASSET_RUNTIME = repo_local_runtime
 def load_json(path):
     if not path.exists():
         return {}
@@ -573,6 +578,37 @@ def refresh_projects():
 def collect_projects():
     data = load_json(PROJECT_INDEX)
     return data.get("projects", []), data.get("updated_at", ""), data
+
+
+def collect_runtime():
+    """调用 asset-runtime --json，只读，带超时保护。返回 dict 或 None（失败/不存在时）。"""
+    if not ASSET_RUNTIME.exists():
+        return {"_error": "asset-runtime 未找到", "_hint": f"预期路径：{ASSET_RUNTIME}"}
+    try:
+        proc = subprocess.run(
+            [str(ASSET_RUNTIME), "--json"],
+            cwd=str(HOME),
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+        if proc.returncode != 0:
+            return {"_error": f"asset-runtime 退出码 {proc.returncode}", "_hint": (proc.stderr or "").strip()[:400]}
+        data = json.loads(proc.stdout or "{}")
+        # 刷新 kill 白名单：只允许最近一次 runtime 报告里出现过的 pid
+        global RUNTIME_WHITELIST
+        RUNTIME_WHITELIST = {}
+        for p in (data.get("processes") or []):
+            pid = p.get("pid")
+            if pid:
+                RUNTIME_WHITELIST[str(pid)] = {"cmd": p.get("cmd", ""), "category": p.get("category", "")}
+        return data
+    except subprocess.TimeoutExpired:
+        return {"_error": "asset-runtime 超时（>25s）"}
+    except json.JSONDecodeError as exc:
+        return {"_error": f"asset-runtime JSON 解析失败：{exc}"}
+    except FileNotFoundError as exc:
+        return {"_error": f"asset-runtime 无法执行：{exc}"}
 
 
 def render_chips(values, css_class=""):
@@ -1219,6 +1255,295 @@ def render_macos_signals_rows(rows):
     return "\n".join(parts)
 
 
+RUNTIME_GROUP_META = {
+    "leak": ("⚠️", "泄漏", "同一指纹出现多次的进程，通常是 MCP / dev server 被重复拉起、没有回收。多实例会同时占内存和句柄。"),
+    "zombie": ("🧟", "僵尸 Dev server", "serve / 监听类 dev server 还挂着，项目目录可能早就不存在或已经没人用。"),
+    "ports": ("🔌", "端口占用", "本机监听端口清单。定位「谁占了 17654」这类问题用这个。"),
+}
+
+RUNTIME_CATEGORY_META = [
+    ("mcp", "🤖", "MCP Servers", "被 Agent host 调用的 MCP server 进程，stdio / http 都有。"),
+    ("agent-daemon", "🤖", "Agent Daemons", "Agent 框架自己的常驻 gateway / hub / watcher / browser daemon。"),
+    ("dev-server", "🌐", "Dev Servers", "vite / next / webpack 等开发预览服务器，容易变成僵尸。"),
+    ("support", "⚙️", "Support / Runtime", "支撑运行时，如当前 dashboard 自己、package manager、解释器。"),
+    ("system", "🔒", "System", "系统级 daemon / agent / 服务。默认 asset-runtime 会过滤，加 --show-system 才出现。"),
+    ("unknown", "❓", "Other / Unclassified", "没被规则归到上面的进程，可能藏着你想找的东西。"),
+]
+
+# 最近一次 collect_runtime() 拿到的进程白名单：{pid_str: {"cmd": str, "category": str}}。
+# /api/kill-process 只接受 pid 在此白名单里的请求，避免前端伪造任意 pid。
+RUNTIME_WHITELIST = {}
+
+
+def _runtime_cmd_short(cmd, limit=90):
+    cmd = (cmd or "").strip()
+    if len(cmd) <= limit:
+        return cmd
+    return cmd[: limit - 1] + "…"
+
+
+def _aggregate_runtime_by_fp(processes):
+    """按 fingerprint 聚合进程。返回 [{fp, category, pids, ports, cmd, cwds}]."""
+    groups = {}
+    for p in processes:
+        fp = p.get("fp") or p.get("cmd") or "?"
+        g = groups.setdefault(
+            fp,
+            {
+                "fp": fp,
+                "category": p.get("category", "unknown"),
+                "pids": [],
+                "ports": set(),
+                "cmd": p.get("cmd", ""),
+                "cwds": set(),
+            },
+        )
+        pid = p.get("pid")
+        if pid and pid not in g["pids"]:
+            g["pids"].append(pid)
+        for port in listify(p.get("ports")):
+            g["ports"].add(port)
+        if p.get("cwd"):
+            g["cwds"].add(p["cwd"])
+    for g in groups.values():
+        g["pids"].sort(key=lambda x: int(x) if str(x).isdigit() else 0)
+        g["ports"] = sorted(g["ports"])
+        g["cwds"] = sorted(g["cwds"])
+    return sorted(groups.values(), key=lambda g: (-len(g["pids"]), g["fp"]))
+
+
+def _runtime_type_badge(category):
+    mapping = {
+        "mcp": ("MCP", "mcp"),
+        "agent-daemon": ("Agent", "agent"),
+        "dev-server": ("Dev", "dev"),
+        "support": ("Support", "support"),
+        "system": ("System", "system"),
+    }
+    label, cls = mapping.get(category, ("Other", "other"))
+    return f'<span class="tag {cls}">{h(label)}</span>'
+
+
+def _cwd_badge(cwd):
+    if not cwd or cwd == "/":
+        return ""
+    href = "file://" + urllib.parse.quote(str(cwd))
+    return f'<a class="chip cwd-chip" href="{h(href)}">{h(cwd)}</a>'
+
+
+def _runtime_table_row(pid_or_count, type_badge, ports, cmd, cwd, pids_for_kill, cmd_short):
+    ports_html = ", ".join(ports) if ports else '<span class="muted">—</span>'
+    cwd_html = _cwd_badge(cwd)
+    kill_btns = _kill_buttons_for_pids(pids_for_kill, cmd_short) if pids_for_kill else ""
+    return (
+        f'<tr class="searchable" data-section="runtime">'
+        f'<td class="col-pid">{pid_or_count}</td>'
+        f'<td class="col-type">{type_badge}</td>'
+        f'<td class="col-ports">{ports_html}</td>'
+        f'<td class="col-cmd"><code>{h(cmd_short)}</code>{cwd_html}</td>'
+        f'<td class="col-action">{kill_btns}</td>'
+        f'</tr>'
+    )
+
+
+def _kill_buttons_for_pids(pids, cmd_short):
+    if not pids:
+        return ""
+    if len(pids) == 1:
+        pid = pids[0]
+        return (
+            f'<div class="action-cell">'
+            f'<button class="table-action js-kill-process" data-pid="{h(pid)}" data-cmd="{h(cmd_short)}" data-mode="term">终止</button>'
+            f'<button class="table-action js-kill-process danger" data-pid="{h(pid)}" data-cmd="{h(cmd_short)}" data-mode="kill">强制</button>'
+            f'</div>'
+        )
+    # Multi-instance: one "terminate all" / "force all" button that sends all pids.
+    pids_json = h(str(list(pids)).replace("'", '"'))
+    return (
+        f'<div class="action-cell">'
+        f'<button class="table-action js-kill-process" data-pid="{pids_json}" data-cmd="{h(cmd_short)}" data-mode="term">全部终止</button>'
+        f'<button class="table-action js-kill-process danger" data-pid="{pids_json}" data-cmd="{h(cmd_short)}" data-mode="kill">全部强制</button>'
+        f'</div>'
+    )
+
+
+def render_runtime_rows(data):
+    """渲染 asset-runtime 报告：统一 5 列表格（PID/实例、类型、端口、命令/路径、操作）。"""
+    if not data:
+        return '<p class="muted">运行态盲区数据为空。</p>'
+    if data.get("_error"):
+        hint = f'<p class="subtle">{h(data.get("_hint") or "")}</p>' if data.get("_hint") else ""
+        return f'<p class="muted">运行态盲区采集失败：{h(data["_error"])}</p>{hint}'
+
+    processes = data.get("processes") or []
+    leaks = data.get("leaks") or []
+    ports = data.get("ports") or {}
+    threshold = data.get("leak_threshold", 3)
+    summary = data.get("summary") or {}
+
+    parts = []
+
+    # summary 行
+    bits = []
+    for key, label in (("leak", "泄漏"), ("zombie", "僵尸 dev server"), ("daemon", "常驻 daemon"), ("mcp", "MCP"), ("dev", "dev server")):
+        val = summary.get(key)
+        if val:
+            bits.append(f"<strong>{val}</strong> {label}")
+    if bits:
+        parts.append(f'<p class="metric-line">{" · ".join(bits)}　·　泄漏阈值：同指纹 ≥ {h(threshold)} 个</p>')
+
+    table_head = """
+    <table class="runtime-table">
+      <thead>
+        <tr>
+          <th class="col-pid">PID / 实例</th>
+          <th class="col-type">类型</th>
+          <th class="col-ports">端口</th>
+          <th class="col-cmd">命令 / 路径</th>
+          <th class="col-action">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+    """
+
+    # 泄漏组
+    if leaks:
+        parts.append(f"""
+        <div class="runtime-group">
+          <div class="runtime-group-title">
+            <span>⚠️</span>
+            <strong>泄漏</strong>
+            <span class="muted">({len(leaks)})</span>
+            <span class="subtle">— 同一指纹出现多次</span>
+          </div>
+          {table_head}
+        """)
+        for row in leaks:
+            fp = row.get("fingerprint") or "?"
+            count = row.get("count", 0)
+            matching = [p for p in processes if p.get("fp") == fp]
+            pids = sorted([p.get("pid") for p in matching if p.get("pid")], key=lambda x: int(x) if str(x).isdigit() else 0)
+            cat = matching[0].get("category", "unknown") if matching else "unknown"
+            ports_set = set()
+            cwds = set()
+            for p in matching:
+                ports_set.update(listify(p.get("ports")))
+                if p.get("cwd"):
+                    cwds.add(p["cwd"])
+            pid_list_text = ", ".join(str(x) for x in pids)
+            if len(pids) == 1:
+                pid_html = f'<code>{h(pids[0])}</code>'
+            else:
+                pid_html = f'<strong title="PID: {h(pid_list_text)}">{count}×</strong>'
+            type_badge = _runtime_type_badge(cat)
+            cmd_short = _runtime_cmd_short(fp)
+            cwd = sorted(cwds)[0] if cwds else ""
+            parts.append(_runtime_table_row(pid_html, type_badge, sorted(ports_set), fp, cwd, pids, cmd_short))
+        parts.append("</tbody></table></div>")
+
+    # 僵尸 dev server 组
+    zombie_rows = [p for p in processes if p.get("severity") == "zombie"]
+    if zombie_rows:
+        parts.append(f"""
+        <div class="runtime-group">
+          <div class="runtime-group-title">
+            <span>🧟</span>
+            <strong>僵尸 Dev server</strong>
+            <span class="muted">({len(zombie_rows)})</span>
+            <span class="subtle">— serve / 监听类 dev server 还挂着</span>
+          </div>
+          {table_head}
+        """)
+        for p in sorted(zombie_rows, key=lambda r: r.get("pid", "")):
+            pid = p.get("pid", "?")
+            cat = p.get("category", "unknown")
+            cmd_short = _runtime_cmd_short(p.get("cmd", ""))
+            parts.append(_runtime_table_row(
+                f'<code>{h(pid)}</code>',
+                _runtime_type_badge(cat),
+                listify(p.get("ports")),
+                p.get("cmd", ""),
+                p.get("cwd", ""),
+                [pid],
+                cmd_short,
+            ))
+        parts.append("</tbody></table></div>")
+
+    # 按 category 分组
+    non_alert = [p for p in processes if p.get("severity") not in ("leak", "zombie")]
+    by_cat = {}
+    for p in non_alert:
+        by_cat.setdefault(p.get("category", "unknown"), []).append(p)
+
+    group_titles = {
+        "mcp": ("🤖", "MCP Servers", "被 Agent host 调用的 MCP server 进程"),
+        "agent-daemon": ("🤖", "Agent Daemons", "Agent 框架自己的常驻 gateway / hub / watcher / browser daemon"),
+        "dev-server": ("🌐", "Dev Servers", "vite / next / webpack 等开发预览服务器"),
+        "support": ("⚙️", "Support / Runtime", "支撑运行时，如当前 dashboard 自己"),
+        "system": ("🔒", "System", "系统级 daemon / 服务"),
+        "unknown": ("❓", "Other / Unclassified", "没被规则归到上面的进程"),
+    }
+
+    for cat, (icon, label, note) in group_titles.items():
+        grp = by_cat.get(cat)
+        if not grp:
+            continue
+        aggregated = _aggregate_runtime_by_fp(grp)
+        parts.append(f"""
+        <div class="runtime-group">
+          <div class="runtime-group-title">
+            <span>{icon}</span>
+            <strong>{h(label)}</strong>
+            <span class="muted">({len(grp)})</span>
+            <span class="subtle">— {h(note)}</span>
+          </div>
+          {table_head}
+        """)
+        for g in aggregated:
+            cmd_short = _runtime_cmd_short(g["cmd"])
+            fp_short = _runtime_cmd_short(g["fp"])
+            cwd = g["cwds"][0] if g["cwds"] else ""
+            pid_list_text = ", ".join(str(x) for x in g["pids"])
+            if len(g["pids"]) > 1:
+                pid_html = f'<strong title="PID: {h(pid_list_text)}">{len(g["pids"])}×</strong>'
+                display_cmd = fp_short
+                pids_for_kill = g["pids"]
+            else:
+                pid_html = f'<code>{h(g["pids"][0] if g["pids"] else "?")}</code>'
+                display_cmd = cmd_short
+                pids_for_kill = g["pids"]
+            parts.append(_runtime_table_row(
+                pid_html,
+                _runtime_type_badge(cat),
+                g["ports"],
+                g["cmd"],
+                cwd,
+                pids_for_kill,
+                display_cmd,
+            ))
+        parts.append("</tbody></table></div>")
+
+    # 端口占用组
+    if ports:
+        port_rows = sorted(ports.items())
+        parts.append(f"""
+        <div class="runtime-group">
+          <div class="runtime-group-title">
+            <span>🔌</span>
+            <strong>端口占用</strong>
+            <span class="muted">({len(port_rows)})</span>
+          </div>
+          <div class="ports-bar">
+        """)
+        for port_key, pid_list in port_rows:
+            pids = listify(pid_list)
+            parts.append(f'<span class="port" title="PID: {h(", ".join(str(x) for x in pids))}">{h(port_key)}</span>')
+        parts.append("</div></div>")
+
+    if len(parts) <= 1:
+        parts.append('<p class="muted">当前没有运行态数据。</p>')
+    return "\n".join(parts)
+
 def render_discovered_rows(rows, empty_label="没有匹配的候选项。"):
     out = []
     for row in rows:
@@ -1366,74 +1691,91 @@ def render_config_filters(agent_registry):
     ])
 
 
-def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, health_raw, discovered_rows, discovered_at, discovery_raw, mcp_audit, project_rows, project_at, project_meta, project_raw="", discovered_meta=None, signals_rows=None, signals_meta=None, live=False):
-    discovered_meta = discovered_meta or {}
-    project_meta = project_meta or {}
-    assets = agent_registry.get("assets", {})
-    asset_count = len(assets)
-    agent_app_count = 0
-    agent_host_count = 0
-    agent_subject_count = 0
-    for asset in assets.values():
-        categories = set(listify(asset.get("category")))
-        is_agent_app = "agent-app" in categories
-        is_agent_host = "agent-host" in categories
-        if is_agent_app:
-            agent_app_count += 1
-        if is_agent_host:
-            agent_host_count += 1
-        if is_agent_app or is_agent_host:
-            agent_subject_count += 1
-    mcp_connected = sum(1 for r in mcp_rows if r["state"] == "connected")
-    mcp_failed_count = mcp_audit["summary"].get("failed", 0)
-    mcp_delta_count = mcp_audit["summary"].get("host_only", 0) + mcp_audit["summary"].get("registry_only", 0)
-    entry_ok = sum(1 for r in entrypoints if r["state"] in {"exec", "file", "dir"})
-    unregistered_count = sum(1 for r in discovered_rows if not r.get("registered"))
-    needs_review_count = sum(1 for r in discovered_rows if not r.get("registered") and r.get("review_status", "new") == "new")
-    deferred_count = sum(1 for r in discovered_rows if not r.get("registered") and r.get("review_status") == "defer")
-    ignored_count = sum(1 for r in discovered_rows if not r.get("registered") and r.get("review_status") == "ignore")
-    pending_rows = [r for r in discovered_rows if not r.get("registered") and r.get("review_status", "new") == "new"]
-    deferred_rows = [r for r in discovered_rows if not r.get("registered") and r.get("review_status") == "defer"]
-    ignored_rows = [r for r in discovered_rows if not r.get("registered") and r.get("review_status") == "ignore"]
-    registered_rows = [r for r in discovered_rows if r.get("registered")]
-    scan_mode = discovered_meta.get("scan_mode") or "daily"
-    scan_dirs = discovered_meta.get("scan_dirs") or []
-    scan_mode_label = "全面盘点" if scan_mode == "deep" else "快速体检"
-    project_summary = project_meta.get("summary", {})
-    project_total = project_summary.get("total", len(project_rows))
-    project_legacy = project_summary.get("legacy", 0)
-    project_downloads = project_summary.get("download_candidate", 0)
-    project_host_managed = project_summary.get("host_managed", 0)
-    project_linked = project_summary.get("linked", 0)
-    decision_count = needs_review_count
+
+def _runtime_updated_at(runtime_data):
+    if not runtime_data or runtime_data.get("_error"):
+        return "未采集"
+    return runtime_data.get("updated_at") or dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _runtime_summary(runtime_data):
+    if not runtime_data or runtime_data.get("_error"):
+        return {"leak": 0, "zombie": 0, "daemon": 0}
+    s = runtime_data.get("summary", {})
+    return {
+        "leak": s.get("leak", 0),
+        "zombie": s.get("zombie", 0),
+        "daemon": s.get("daemon", 0),
+    }
+
+
+def render_alert_cards(runtime_data):
+    summary = _runtime_summary(runtime_data)
+    leak_ok = "ok" if summary["leak"] == 0 else ""
+    zombie_ok = "ok" if summary["zombie"] == 0 else ""
+    daemon_ok = "ok" if summary["daemon"] == 0 else ""
+    return f"""
+    <div class="card alert-card">
+      <div class="card-title">需要关注</div>
+      <div class="alert-grid">
+        <div class="alert-item {leak_ok}"><b>{summary["leak"]}</b><span>泄漏（重复实例）</span></div>
+        <div class="alert-item {zombie_ok}"><b>{summary["zombie"]}</b><span>僵尸 dev server</span></div>
+        <div class="alert-item {daemon_ok}"><b>{summary["daemon"]}</b><span>异常 daemon</span></div>
+      </div>
+    </div>
+    """
+
+
+def render_runtime_filter_bar():
+    return """
+    <div class="filter-bar runtime-filter-bar">
+      <button class="filter active" data-filter="">全部</button>
+      <button class="filter" data-filter="agent-mcp">Agent / MCP</button>
+      <button class="filter" data-filter="dev-server">Dev Server</button>
+      <button class="filter" data-filter="other">其他</button>
+    </div>
+    """
+
+
+def render_cli_entrypoints(entrypoints):
+    rows = []
+    for row in sorted(entrypoints, key=lambda r: r.get("path", "")):
+        path = row.get("path", "")
+        name = pathlib.Path(path).name or path
+        state = row.get("state", "missing")
+        state_label = label_for_state(state)
+        path_html = _cwd_badge(path) if path else '<span class="muted">—</span>'
+        rows.append(f"""
+        <tr class="searchable" data-section="entrypoints" data-text="{h(name)} {h(path)} {h(state)}">
+          <td><code>{h(name)}</code></td>
+          <td>{path_html}</td>
+          <td><span class="state state-{h(state.replace('_', '-'))}">{h(state_label)}</span></td>
+        </tr>
+        """)
+    body = "\n".join(rows) if rows else '<tr><td colspan="3" class="muted">没有找到 CLI 入口。</td></tr>'
+    return f"""
+    <div class="card">
+      <div class="card-title">本机 CLI 入口</div>
+      <table class="data-table">
+        <thead><tr><th>名称</th><th>路径</th><th>状态</th></tr></thead>
+        <tbody>{body}</tbody>
+      </table>
+    </div>
+    """
+
+
+def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, health_raw, discovered_rows, discovered_at, discovery_raw, mcp_audit, project_rows, project_at, project_meta, project_raw="", discovered_meta=None, signals_rows=None, signals_meta=None, live=False, runtime_data=None):
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    runtime_updated = _runtime_updated_at(runtime_data)
     live_attr = "true" if live else "false"
-    scan_disabled = "" if live else "disabled"
-    scan_hint = "实时模式：扫描后会刷新候选项和 MCP 对账。" if live else "静态文件只读。打开 live dashboard 后，才能在浏览器里触发扫描。"
-    project_scan_hint = "刷新会重建项目索引，不移动、不删除任何文件。" if live else "静态文件只读。打开 live dashboard 后，才能刷新项目索引。"
-    overview_issues = []
-    if mcp_audit["summary"]["host_only"]:
-        overview_issues.append(("new", f"{mcp_audit['summary']['host_only']} 个 MCP 已写进宿主配置，但还没纳入 MCP 总账。", "#mcp-host-only", "纳入 MCP 总账"))
-    if mcp_audit["summary"]["registry_only"]:
-        overview_issues.append(("defer", f"{mcp_audit['summary']['registry_only']} 条 MCP registry 引用在宿主配置里已经找不到。", "#mcp-registry-only", "查看差异"))
-    if mcp_audit["summary"]["failed"]:
-        overview_issues.append(("failed", f"{mcp_audit['summary']['failed']} 个 MCP 当前连接失败，需要排查宿主或运行时。", "#mcp-health", "查看连接"))
-    if needs_review_count:
-        overview_issues.append(("new", f"{needs_review_count} 个候选工具还没处理，扫描结果还没有形成资产决策。", "#discovered-pending", "处理候选"))
-    if project_legacy or project_downloads:
-        overview_issues.append(("legacy", f"{project_legacy + project_downloads} 个项目还在旧位置或下载目录，需要判断是否收编到 {PROJECTS_DIR}。", "#projects-legacy", "查看项目"))
-    outside_stable = [
-        row for row in entrypoints
-        if row["path"] and row["state"] == "exec" and not row["path"].startswith(str(STABLE_BIN_DIR) + "/")
-    ]
-    if outside_stable:
-        overview_issues.append(("defer", f"{len(outside_stable)} 个已登记入口不在 {STABLE_BIN_DIR}，后续应统一成稳定 wrapper。", "#entrypoints", "查看入口"))
+    runtime_section = render_runtime_rows(runtime_data) if runtime_data else '<p class="muted">运行态数据未加载。</p>'
+    signals_section = render_macos_signals_rows(signals_rows) if signals_rows else '<p class="muted">系统信号未加载。</p>'
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>本机 Agent 资产面板</title>
+  <title>本机运行态</title>
   <style>
     :root {{
       color-scheme: light;
@@ -1446,9 +1788,7 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, health_raw, 
       --blue: #2458d3;
       --green: #137333;
       --red: #b42318;
-      --amber: #996500;
-      --violet: #6f42c1;
-      --ink: #24292f;
+      --amber: #f59e0b;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -1456,34 +1796,32 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, health_raw, 
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: var(--bg);
       color: var(--text);
-      letter-spacing: 0;
     }}
     .shell {{
       display: grid;
-      grid-template-columns: 248px minmax(0, 1fr);
+      grid-template-columns: 200px minmax(0, 1fr);
       min-height: 100vh;
-      min-width: 0;
     }}
     aside {{
-      border-right: 1px solid var(--line);
       background: #fbfbf8;
-      padding: 22px 18px;
+      border-right: 1px solid var(--line);
+      padding: 20px 14px;
       position: sticky;
       top: 0;
       height: 100vh;
-      min-width: 0;
-      max-width: 100%;
     }}
-    main {{ padding: 28px 32px 60px; min-width: 0; max-width: 100%; }}
-    h1 {{ margin: 0; font-size: 30px; line-height: 1.15; }}
-    h2 {{ margin: 28px 0 14px; font-size: 18px; }}
-    h3 {{ margin: 0; font-size: 16px; }}
-    p {{ margin: 6px 0; color: var(--muted); line-height: 1.45; }}
-    .brand {{ display: flex; gap: 10px; align-items: center; margin-bottom: 22px; }}
-    .brand-mark {{
-      width: 34px; height: 34px; border-radius: 8px;
-      background: #20242a; color: white; display: grid; place-items: center;
+    .brand {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 28px;
       font-weight: 700;
+      font-size: 15px;
+    }}
+    .brand-mark {{
+      width: 32px; height: 32px; border-radius: 8px;
+      background: #20242a; color: #fff;
+      display: grid; place-items: center;
     }}
     .nav button {{
       width: 100%;
@@ -1496,954 +1834,424 @@ def build_html(agent_registry, mcp_registry, mcp_rows, entrypoints, health_raw, 
       font: inherit;
       cursor: pointer;
       margin-bottom: 4px;
+      font-size: 14px;
     }}
     .nav button.active {{ background: #eceee8; font-weight: 650; }}
-    .meta {{ margin-top: 20px; font-size: 12px; color: var(--muted); line-height: 1.5; }}
+    main {{ padding: 28px 32px 60px; min-width: 0; }}
+    h1 {{ margin: 0 0 6px; font-size: 28px; }}
+    .sub {{ color: var(--muted); font-size: 14px; }}
     .topbar {{
       display: flex;
-      gap: 16px;
-      align-items: flex-start;
+      align-items: center;
       justify-content: space-between;
-      border-bottom: 1px solid var(--line);
-      padding-bottom: 20px;
       margin-bottom: 20px;
-      min-width: 0;
     }}
-    .search {{
-      width: min(440px, 100%);
+    .btn {{
       border: 1px solid var(--line);
-      background: var(--panel);
+      background: #fff;
       border-radius: 8px;
-      padding: 11px 12px;
-      font-size: 14px;
-      outline: none;
-    }}
-    .summary {{
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      margin: 18px 0 8px;
-    }}
-    .metric-hero {{
-      padding: 18px 20px;
-      border: 1px solid var(--line, #e5e7eb);
-      border-left: 4px solid #1d4ed8;
-      border-radius: 8px;
-      background: #f8faff;
-    }}
-    .metric-hero b {{ font-size: 60px; line-height: 1; }}
-    .metric-line {{
-      color: var(--muted, #6b7280);
-      font-size: 14px;
-      margin: 0 0 20px;
-    }}
-    .actions {{
-      display: flex;
-      align-items: center;
-      justify-content: flex-end;
-      gap: 10px;
-      flex-wrap: wrap;
-      min-width: 260px;
-    }}
-    .scan-action {{
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }}
-    .scan-action[hidden] {{ display: none; }}
-    .primary-action, .secondary-action {{
-      border: 1px solid #1d4ed8;
-      border-radius: 8px;
-      min-height: 40px;
-      padding: 0 14px;
+      padding: 8px 16px;
       font: inherit;
-      font-weight: 650;
+      font-size: 14px;
       cursor: pointer;
     }}
-    .primary-action {{
-      background: var(--blue);
-      color: #fff;
-    }}
-    .secondary-action {{
-      background: var(--panel);
-      color: var(--blue);
-    }}
-    .primary-action:disabled, .secondary-action:disabled {{
-      border-color: var(--line);
-      background: #e5e7eb;
-      color: var(--muted);
-      cursor: not-allowed;
-    }}
-    .scan-status {{
-      color: var(--muted);
-      font-size: 12px;
-      max-width: 320px;
-      line-height: 1.35;
-    }}
-    .search[hidden], .actions[hidden] {{ display: none; }}
-    .metric {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-    }}
-    .metric b {{ display: block; font-size: 26px; margin-bottom: 4px; }}
-    .metric span {{ color: var(--muted); font-size: 13px; }}
-    .metric small {{
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.35;
-      margin-top: 5px;
-    }}
-    .asset-summary {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 16px; }}
-    .asset-chip {{ display: inline-flex; align-items: baseline; gap: 6px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); text-decoration: none; color: inherit; cursor: pointer; }}
-    .asset-chip b {{ font-size: 18px; color: var(--blue); }}
-    .asset-chip span {{ font-size: 13px; color: var(--muted); }}
-    .asset-chip:hover {{ border-color: var(--blue); }}
-    .asset-chip-warn {{ border-color: #f59e0b; background: #fffbeb; }}
-    .asset-chip-warn b, .asset-chip-warn span {{ color: #b45309; }}
-    .pending-block {{ margin: 4px 0 20px; padding: 14px 16px; border: 1px solid #f59e0b; border-left: 4px solid #f59e0b; border-radius: 8px; background: #fffbeb; }}
-    .pending-block h2 {{ margin: 0 0 4px; font-size: 16px; color: #b45309; }}
-    .pending-hint {{ color: var(--muted); font-size: 13px; margin: 0 0 10px; }}
-    .pending-tags {{ display: flex; flex-wrap: wrap; gap: 6px; }}
-    .tag-pending {{ display: inline-block; padding: 4px 10px; border: 1px solid #fcd34d; border-radius: 999px; background: #fff; color: #92400e; font-size: 13px; text-decoration: none; cursor: pointer; }}
-    .tag-pending:hover {{ background: #fef3c7; }}
-    .crosscheck-block {{ margin: 4px 0 20px; padding: 14px 16px; border: 1px solid var(--blue); border-left: 4px solid var(--blue); border-radius: 8px; background: #f8faff; }}
-    .crosscheck-block h2 {{ margin: 0 0 4px; font-size: 16px; color: var(--blue); }}
-    .tag-cross {{ display: inline-block; padding: 4px 10px; border: 1px solid #bfdbfe; border-radius: 999px; background: #fff; color: #1e40af; font-size: 13px; text-decoration: none; cursor: pointer; }}
-    .tag-cross:hover {{ background: #eff6ff; }}
-    .section {{ display: none; min-width: 0; max-width: 100%; }}
-    .section.active {{ display: block; }}
-    .asset-grid {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-    }}
-    .content-group {{
-      margin: 18px 0 28px;
-    }}
-    .content-group-head {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 10px;
-      border-bottom: 1px solid var(--line);
-      padding-bottom: 8px;
-    }}
-    .filter-bar {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin: 14px 0 16px;
-    }}
-    .filter-chip {{
-      border: 1px solid var(--line);
-      background: var(--panel);
-      color: var(--text);
-      min-height: 32px;
+    .btn.primary {{ background: var(--blue); color: #fff; border-color: var(--blue); }}
+    .btn:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+    .filter-bar {{ display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }}
+    .filter {{
+      padding: 6px 14px;
       border-radius: 999px;
-      padding: 0 11px;
-      font: inherit;
+      background: #fff;
+      border: 1px solid var(--line);
       font-size: 13px;
       cursor: pointer;
     }}
-    .filter-chip span {{
+    .filter.active {{ background: #20242a; color: #fff; border-color: #20242a; }}
+    .card {{
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }}
+    .card-title {{
+      font-weight: 650;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .alert-card {{ background: #fffbeb; border-color: #fcd34d; }}
+    .alert-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }}
+    .alert-item {{
+      padding: 14px;
+      border-radius: 8px;
+      background: #fff;
+      border: 1px solid #fcd34d;
+      min-height: 80px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }}
+    .alert-item.ok {{ background: #f0fdf4; border-color: #86efac; }}
+    .alert-item b {{ display: block; font-size: 26px; }}
+    .alert-item span {{ color: var(--muted); font-size: 13px; }}
+    .data-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }}
+    .data-table th {{
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
       color: var(--muted);
-      margin-left: 4px;
+      font-weight: 500;
+      font-size: 13px;
     }}
-    .filter-chip.active {{
-      border-color: #20242a;
-      background: #20242a;
-      color: #fff;
+    .data-table td {{
+      padding: 12px 8px;
+      border-bottom: 1px solid var(--soft);
+      vertical-align: top;
     }}
-    .filter-chip.active span {{ color: #d8dadd; }}
-    .asset-card {{
-      background: var(--panel);
+    .data-table tr:hover td {{ background: #f9f9f7; }}
+    .section {{ display: none; min-width: 0; }}
+    .section.active {{ display: block; }}
+    .signal-table {{ width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 16px; }}
+    .signal-table caption {{
+      text-align: left;
+      font-weight: 650;
+      padding: 10px 0;
+      font-size: 15px;
+    }}
+    .signal-table th, .signal-table td {{
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--soft);
+      vertical-align: top;
+    }}
+    .signal-table th {{ color: var(--muted); font-weight: 500; font-size: 13px; }}
+    .signal-table .subtle {{ color: var(--muted); font-size: 13px; }}
+    .signal-table .muted {{ color: var(--muted); }}
+    .signal-table .ctrl-icon {{ margin-right: 6px; }}
+    .runtime-group {{ margin-bottom: 24px; }}
+    .runtime-group-title {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 15px;
+      font-weight: 650;
+      margin-bottom: 8px;
+    }}
+    .runtime-group-title .muted {{ color: var(--muted); font-weight: normal; }}
+    .runtime-group-title .subtle {{ color: var(--muted); font-weight: normal; font-size: 13px; margin-left: 4px; }}
+    .runtime-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      table-layout: fixed;
+      background: #fff;
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 16px;
-      min-width: 0;
+      overflow: hidden;
     }}
-    .asset-head {{
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: flex-start;
-      margin-bottom: 10px;
+    .runtime-table th, .runtime-table td {{
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--soft);
+      vertical-align: middle;
+      text-align: left;
     }}
-    .badge, .state, .count-pill {{
-      display: inline-flex;
-      align-items: center;
-      min-height: 24px;
-      border-radius: 999px;
-      padding: 3px 8px;
-      background: var(--soft);
+    .runtime-table th {{
+      background: #fbfbf8;
       color: var(--muted);
-      font-size: 12px;
+      font-weight: 500;
+      font-size: 13px;
+    }}
+    .runtime-table tr:last-child td {{ border-bottom: 0; }}
+    .runtime-table tr:hover td {{ background: #f9f9f7; }}
+    .runtime-table .col-pid {{ width: 13%; }}
+    .runtime-table .col-type {{ width: 7%; }}
+    .runtime-table .col-ports {{ width: 14%; }}
+    .runtime-table .col-cmd {{ width: 46%; }}
+    .runtime-table .col-action {{ width: 20%; }}
+    .runtime-table td.col-pid {{ white-space: nowrap; }}
+    .runtime-table td.col-type {{ white-space: nowrap; }}
+    .runtime-table td.col-ports {{
+      font-family: ui-monospace, monospace;
+      font-size: 13px;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }}
-    .state-connected, .state-exec, .state-file, .state-dir, .state-file-ref, .state-canonical, .state-linked, .state-running, .state-enabled, .state-confirmed {{ color: var(--green); background: #e8f2ea; }}
-    .state-failed, .state-missing, .state-broken-link, .state-error {{ color: var(--red); background: #fbeaea; }}
-    .state-registered, .state-ref, .state-internal, .state-host-managed, .state-registered-source, .state-git-repo, .state-node-package, .state-python-package, .state-go-module, .state-rust-package, .state-launch-agent, .state-launch-daemon, .state-global-agent, .state-agent-service {{ color: var(--blue); background: #e9eefb; }}
-    .state-unregistered, .state-new, .state-cli-candidate, .state-agent-candidate, .state-mcp-wrapper, .state-mcp-candidate, .state-skill, .state-listening, .state-remote-control, .state-network-proxy {{ color: var(--violet); background: #f1eafb; }}
-    .state-defer, .state-legacy, .state-download-candidate, .state-documentation, .state-attention, .state-privileged, .state-residual-candidate, .state-residual {{ color: var(--amber); background: #fff5d6; }}
-    .state-ignore, .state-not-running, .state-disabled, .state-updater, .state-input-method, .state-not-agent {{ color: var(--muted); background: #eceee8; }}
-    .state-unknown {{ color: var(--amber); background: #fff5d6; }}
-    .asset-row {{ margin: 9px 0; }}
-    .asset-row strong {{ display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }}
-    .chip {{
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      max-width: 100%;
-      min-height: 24px;
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      padding: 3px 7px;
-      margin: 2px 4px 2px 0;
-      background: #fafafa;
-      color: var(--ink);
-      text-decoration: none;
-      vertical-align: top;
-      font-size: 12px;
-    }}
-    .chip span {{
+    .runtime-table td.col-cmd code {{
+      display: block;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      max-width: min(680px, 64vw);
-    }}
-    .chip b {{ color: var(--muted); font-weight: 500; }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: hidden;
-    }}
-    .table-scroll {{
-      width: 100%;
       max-width: 100%;
-      overflow-x: auto;
-      border-radius: 8px;
     }}
-    .table-scroll table {{
-      min-width: 900px;
-    }}
-    th, td {{
-      text-align: left;
-      padding: 12px;
-      border-bottom: 1px solid var(--line);
-      vertical-align: top;
-      font-size: 13px;
-    }}
-    th {{ background: #f3f4ef; color: var(--muted); font-weight: 650; }}
-    tr:last-child td {{ border-bottom: 0; }}
-    .subtle {{ display: block; color: var(--muted); margin-top: 4px; font-size: 12px; }}
-    .note-cell {{ color: var(--muted); max-width: 280px; }}
-    .status-text {{
-      color: var(--ink);
-      background: #f5f6f1;
-      border-radius: 7px;
-      padding: 8px 10px;
-      font-size: 13px;
-    }}
-    .empty {{
-      display: none;
-      color: var(--muted);
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 18px;
-    }}
-    .issue-list, .scan-card {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-      margin: 16px 0;
-    }}
-    .issue-row {{
-      display: flex;
-      gap: 12px;
-      align-items: flex-start;
-      justify-content: space-between;
-      padding: 12px 0;
-      border-bottom: 1px solid var(--line);
-    }}
-    .issue-row:last-child {{ border-bottom: 0; padding-bottom: 0; }}
-    .issue-main {{ min-width: 0; }}
-    .jump-link {{
-      color: var(--blue);
-      text-decoration: none;
-      font-size: 13px;
+    .runtime-table td.col-cmd .cwd-chip {{
+      display: inline-block;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
       white-space: nowrap;
+      vertical-align: middle;
+      margin-top: 6px;
     }}
-    .issue-actions {{
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-    }}
-    .quick-actions {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin: 14px 0 4px;
-    }}
-    .evidence-grid {{
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-      margin: 16px 0 22px;
-    }}
-    .evidence-card {{
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      min-height: 150px;
-      padding: 16px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-      text-decoration: none;
-      color: var(--text);
-    }}
-    .evidence-card strong {{
-      font-size: 16px;
-    }}
-    .evidence-card b {{
-      display: block;
-      font-size: 28px;
-      margin: 12px 0 2px;
-    }}
-    .evidence-card span {{
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.35;
-    }}
-    .action-cell {{
-      min-width: 180px;
-    }}
+    .runtime-table td.col-cmd .cwd-chip b {{ display: none; }}
     .table-action {{
-      min-height: 30px;
-      border-radius: 7px;
+      padding: 4px 8px;
+      border-radius: 6px;
       border: 1px solid var(--line);
       background: #fff;
-      color: var(--text);
-      padding: 0 10px;
-      margin: 2px 6px 2px 0;
-      font: inherit;
       font-size: 12px;
       cursor: pointer;
-    }}
-    .table-action.primary {{
-      border-color: #1d4ed8;
-      background: var(--blue);
-      color: #fff;
-    }}
-    .table-action:disabled {{
-      opacity: 0.65;
-      cursor: wait;
-    }}
-    .signal-table {{
-      margin-top: 18px;
-    }}
-    .signal-table caption {{
-      text-align: left;
-      padding: 8px 6px;
-      font-size: 13px;
-      border-bottom: 2px solid var(--line);
-      margin-bottom: 6px;
-    }}
-    .signal-table .ctrl-icon {{
-      font-size: 15px;
-    }}
-    .signal-table .action-cell {{
-      min-width: 220px;
-    }}
-    .plist-path {{
-      word-break: break-all;
-      font-family: ui-monospace, SFMono-Regular, monospace;
-      font-size: 11px;
-    }}
-    .action-stack {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 4px;
-      align-items: center;
-    }}
-    .action-stack .table-action {{
-      margin: 0;
-    }}
-    .auto-state {{
-      font-size: 11px;
-      padding: 1px 6px;
-      border-radius: 5px;
+      margin-right: 4px;
       white-space: nowrap;
     }}
-    .auto-state.on {{
-      background: #dcfce7;
-      color: #166534;
-    }}
-    .auto-state.off {{
-      background: #fee2e2;
-      color: #991b1b;
-    }}
-    .raw-health {{
-      white-space: pre-wrap;
-      background: #22252a;
-      color: #f4f4f1;
-      border-radius: 8px;
-      padding: 14px;
+    .table-action.danger {{ border-color: #fca5a5; color: #b42318; }}
+    .action-cell {{ white-space: nowrap; }}
+    .chip {{
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--soft);
+      text-decoration: none;
+      color: inherit;
       font-size: 12px;
-      overflow: auto;
+      font-family: ui-monospace, monospace;
     }}
-    @media (max-width: 920px) {{
-      .shell {{ grid-template-columns: 1fr; }}
-      aside {{ position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }}
-      .summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-      .evidence-grid {{ grid-template-columns: 1fr; }}
-      .asset-grid {{ grid-template-columns: 1fr; }}
-      .topbar {{ flex-direction: column; }}
-      main {{ padding: 20px; }}
+    .chip b {{ font-size: 10px; color: var(--muted); font-weight: normal; }}
+    .cwd-chip {{ background: #eff6ff; border-color: #bfdbfe; color: #1e40af; margin-left: 6px; }}
+    .state {{
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
     }}
+    .state-exec {{ background: #dcfce7; color: #166534; }}
+    .state-missing {{ background: #fee2e2; color: #b42318; }}
+    .state-broken-link {{ background: #fee2e2; color: #b42318; }}
+    .state-file, .state-dir {{ background: #f0f1ed; color: var(--muted); }}
+    .tag {{
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 500;
+      background: #f0f1ed;
+      color: var(--muted);
+    }}
+    .tag.mcp {{ background: #dcfce7; color: #166534; }}
+    .tag.agent {{ background: #f3e8ff; color: #6b21a8; }}
+    .tag.dev {{ background: #ffedd5; color: #9a3412; }}
+    .tag.support {{ background: #e0f2fe; color: #075985; }}
+    .tag.system {{ background: #f3f4f6; color: #374151; }}
+    .tag.other {{ background: #f0f1ed; color: var(--muted); }}
+    .ports-bar {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    .port {{
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: var(--soft);
+      font-size: 13px;
+      font-family: ui-monospace, monospace;
+    }}
+    .muted {{ color: var(--muted); }}
+    .refresh-status {{ color: var(--muted); font-size: 13px; margin-left: 10px; }}
+    .hidden {{ display: none; }}
+    .toggle {{ color: var(--blue); cursor: pointer; font-size: 13px; margin-left: auto; }}
   </style>
 </head>
-<body>
+<body data-live="{h(live_attr)}">
   <div class="shell">
     <aside>
       <div class="brand">
-        <div class="brand-mark">AA</div>
-        <div>
-          <strong>Agent 资产</strong>
-          <p>本机工具总览</p>
-        </div>
+        <div class="brand-mark">RT</div>
+        <div>运行态</div>
       </div>
-      <nav class="nav" aria-label="dashboard sections">
-        <button class="active" data-tab="overview">总览</button>
-        <button data-tab="discovered">待处理</button>
-        <button data-tab="assets">资产</button>
+      <nav class="nav">
+        <button class="active" data-tab="runtime">运行态</button>
         <button data-tab="signals">系统信号</button>
-        <button data-tab="evidence">发现</button>
-        <button data-tab="config">设置</button>
+        <button data-tab="settings">设置</button>
       </nav>
-      <div class="meta">
-        生成时间：{h(generated)}<br>
-        总账：{h(REGISTRY)}
-      </div>
     </aside>
     <main>
-      <div class="topbar">
-        <div>
-          <h1 id="pageTitle">总览</h1>
-          <p id="pageSubtitle">先看问题和下一步动作，不在总览里堆列表。</p>
-        </div>
-        <div class="actions">
-          <input class="search" id="search" placeholder="搜索当前列表页..." autocomplete="off" hidden>
-          <div class="scan-action" id="scanAction">
-            <button class="primary-action scan-button" data-mode="daily" data-live="{live_attr}" {scan_disabled}>快速体检</button>
-            <button class="secondary-action scan-button" data-mode="deep" data-live="{live_attr}" {scan_disabled}>全面盘点</button>
-            <span class="scan-status" id="scanStatus">{h(scan_hint)}</span>
+      <section class="section active" data-section="runtime">
+        <div class="topbar">
+          <div>
+            <h1>本机运行态</h1>
+            <div class="sub">只看现在有什么在跑 · 上次刷新 <span id="runtime-updated">{h(runtime_updated)}</span></div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span id="refresh-status" class="refresh-status"></span>
+            <button class="btn primary" id="refresh-runtime">刷新</button>
           </div>
         </div>
-      </div>
-
-      <section class="section active" data-section="overview">
-        <div class="summary">
-          <div class="metric metric-hero"><b>{decision_count}</b><span>待处理决策</span><small>{needs_review_count} 个候选等你拍板 · <a class="jump-link js-jump" href="#discovered-pending">去处理 →</a></small></div>
-        </div>
-        <div class="asset-summary">
-          {asset_summary_chips(agent_registry)}
-        </div>
-        <p class="metric-line">{asset_count} 资产 · {len(mcp_rows)} 个 MCP（{mcp_connected} 连通）· 入口 {entry_ok}/{len(entrypoints)} 健康</p>
-        {render_unsorted_block(agent_registry)}
-        {render_crosscheck_block(signals_rows, signals_meta)}
-        <h2>当前问题</h2>
-        <div class="issue-list">
-          {"".join(
-              f'<div class="issue-row searchable" data-section="overview" data-text="{h(text)}">'
-              f'<div class="issue-main">{state_badge(state)}<p>{h(text)}</p></div>'
-              f'<div class="issue-actions"><a class="jump-link js-jump" href="{h(target)}">{h(label)}</a></div></div>'
-              for state, text, target, label in overview_issues
-          ) if overview_issues else '<div class="issue-row"><div class="issue-main">' + state_badge('registered', '健康') + '<p>当前没有新的待办问题，系统更像一本总账而不是告警面板。</p></div></div>'}
-        </div>
-        <div class="scan-card">
-          <h2>体检说明</h2>
-          <p>`快速体检` 只复查已知入口目录、候选工具和 MCP 对账，适合日常使用。`全面盘点` 会扩大到常见 App / Agent 目录，适合抓漏，不应该当日常刷新。</p>
-          <p>最近一次体检模式：{h(scan_mode_label)}。最近一次扫描时间：{h(discovered_at or "尚未扫描")}。</p>
-          <div class="quick-actions">
-            {'<button class="table-action primary js-register-all-mcp">一键纳入新增 MCP</button>' if mcp_audit["summary"]["host_only"] else ''}
-            <button class="table-action primary full-update-button" data-live="{live_attr}" {scan_disabled}>一键更新全部索引</button>
-            <button class="table-action crosscheck-button" data-live="{live_attr}" {scan_disabled}>一键交叉校验</button>
-            <button class="table-action project-scan-button" data-live="{live_attr}" {scan_disabled}>刷新项目目录</button>
-            <a class="jump-link js-jump" href="#discovered-pending">处理候选工具</a>
-            <a class="jump-link js-jump" href="#projects-legacy">查看旧项目</a>
-            <a class="jump-link js-jump" href="#entrypoints">查看入口规范</a>
-          </div>
-        </div>
-        <h2>给新 Agent 的一句话</h2>
-        <table>
-          <tbody>
-            <tr>
-              <td><strong>起始文件</strong></td>
-              <td>{chip(str(START_FILE))}</td>
-            </tr>
-            <tr>
-              <td><strong>告诉新 Agent 的一句话</strong></td>
-              <td>先看 <code>{h(START_FILE)}</code>，按里面的本机资产规范办。</td>
-            </tr>
-          </tbody>
-        </table>
-        <details>
-          <summary>原始体检输出</summary>
-          <h2>Claude MCP 健康状态</h2>
-          <pre class="raw-health">{h(health_raw or "没有捕获到健康检查输出。")}</pre>
-          <h2>扫描结果</h2>
-          <table>
-            <tbody>
-              <tr><td><strong>上次扫描</strong></td><td>{h(discovered_at or "尚未扫描")}</td></tr>
-              <tr><td><strong>摘要</strong></td><td><pre class="raw-health">{h(discovery_raw or "当前没有扫描输出。")}</pre></td></tr>
-            </tbody>
-          </table>
-        </details>
-      </section>
-
-      <section class="section" data-section="evidence">
-        <h2>发现来源</h2>
-        <p>这里不是正式资产台账，只是证据入口。日常先处理“待处理”，需要追来源时再从这里进入细项。</p>
-        <div class="evidence-grid">
-          <a class="evidence-card" href="#projects">
-            <strong>项目目录</strong>
-            <b>{project_total}</b>
-            <span>{project_legacy + project_downloads} 个旧位置/下载候选，{project_linked} 个已关联资产。</span>
-          </a>
-          <a class="evidence-card" href="#mcp">
-            <strong>MCP 对账</strong>
-            <b>{mcp_audit['summary']['host_only'] + mcp_audit['summary']['registry_only']}</b>
-            <span>{mcp_connected}/{len(mcp_rows)} 当前连通，查看宿主配置和总账差异。</span>
-          </a>
-          <a class="evidence-card" href="#entrypoints">
-            <strong>稳定入口</strong>
-            <b>{entry_ok}/{len(entrypoints)}</b>
-            <span>Agent 真正应该调用的命令、wrapper、PATH 和坏链检查。</span>
-          </a>
-          <a class="evidence-card" href="#config">
-            <strong>规则来源</strong>
-            <b>{len(agent_registry.get("indexes", {}).get("host_configs", {}))}</b>
-            <span>查看 registry、MCP registry、宿主配置和启动文件在哪里。</span>
-          </a>
-        </div>
-      </section>
-
-      <section class="section" data-section="projects">
-        <h2 id="projects-legacy">项目索引</h2>
-        <p>这里专门看 GitHub 下载、历史 clone、源码包和宿主管理工作区；索引只记录位置和信号，不搬迁、不删除文件。</p>
-        <p>当前：{project_total} 个项目 / {project_legacy} 个旧位置 / {project_downloads} 个下载候选 / {project_host_managed} 个宿主管理 / {project_linked} 个已关联资产。更新时间：{h(project_at or "尚未生成")}。</p>
-        <div class="quick-actions">
-          <button class="table-action primary project-scan-button" data-live="{live_attr}" {scan_disabled}>刷新项目索引</button>
-          <span class="scan-status" id="projectStatus">{h(project_scan_hint)}</span>
-        </div>
-        {render_project_filters(project_rows)}
-        <div class="table-scroll">
-          <table>
-            <thead><tr><th>项目</th><th>路径 / remote</th><th>状态</th><th>信号 / 入口候选</th><th>关联资产</th><th>下一步</th></tr></thead>
-            <tbody>{render_project_rows(project_rows)}</tbody>
-          </table>
-        </div>
-        <div class="empty">没有匹配的项目。</div>
-        {'<h2>项目索引输出</h2><pre class="raw-health">' + h(project_raw) + '</pre>' if project_raw else ''}
-      </section>
-
-      <section class="section" data-section="assets">
-        <h2>正式资产</h2>
-        <p>这里按资产用途分区，左侧菜单不拆层级，页面内部再看分类。</p>
-        {render_asset_filters(agent_registry)}
-        {render_asset_sections(agent_registry)}
-        <div class="empty">没有匹配的资产。</div>
-      </section>
-
-      <section class="section" data-section="mcp">
-        <h2 id="mcp-health">MCP 服务</h2>
-        <p>这里分开看三件事：总账里登记了什么、宿主配置实际在用什么、两边是否对得上。</p>
-        {render_mcp_filters(mcp_rows, mcp_audit)}
-        <table>
-          <thead><tr><th>名称</th><th>入口 / URL</th><th>健康状态</th><th>宿主</th><th>备注</th></tr></thead>
-          <tbody>{render_mcp_rows(mcp_rows)}</tbody>
-        </table>
-        <h3 id="mcp-host-only">宿主里已配置，但总账里还没有</h3>
-        {'<div class="quick-actions"><button class="table-action primary js-register-all-mcp">一键纳入新增 MCP</button></div>' if mcp_audit["summary"]["host_only"] else ''}
-        {audit_table(mcp_audit["host_only"], "当前没有发现新的 host-only MCP。", include_action=True)}
-        <h3 id="mcp-registry-only">总账里有，但宿主配置里已经找不到</h3>
-        {audit_table(mcp_audit["registry_only"], "当前没有 registry-only MCP 引用。")}
-        <div class="empty">没有匹配的 MCP。</div>
-      </section>
-
-      <section class="section" data-section="entrypoints">
-        <h2 id="entrypoints">稳定入口</h2>
-        <p>这里是 Agent 真正应该调用的命令入口，重点看路径是否存在、类型是否正确、归属到哪个资产。</p>
-        {render_entrypoint_filters(entrypoints)}
-        <table>
-          <thead><tr><th>路径</th><th>类型</th><th>状态</th><th>归属资产</th></tr></thead>
-          <tbody>{render_entrypoint_rows(entrypoints)}</tbody>
-        </table>
-        <div class="empty">没有匹配的入口。</div>
-      </section>
-
-      <section class="section" data-section="discovered">
-        <h2>待处理</h2>
-        <p>这里集中放需要你做决定的事项。项目、系统、MCP、入口这些来源都只是证据，真正要做的是登记、确认、忽略或稍后。</p>
-        <div class="issue-list">
-          {"".join(
-              f'<div class="issue-row searchable" data-section="discovered" data-text="{h(text)}">'
-              f'<div class="issue-main">{state_badge(state)}<p>{h(text)}</p></div>'
-              f'<div class="issue-actions"><a class="jump-link js-jump" href="{h(target)}">{h(label)}</a></div></div>'
-              for state, text, target, label in overview_issues
-          ) if overview_issues else '<div class="issue-row"><div class="issue-main">' + state_badge('registered', '已清空') + '<p>当前没有跨来源待办。</p></div></div>'}
-        </div>
-        <h2>候选工具</h2>
-        <p>候选工具只是一类待办。每个候选项都应该有决定：登记、稍后、忽略。</p>
-        <p>当前模式：{h(scan_mode_label)}。当前：{needs_review_count} 个待处理 / {deferred_count} 个稍后处理 / {ignored_count} 个已忽略 / 共 {unregistered_count} 个未登记。</p>
-        {render_discovered_filters(discovered_rows)}
-        <details>
-          <summary>本次扫描目录（{len(scan_dirs)} 个）</summary>
-          <div>{render_chips(scan_dirs)}</div>
-        </details>
-        <h3 id="discovered-pending">待我处理</h3>
-        {discovered_table(pending_rows, "当前没有待确认候选项。")}
-        <h3>已登记或稍后</h3>
-        {discovered_table(registered_rows + deferred_rows, "当前没有已登记或稍后处理候选项。")}
-        <h3>已忽略</h3>
-        {discovered_table(ignored_rows, "当前没有已忽略候选项。")}
-      </section>
-
-      <section class="section" data-section="config">
-        <h2>设置 / 规则</h2>
-        <p>这里列出本机 Agent 资产规范、MCP 总账、宿主配置和启动文件，方便排查“规则到底写在哪里”。</p>
-        {render_config_filters(agent_registry)}
-        <table>
-          <thead><tr><th>名称</th><th>路径</th><th>状态</th></tr></thead>
-          <tbody>{render_config_rows(agent_registry)}</tbody>
-        </table>
-        <div class="empty">没有匹配的配置。</div>
+        {render_runtime_filter_bar()}
+        {render_alert_cards(runtime_data)}
+        {runtime_section}
+        {render_cli_entrypoints(entrypoints)}
       </section>
 
       <section class="section" data-section="signals">
-        <p>本机 launchd 服务、监听端口、后台进程、登录项——交叉验证哪些资产真在跑、哪些系统服务还没登记进总账。<strong>🟢 用户级服务可在此直接开关</strong>（开机自启 / 现在跑停），⚪系统级需 sudo 不动，🔑登录项去系统设置管。</p>
-        <p class="metric-line">登录项：{h(', '.join(signals_meta.get('login_items') or []) or '无')}　·　系统扩展：摄像头等（见系统设置 &gt; 登录项与扩展）</p>
-        {render_macos_signals_rows(signals_rows or [])}
-        <div class="empty">没有匹配的系统信号。</div>
+        <div class="topbar">
+          <div>
+            <h1>系统信号</h1>
+            <div class="sub">launchd / 开机自启 / 登录项 / 后台服务</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span id="signals-status" class="refresh-status"></span>
+            <button class="btn primary" id="refresh-signals">刷新</button>
+          </div>
+        </div>
+        {signals_section}
+      </section>
+
+      <section class="section" data-section="settings">
+        <div class="topbar">
+          <div>
+            <h1>设置</h1>
+            <div class="sub">配置路径与工具信息</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">配置路径</div>
+          <table class="data-table">
+            <tbody>
+              <tr><td>registry</td><td>{chip(str(REGISTRY))}</td></tr>
+              <tr><td>MCP registry</td><td>{chip(str(MCP_REGISTRY))}</td></tr>
+              <tr><td>stable bin</td><td>{chip(str(STABLE_BIN_DIR))}</td></tr>
+              <tr><td>projects</td><td>{chip(str(PROJECTS_DIR))}</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-title">关于</div>
+          <p class="muted">Agent Assets Control Plane · 本机运行态观测台</p>
+          <p class="muted">生成时间：{h(generated)}</p>
+        </div>
       </section>
     </main>
   </div>
   <script>
-    const buttons = Array.from(document.querySelectorAll("[data-tab]"));
-    const sections = Array.from(document.querySelectorAll(".section"));
-    const search = document.getElementById("search");
-    const pageTitle = document.getElementById("pageTitle");
-    const pageSubtitle = document.getElementById("pageSubtitle");
-    const scanAction = document.getElementById("scanAction");
-    const scanButtons = Array.from(document.querySelectorAll(".scan-button"));
-    const scanStatus = document.getElementById("scanStatus");
-    const projectButtons = Array.from(document.querySelectorAll(".project-scan-button"));
-    const projectStatus = document.getElementById("projectStatus");
-    const fullUpdateButtons = Array.from(document.querySelectorAll(".full-update-button"));
-    const crosscheckButtons = Array.from(document.querySelectorAll(".crosscheck-button"));
-    const filterButtons = Array.from(document.querySelectorAll(".filter-chip"));
-    const tabCopy = {{
-      overview: {{
-        title: "总览",
-        subtitle: "先看问题和下一步动作，不在总览里堆列表。"
-      }},
-      assets: {{
-        title: "资产",
-        subtitle: "正式登记过的本机 Agent 资产；这里回答“这个工具归谁、入口在哪、配置在哪”。"
-      }},
-      evidence: {{
-        title: "发现",
-        subtitle: "所有扫描来源都收在这里。先当证据看，只有处理后才进入正式资产。"
-      }},
-      mcp: {{
-        title: "发现 / MCP",
-        subtitle: "MCP 是证据来源之一：同时看总账、宿主配置和连接状态，先对账，再排查。"
-      }},
-      entrypoints: {{
-        title: "发现 / 入口",
-        subtitle: "入口是证据来源之一：Agent 应该调用的稳定命令和 wrapper；这里专门排查 PATH、坏链、归属不清。"
-      }},
-      discovered: {{
-        title: "待处理",
-        subtitle: "把候选工具真正处理掉，而不是只看见它们。"
-      }},
-      projects: {{
-        title: "发现 / 项目",
-        subtitle: "项目是证据来源之一：历史下载、GitHub clone、源码包和宿主管理工作区；先索引，再决定是否收编。"
-      }},
-      config: {{
-        title: "设置",
-        subtitle: "本机规则、总账、宿主配置和启动文件的位置；新 Agent 接入时先从这里找源头。"
-      }},
-      signals: {{
-        title: "系统信号",
-        subtitle: "macOS launchd 服务、监听端口、后台进程；交叉验证哪些资产真在跑、哪些还没登记。"
-      }}
-    }};
-    const scanTabs = new Set(["overview", "discovered"]);
-    const searchTabs = new Set(["assets", "projects", "mcp", "entrypoints", "config", "signals"]);
-    const tabParents = {{
-      projects: "evidence",
-      mcp: "evidence",
-      entrypoints: "evidence"
-    }};
-    const hashTabs = {{
-      overview: "overview",
-      signals: "signals",
-      projects: "projects",
-      "projects-legacy": "projects",
-      mcp: "mcp",
-      "mcp-health": "mcp",
-      "mcp-host-only": "mcp",
-      "mcp-registry-only": "mcp",
-      discovered: "discovered",
-      "discovered-pending": "discovered",
-      assets: "assets",
-      "asset-group-agent": "assets",
-      "asset-group-mcp": "assets",
-      "asset-group-cli-tool": "assets",
-      "asset-group-skill": "assets",
-      "asset-group-project": "assets",
-      "asset-group-config": "assets",
-      "asset-group-support": "assets",
-      "asset-group-unsorted": "assets",
-      evidence: "evidence",
-      entrypoints: "entrypoints",
-      config: "config"
-    }};
+    (function() {{
+      const tabs = document.querySelectorAll('.nav button[data-tab]');
+      const sections = document.querySelectorAll('.section');
+      tabs.forEach(btn => {{
+        btn.addEventListener('click', () => {{
+          tabs.forEach(b => b.classList.remove('active'));
+          sections.forEach(s => s.classList.remove('active'));
+          btn.classList.add('active');
+          document.querySelector('section[data-section="' + btn.dataset.tab + '"]').classList.add('active');
+        }});
+      }});
 
-    function activate(tab) {{
-      const navTab = tabParents[tab] || tab;
-      buttons.forEach((button) => button.classList.toggle("active", button.dataset.tab === navTab));
-      sections.forEach((section) => section.classList.toggle("active", section.dataset.section === tab));
-      const copy = tabCopy[tab] || tabCopy.overview;
-      if (pageTitle) pageTitle.textContent = copy.title;
-      if (pageSubtitle) pageSubtitle.textContent = copy.subtitle;
-      if (scanAction) scanAction.hidden = !scanTabs.has(tab);
-      if (search) {{
-        search.hidden = !searchTabs.has(tab);
-        if (search.hidden) search.value = "";
-      }}
-      filter();
-    }}
+      // Runtime filter buttons
+      document.querySelectorAll('.runtime-filter-bar .filter').forEach(btn => {{
+        btn.addEventListener('click', () => {{
+          document.querySelectorAll('.runtime-filter-bar .filter').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          const filter = btn.dataset.filter;
+          document.querySelectorAll('[data-section="runtime"] .searchable').forEach(row => {{
+            const tags = (row.dataset.filterTags || '').split(/\\s+/);
+            let visible = false;
+            if (!filter) {{ visible = true; }}
+            else if (filter === 'agent-mcp') {{ visible = tags.includes('mcp') || tags.includes('agent-daemon'); }}
+            else if (filter === 'dev-server') {{ visible = tags.includes('dev-server') || tags.includes('zombie'); }}
+            else if (filter === 'other') {{ visible = tags.includes('support') || tags.includes('unknown') || tags.includes('system'); }}
+            row.style.display = visible ? '' : 'none';
+          }});
+        }});
+      }});
 
-    function activateFromHash() {{
-      const raw = location.hash ? location.hash.slice(1) : "overview";
-      const tab = hashTabs[raw] || raw || "overview";
-      if (!sections.some((section) => section.dataset.section === tab)) {{
-        activate("overview");
-        return;
-      }}
-      activate(tab);
-      if (raw && raw !== tab) {{
-        requestAnimationFrame(() => {{
-          const target = document.getElementById(raw);
-          if (target) target.scrollIntoView({{ block: "start", behavior: "smooth" }});
+      // Refresh runtime
+      const refreshBtn = document.getElementById('refresh-runtime');
+      const refreshStatus = document.getElementById('refresh-status');
+      const updatedSpan = document.getElementById('runtime-updated');
+      if (refreshBtn) {{
+        refreshBtn.addEventListener('click', async () => {{
+          refreshBtn.disabled = true;
+          refreshStatus.textContent = '刷新中...';
+          try {{
+            const res = await fetch('/api/scan', {{method: 'POST'}});
+            const data = await res.json();
+            if (data.ok) {{
+              window.location.reload();
+            }} else {{
+              refreshStatus.textContent = data.error || '刷新失败';
+            }}
+          }} catch (e) {{
+            refreshStatus.textContent = '网络错误';
+          }} finally {{
+            refreshBtn.disabled = false;
+          }}
         }});
       }}
-    }}
 
-    function filter() {{
-      const active = document.querySelector(".section.active");
-      if (!active) return;
-      const query = (search.value || "").trim().toLowerCase();
-      const activeFilter = active.dataset.activeFilter || "";
-      const items = Array.from(active.querySelectorAll(".searchable"));
-      let visible = 0;
-      items.forEach((item) => {{
-        const text = (item.dataset.text || item.textContent || "").toLowerCase();
-        const tags = (item.dataset.filterTags || "").toLowerCase();
-        const queryMatch = !query || text.includes(query);
-        const filterMatch = !activeFilter || tags.split(/\s+/).includes(activeFilter.toLowerCase());
-        const show = queryMatch && filterMatch;
-        item.style.display = show ? "" : "none";
-        if (show) visible += 1;
-      }});
-      const empty = active.querySelector(".empty");
-      if (empty) empty.style.display = items.length && !visible ? "block" : "none";
-    }}
-
-    buttons.forEach((button) => button.addEventListener("click", () => activate(button.dataset.tab)));
-    search.addEventListener("input", filter);
-    filterButtons.forEach((button) => {{
-      button.addEventListener("click", () => {{
-        const section = document.querySelector(`.section[data-section="${{button.dataset.filterSection}}"]`);
-        if (!section) return;
-        section.dataset.activeFilter = button.dataset.filter || "";
-        section.querySelectorAll(".filter-chip").forEach((item) => item.classList.toggle("active", item === button));
-        filter();
-      }});
-    }});
-    scanButtons.forEach((scanButton) => {{
-      if (scanButton.dataset.live !== "true") return;
-      scanButton.addEventListener("click", async () => {{
-        const mode = scanButton.dataset.mode || "daily";
-        scanButtons.forEach((button) => button.disabled = true);
-        scanStatus.textContent = mode === "deep" ? "正在运行深度盘点，刷新 MCP 状态..." : "正在刷新日常扫描，刷新 MCP 状态...";
-        try {{
-          const response = await fetch(`/api/scan?mode=${{encodeURIComponent(mode)}}`, {{ method: "POST" }});
-          if (!response.ok) throw new Error(await response.text());
-          const result = await response.json();
-          scanStatus.textContent = `体检完成（${{result.scan_mode}}）：${{result.candidates}} 个候选，${{result.unregistered}} 个未登记。正在刷新页面...`;
-          setTimeout(() => window.location.reload(), 450);
-        }} catch (error) {{
-          scanStatus.textContent = `扫描失败：${{error.message || error}}`;
-          scanButtons.forEach((button) => button.disabled = false);
-        }}
-      }});
-    }});
-    projectButtons.forEach((projectButton) => {{
-      if (projectButton.dataset.live !== "true") return;
-      projectButton.addEventListener("click", async () => {{
-        projectButtons.forEach((button) => button.disabled = true);
-        if (projectStatus) projectStatus.textContent = "正在刷新项目索引，不移动、不删除文件...";
-        try {{
-          const response = await fetch("/api/projects/scan", {{ method: "POST" }});
-          if (!response.ok) throw new Error(await response.text());
-          const result = await response.json();
-          if (projectStatus) projectStatus.textContent = `项目索引完成：${{result.projects}} 个项目，${{result.legacy + result.download_candidate}} 个旧位置/下载候选。正在刷新页面...`;
-          setTimeout(() => window.location.reload(), 450);
-        }} catch (error) {{
-          if (projectStatus) projectStatus.textContent = `项目索引失败：${{error.message || error}}`;
-          projectButtons.forEach((button) => button.disabled = false);
-        }}
-      }});
-    }});
-    fullUpdateButtons.forEach((fullUpdateButton) => {{
-      if (fullUpdateButton.dataset.live !== "true") return;
-      fullUpdateButton.addEventListener("click", async () => {{
-        fullUpdateButtons.forEach((button) => button.disabled = true);
-        if (scanStatus) scanStatus.textContent = "正在更新候选工具、项目索引和 MCP 状态...";
-        try {{
-          const response = await fetch("/api/reconcile?mode=daily", {{ method: "POST" }});
-          if (!response.ok) throw new Error(await response.text());
-          const result = await response.json();
-          if (scanStatus) scanStatus.textContent = `更新完成：${{result.candidates}} 个候选，${{result.projects}} 个项目。正在刷新页面...`;
-          setTimeout(() => window.location.reload(), 450);
-        }} catch (error) {{
-          if (scanStatus) scanStatus.textContent = `一键更新失败：${{error.message || error}}`;
-          fullUpdateButtons.forEach((button) => button.disabled = false);
-        }}
-      }});
-    }});
-    crosscheckButtons.forEach((crosscheckButton) => {{
-      if (crosscheckButton.dataset.live !== "true") return;
-      crosscheckButton.addEventListener("click", async () => {{
-        crosscheckButtons.forEach((button) => button.disabled = true);
-        if (scanStatus) scanStatus.textContent = "正在用现有快照交叉校验资产、MCP 和项目...";
-        try {{
-          const response = await fetch("/api/crosscheck", {{ method: "POST" }});
-          if (!response.ok) throw new Error(await response.text());
-          const result = await response.json();
-          if (scanStatus) scanStatus.textContent = `交叉校验完成：MCP 差异 ${{result.mcp_delta}}。正在刷新页面...`;
-          setTimeout(() => window.location.reload(), 450);
-        }} catch (error) {{
-          if (scanStatus) scanStatus.textContent = `交叉校验失败：${{error.message || error}}`;
-          crosscheckButtons.forEach((button) => button.disabled = false);
-        }}
-      }});
-    }});
-    async function postJson(url, payload, button) {{
-      if (button) {{
-        button.disabled = true;
-        button.dataset.originalText = button.textContent;
-        button.textContent = "处理中";
+      // Refresh signals
+      const sigRefresh = document.getElementById('refresh-signals');
+      const sigStatus = document.getElementById('signals-status');
+      if (sigRefresh) {{
+        sigRefresh.addEventListener('click', () => {{
+          sigStatus.textContent = '刷新中...';
+          window.location.reload();
+        }});
       }}
-      const response = await fetch(url, {{
-        method: "POST",
-        headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify(payload || {{}})
+
+      // Kill process
+      document.querySelectorAll('.js-kill-process').forEach(btn => {{
+        btn.addEventListener('click', async () => {{
+          const pid = btn.dataset.pid;
+          const mode = btn.dataset.mode;
+          if (!pid) return;
+          if (!confirm('确认终止 PID ' + pid + '？')) return;
+          btn.disabled = true;
+          try {{
+            const res = await fetch('/api/kill-process', {{
+              method: 'POST',
+              headers: {{'Content-Type': 'application/json'}},
+              body: JSON.stringify({{pid: pid, mode: mode}})
+            }});
+            const data = await res.json();
+            alert(data.result || data.error || '未知结果');
+            window.location.reload();
+          }} catch (e) {{
+            alert('请求失败');
+          }}
+        }});
       }});
-      if (!response.ok) throw new Error(await response.text());
-      return await response.json();
-    }}
-    function resetActionButton(button) {{
-      if (!button) return;
-      button.disabled = false;
-      if (button.dataset.originalText) button.textContent = button.dataset.originalText;
-    }}
-    document.querySelectorAll(".js-review").forEach((button) => {{
-      button.addEventListener("click", async () => {{
-        try {{
-          await postJson("/api/review", {{ path: button.dataset.path, status: button.dataset.status }}, button);
-          window.location.reload();
-        }} catch (error) {{
-          scanStatus.textContent = `更新处理状态失败：${{error.message || error}}`;
-          resetActionButton(button);
-        }}
+
+      // Launchctl control
+      document.querySelectorAll('.js-launchctl').forEach(btn => {{
+        btn.addEventListener('click', async () => {{
+          const label = btn.dataset.label;
+          const domain = btn.dataset.domain;
+          const action = btn.dataset.action;
+          if (!label || !action) return;
+          btn.disabled = true;
+          try {{
+            const res = await fetch('/api/launchctl', {{
+              method: 'POST',
+              headers: {{'Content-Type': 'application/json'}},
+              body: JSON.stringify({{label: label, domain: domain, action: action}})
+            }});
+            const data = await res.json();
+            alert(data.result || data.error || '未知结果');
+            window.location.reload();
+          }} catch (e) {{
+            alert('请求失败');
+          }}
+        }});
       }});
-    }});
-    document.querySelectorAll(".js-register-candidate").forEach((button) => {{
-      button.addEventListener("click", async () => {{
-        try {{
-          await postJson("/api/register-candidate", {{ path: button.dataset.path }}, button);
-          window.location.reload();
-        }} catch (error) {{
-          scanStatus.textContent = `登记候选项失败：${{error.message || error}}`;
-          resetActionButton(button);
-        }}
-      }});
-    }});
-    document.querySelectorAll(".js-register-mcp").forEach((button) => {{
-      button.addEventListener("click", async () => {{
-        try {{
-          await postJson("/api/register-mcp", {{ location: button.dataset.location }}, button);
-          window.location.reload();
-        }} catch (error) {{
-          scanStatus.textContent = `纳入 MCP 总账失败：${{error.message || error}}`;
-          resetActionButton(button);
-        }}
-      }});
-    }});
-    document.querySelectorAll(".js-register-all-mcp").forEach((button) => {{
-      button.addEventListener("click", async () => {{
-        try {{
-          await postJson("/api/register-mcp-bulk", {{}}, button);
-          window.location.reload();
-        }} catch (error) {{
-          scanStatus.textContent = `批量纳入 MCP 失败：${{error.message || error}}`;
-          resetActionButton(button);
-        }}
-      }});
-    }});
-    document.querySelectorAll(".js-launchctl").forEach((button) => {{
-      button.addEventListener("click", async () => {{
-        const verb = {{ enable: "启用开机自启", disable: "禁用开机自启", bootstrap: "现在启动", bootout: "现在停止" }}[button.dataset.action] || button.dataset.action;
-        if (!window.confirm(`确认「${{verb}}」: ${{button.dataset.label}}？`)) return;
-        try {{
-          const res = await postJson("/api/launchctl", {{
-            plist: button.dataset.plist,
-            label: button.dataset.label,
-            action: button.dataset.action
-          }}, button);
-          scanStatus.textContent = `${{res.action_zh || "完成"}}：${{res.label}}${{res.running ? "（运行中）" : ""}}`;
-          window.location.reload();
-        }} catch (error) {{
-          scanStatus.textContent = `launchctl 操作失败：${{error.message || error}}`;
-          resetActionButton(button);
-        }}
-      }});
-    }});
-    window.addEventListener("hashchange", activateFromHash);
-    activateFromHash();
+    }})();
   </script>
 </body>
 </html>
 """
-
 
 def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, live=False, discovery_mode="daily"):
     agent_registry = load_json(REGISTRY)
@@ -2476,6 +2284,7 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, liv
             _row["_control"] = "login-item"
         _row["_human"] = humanize_signal(_row)
         _row["_safe"] = is_safe_to_control(_row)
+    runtime_data = collect_runtime()
     if refresh_mcp:
         health, health_raw = parse_claude_mcp_health()
     else:
@@ -2501,6 +2310,7 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, liv
         signals_rows,
         signals_meta,
         live=live,
+        runtime_data=runtime_data,
     )
     project_summary = project_meta.get("summary", {})
     assets = agent_registry.get("assets", {})
@@ -2623,6 +2433,82 @@ def handle_launchctl(payload):
     running, auto_disabled = _launchctl_status(real_label)
     action_zh = {"enable": "已启用开机自启", "disable": "已禁用开机自启", "bootstrap": "已启动", "bootout": "已停止"}.get(action, action)
     return {"ok": True, "action": action, "action_zh": action_zh, "label": real_label, "running": running, "auto_disabled": auto_disabled}, 200
+
+
+def _is_kill_safe_pid(pid_str, cmd):
+    """判断 pid 是否允许从 dashboard 终止。从严：必须命中白名单 + 非系统路径 + 命中用户进程特征。返回 (safe: bool, reason: str)。"""
+    info = RUNTIME_WHITELIST.get(str(pid_str))
+    if not info:
+        return False, "pid 不在最近一次 runtime 报告白名单内（可能是系统进程、已退出，或前端伪造）"
+    cmd = (cmd or info.get("cmd") or "").strip()
+    if (info.get("cmd") or "").strip() and cmd and cmd != info.get("cmd"):
+        return False, "cmd 与 runtime 报告不一致"
+    cmd_resolved = cmd or info.get("cmd") or ""
+    # 禁系统路径 / Apple 系统服务
+    sys_prefixes = ("/usr/sbin/", "/usr/libexec/", "/sbin/", "/System/", "/usr/lib/")
+    if any(cmd_resolved.startswith(p) or (" " + cmd_resolved).find(" " + p) != -1 for p in sys_prefixes):
+        return False, "目标位于系统目录，拒绝终止"
+    if "com.apple." in cmd_resolved:
+        return False, "目标是 Apple 系统服务，拒绝终止"
+    # 禁止动 PID 1 / kernel_task / 自身 dashboard
+    try:
+        pid_int = int(pid_str)
+    except (TypeError, ValueError):
+        return False, "pid 非法"
+    if pid_int <= 1:
+        return False, "拒绝终止系统核心进程"
+    # 只允许「解释器跑用户进程」或「路径在 $HOME 下」或「runtime 已归类为用户态 agent/mcp/dev」
+    home_str = str(HOME)
+    allowed_categories = {"mcp", "dev-server", "agent-daemon", "support"}
+    in_home = home_str in cmd_resolved
+    cat_ok = (info.get("category") or "") in allowed_categories
+    # 解释器特征：node / bun / python / python3 / deno 跑的脚本，且命令里出现 mcp/dev/gateway/agent/watcher/serve
+    interp_markers = ("node", "bun", "deno", "python", "python3")
+    interp_kw = ("mcp", "dev", "gateway", "agent", "watcher", "serve", "hub", "daemon", "hermes", "context7")
+    tokens = cmd_resolved.lower().split()
+    interp_ok = any(t in tokens for t in interp_markers) and any(kw in cmd_resolved.lower() for kw in interp_kw)
+    if not (in_home or cat_ok or interp_ok):
+        return False, "目标不属于用户态 mcp/dev/agent 进程，拒绝终止"
+    return True, "ok"
+
+
+def handle_kill_process(payload):
+    """终止单个 runtime 进程。安全模型：白名单 + 禁系统路径 + Host 127.0.0.1（由 server 绑定保证）。返回 (result, http_status)。"""
+    pid = str(payload.get("pid") or "")
+    mode = str(payload.get("mode") or "term")
+    if mode not in {"term", "kill"}:
+        return {"ok": False, "error": "非法 mode（仅允许 term/kill）"}, 400
+    if not pid:
+        return {"ok": False, "error": "缺少 pid"}, 400
+    info = RUNTIME_WHITELIST.get(pid)
+    cmd = (info or {}).get("cmd", "")
+    safe, reason = _is_kill_safe_pid(pid, cmd)
+    if not safe:
+        sys.stderr.write(f"asset-dashboard: kill DENY pid={pid} reason={reason}\n")
+        return {"ok": False, "error": reason, "pid": pid}, 403
+    # 二次校验：进程还活着吗？取实时 comm 再核对一次路径
+    try:
+        check = subprocess.run(["ps", "-o", "comm=", "-p", pid], capture_output=True, text=True, timeout=4)
+    except Exception as exc:
+        return {"ok": False, "error": f"进程状态检查失败：{exc}"}, 500
+    live_comm = (check.stdout or "").strip()
+    if not live_comm:
+        return {"ok": False, "error": "进程已不在（pid 可能已退出）", "pid": pid}, 404
+    # 实时 comm 也走一次系统路径检查（防 pid 被复用为系统进程）
+    if any(live_comm.startswith(p.rstrip("/")) for p in ("/usr/sbin/", "/usr/libexec/", "/sbin/", "/System/")):
+        sys.stderr.write(f"asset-dashboard: kill DENY pid={pid} live_comm={live_comm} (system path)\n")
+        return {"ok": False, "error": "实时核对发现目标是系统进程，拒绝终止"}, 403
+    signum = "TERM" if mode == "term" else "KILL"
+    try:
+        proc = subprocess.run(["kill", "-" + signum, pid], capture_output=True, text=True, timeout=6)
+    except Exception as exc:
+        return {"ok": False, "error": f"发送信号失败：{exc}"}, 500
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return {"ok": False, "error": err or f"kill 退出码 {proc.returncode}", "pid": pid}, 500
+    sys.stderr.write(f"asset-dashboard: kill OK pid={pid} mode={mode} cmd={cmd[:120]}\n")
+    verb = "已发送 SIGTERM" if mode == "term" else "已发送 SIGKILL"
+    return {"ok": True, "pid": pid, "mode": mode, "verb": verb, "cmd": cmd}, 200
 
 
 def write_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, live=False):
@@ -2854,6 +2740,10 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                     write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, live=False)
                 except Exception:
                     pass
+            self.send_json(result, status=http_status)
+            return
+        if parsed.path == "/api/kill-process":
+            result, http_status = handle_kill_process(payload)
             self.send_json(result, status=http_status)
             return
         self.send_json({"ok": False, "error": "not found"}, status=404)

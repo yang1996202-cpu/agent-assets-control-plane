@@ -1,4 +1,6 @@
-# 分类迁移 dry-run（不写 registry，先给你过）
+# 分类迁移 dry-run（历史决策记录）
+
+> **状态（2026-06）**：分类模型已落地为 dashboard 8 分类（见 `concept-model.md` 第八节）。本 dry-run 未执行写入；逐条迁移已被通用的 8 分类分组取代。下方为本机 58 条私有资产快照，发布前按 `open-source-boundary.md` 评估。
 
 > 每条：旧 category → 新 category ＋ 会丢弃的旧标签。**确认后才写 registry。**
 

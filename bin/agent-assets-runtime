@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""asset-runtime — runtime process semantic layer.
+
+Read-only: classifies running node/bun/python processes, detects leaked
+multi-instance services and forgotten dev servers, lists port listeners.
+Never kills or mutates anything. v1: terminal report + --json.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+
+# --- classification rules -------------------------------------------------
+
+# IDE / system UI / GUI app noise — not runtime blind spots, drop entirely.
+NOISE_RES = [
+    re.compile(r"/Claude\.app/", re.I),
+    re.compile(r"Code Helper", re.I),
+    re.compile(r"/Cursor\.app/", re.I),
+    re.compile(r"Electron Helper", re.I),
+    re.compile(r"/Google Chrome\.app/", re.I),
+    re.compile(r"/Microsoft Edge\.app/", re.I),
+    re.compile(r"/Safari\.app/", re.I),
+    re.compile(r"/Slack\.app/", re.I),
+    re.compile(r"/Finder\.app/", re.I),
+    re.compile(r"/Xcode\.app/", re.I),
+    re.compile(r"/JetBrains/", re.I),
+    re.compile(r"plugin-container", re.I),
+    re.compile(r"/Applications/[^/]+\.app/", re.I),  # GUI apps generally
+    re.compile(r"/System/Library/", re.I),
+    # interactive shells / editors — not runtime blind spots
+    re.compile(r"^login(?:\s|$)", re.I),
+    re.compile(r"^-?(?:bash|zsh|fish)(?:\s|$)", re.I),
+    re.compile(r"\bclaude(?:\.exe)?\s+--permission-mode", re.I),
+    re.compile(r"\bclaude\s+(?:code|cli)\b", re.I),
+    re.compile(r"^/bin/(?:bash|zsh|sh|dash)\b", re.I),
+    re.compile(r"^ps\b", re.I),
+]
+
+# system daemons / Apple machinery — recognized but not a blind spot.
+# Multi-instance system services (distnoted, diskimagesiod, caffeinate, ...)
+# are NORMAL on macOS and must never count as leaks.
+SYSTEM_RES = [
+    re.compile(r"^/usr/libexec/", re.I),
+    re.compile(r"^/usr/sbin/", re.I),
+    re.compile(r"^/sbin/", re.I),
+    re.compile(r"^/System/", re.I),
+    re.compile(r"com\.apple\.", re.I),
+    re.compile(r"containermanagerd", re.I),
+    re.compile(r"rapportd", re.I),
+    re.compile(r"\bdistnoted\b", re.I),
+    re.compile(r"\bdiskimagesiod\b", re.I),
+    re.compile(r"\bcaffeinate\b", re.I),
+    re.compile(r"ControlCenter", re.I),
+    re.compile(r"coreservicesd", re.I),
+    re.compile(r"bluetoothd", re.I),
+    re.compile(r"mDNSResponder", re.I),
+    re.compile(r"kernel_task", re.I),
+    re.compile(r"launchd", re.I),
+    re.compile(r"WindowServer", re.I),
+    re.compile(r"docker-daemon", re.I),
+    re.compile(r"hostdbus-1", re.I),
+]
+
+# Known user services: classification by IDENTITY, not by generic command shape.
+# These win over the generic dev-server `serve`/port rules — a known MCP serving
+# over HTTP is NOT a zombie dev server.
+KNOWN_SERVICE_RES = [
+    # gbrain is the user's memory MCP — classify as mcp even though it runs
+    # `bun ... gbrain serve --http` (contains 'serve', listens on a port).
+    (re.compile(r"\bgbrain\b", re.I), "mcp"),
+    # asset-* control-plane tools are the observer itself + dashboard — they
+    # serve dashboards but must never be flagged as zombie dev servers.
+    (re.compile(r"\basset-(?:dashboard|runtime|register|list)\b", re.I), "support"),
+    (re.compile(r"\bagent-assets-dashboard\b", re.I), "support"),
+]
+
+# known MCP wrapper / command signatures.
+MCP_RES = [
+    re.compile(r"\bmcp\b", re.I),
+    re.compile(r"context7-mcp", re.I),
+    re.compile(r"\bgbrain\b", re.I),
+    re.compile(r"notebooklm", re.I),
+    re.compile(r"cc-connect", re.I),
+    re.compile(r"wechat-mcp", re.I),
+    re.compile(r"ask-gemini-mcp", re.I),
+    re.compile(r"docker-mcp", re.I),
+    re.compile(r"\bnpx\b.*mcp", re.I),
+    re.compile(r"\buvx\b.*mcp", re.I),
+]
+
+AGENT_DAEMON_RES = [
+    re.compile(r"\bopenclaw\b", re.I),
+    re.compile(r"claude-skill-hub|skill-hub", re.I),
+    re.compile(r"\bopencli\b", re.I),
+    re.compile(r"\bhermes-agent\b", re.I),
+    re.compile(r"cc-connect.*gateway|gateway.*cc-connect", re.I),
+    re.compile(r"skill-gallery", re.I),
+    re.compile(r"\bacpx\b", re.I),
+]
+
+DEV_SERVER_RES = [
+    # Explicit dev-server frameworks only.  Generic words like "serve" / "preview"
+    # match too many innocent long-running services (e.g. "python serve.py"),
+    # so we require the framework name or a strong signal.
+    re.compile(r"\bvite\b", re.I),
+    re.compile(r"\bnext\b.*\b(dev|preview|start)\b", re.I),
+    re.compile(r"\bwebpack\b.*\bserve\b|\bwebpack-dev-server\b", re.I),
+    re.compile(r"esbuild\s+--service", re.I),
+    re.compile(r"\bnuxt\b.*\bdev\b", re.I),
+    re.compile(r"\bsvelte-kit\b.*\bdev\b", re.I),
+    re.compile(r"\bsveltekit\b.*\bdev\b", re.I),
+    re.compile(r"\bastro\b.*\bdev\b", re.I),
+    re.compile(r"\bpython[\d.]*\s+-m\s+http\.server\b", re.I),
+    re.compile(r"\bpython[\d.]*\s+-m\s+flask\s+run\b", re.I),
+    re.compile(r"\bpython[\d.]*\s+-m\s+uvicorn\b", re.I),
+    re.compile(r"\bnode.*\bsupervisor\b", re.I),
+    re.compile(r"\btsx\s+watch\b", re.I),
+    re.compile(r"\bnodemon\b", re.I),
+]
+
+
+def classify(cmd):
+    if any(r.search(cmd) for r in SYSTEM_RES):
+        return "system"
+    # Known services by identity — must run BEFORE dev-server so that
+    # gbrain (serve --http) / asset-dashboard (--serve) don't get swept up
+    # by the generic `serve` rule and flagged as zombie dev servers.
+    for rx, cat in KNOWN_SERVICE_RES:
+        if rx.search(cmd):
+            return cat
+    # dev-server must be checked BEFORE agent-daemon: project names like
+    # skill-gallery contain 'gallery' but their vite preview is a dev server.
+    if any(r.search(cmd) for r in DEV_SERVER_RES):
+        return "dev-server"
+    if any(r.search(cmd) for r in MCP_RES):
+        return "mcp"
+    if any(r.search(cmd) for r in AGENT_DAEMON_RES):
+        return "agent-daemon"
+    return "unknown"
+
+
+# --- fingerprint for leak detection --------------------------------------
+# Strip absolute paths, pids, ports, uv/npm cache hashes; collapse launch
+# wrappers (npm exec / npx / uvx / node .../bin/X / python -m X) so that
+# multiple instances of the SAME service share one fingerprint.
+
+PATH_RE = re.compile(r"/(?:[^/\s]+/)+")
+PORT_RE = re.compile(r"(?:(?<=--port\s)|(?<=:)|(?<=\s))\d{4,5}")
+HEXHASH_RE = re.compile(r"\b[0-9a-f]{8,}\b", re.I)
+PIDNUM_RE = re.compile(r"\bpid=\d+", re.I)
+NPX_CACHE_RE = re.compile(r"/\.npm/_npx/[0-9a-f]+/", re.I)
+UV_ARCHIVE_RE = re.compile(r"/\.cache/uv/archive-v0/[0-9A-Za-z_-]+/", re.I)
+PIP_PNPM_RE = re.compile(r"/\.pnpm/[^/\s]+/node_modules/", re.I)
+
+# collapse "npm exec @org/pkg" / "npx pkg" -> the package token
+LAUNCH_RE = re.compile(
+    r"^(?:npm\s+exec\s+|npx\s+|pnpm\s+exec\s+|pnpm\s+dlx\s+|yarn\s+dlx\s+)",
+    re.I,
+)
+UV_TOOL_RE = re.compile(
+    r"(?:uv|pipx)?\s*(?:tool\s+)?(?:uvx\s+|run\s+)?--from\s+\S+\s+", re.I,
+)
+NODE_BIN_RE = re.compile(r"node\s+", re.I)
+PYTHON_MOD_RE = re.compile(r"(?:python[\d.]*)\s+(?:-m\s+)", re.I)
+
+
+def fingerprint(cmd):
+    s = cmd
+    s = NPX_CACHE_RE.sub("/<npx-cache>/", s)
+    s = UV_ARCHIVE_RE.sub("/<uv-archive>/", s)
+    s = PIP_PNPM_RE.sub("/<pnpm>/", s)
+    s = PATH_RE.sub("", s)            # drop /a/b/c/ prefixes -> keep basename
+    s = PORT_RE.sub(" <port>", s)
+    s = HEXHASH_RE.sub("<hash>", s)
+    s = PIDNUM_RE.sub("pid=", s)
+    # collapse launch wrappers: keep the service identifier that follows.
+    s = LAUNCH_RE.sub("", s)
+    s = UV_TOOL_RE.sub("", s)
+    s = NODE_BIN_RE.sub("", s)
+    s = PYTHON_MOD_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # clamp random archive/hash tokens that survived.
+    s = re.sub(r"<hash>|<npx-cache>|<uv-archive>", "<cache>", s)
+    return s[:100]
+
+
+# --- collectors -----------------------------------------------------------
+
+
+def run(cmd):
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return ""
+    return out
+
+
+def collect_processes():
+    """Return list of dicts: pid, ppid, cmd, category, fp."""
+    out = run(["ps", "ax", "-o", "pid,ppid,command"])
+    procs = []
+    seen_pids = set()
+    for line in out.splitlines()[1:]:
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, cmd = parts[0], parts[1], parts[2]
+        try:
+            int(pid)
+        except ValueError:
+            continue
+        if pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+        if any(r.search(cmd) for r in NOISE_RES):
+            continue
+        cat = classify(cmd)
+        procs.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "cmd": cmd,
+                "category": cat,
+                "fp": fingerprint(cmd),
+            }
+        )
+    return procs
+
+
+def collect_listeners():
+    """Return dict pid -> set of 'name:port'. Uses lsof LISTEN only."""
+    out = run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"])
+    by_pid = defaultdict(set)
+    if not out:
+        return by_pid
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        name = parts[0]
+        pid = parts[1]
+        # NAME column is usually the second-to-last token (last is "(LISTEN)").
+        # Find the token shaped host:port (or *:port or [::1]:port).
+        port = None
+        for tok in reversed(parts[8:]):
+            m = re.search(r":(\d{2,5})$", tok)
+            if m:
+                port = m.group(1)
+                break
+        if port:
+            by_pid[pid].add(f"{name}:{port}")
+    return by_pid
+
+
+def collect_cwds(pids):
+    """Return dict pid -> cwd for the given pids.  Empty string if unknown."""
+    if not pids:
+        return {}
+    # Batch lsof for speed.  macOS lsof accepts comma-separated pids.
+    # lsof may exit 1 if some pids disappeared; stdout still contains valid rows.
+    pid_arg = ",".join(str(p) for p in pids)
+    try:
+        proc = subprocess.run(
+            ["lsof", "-a", f"-p{pid_arg}", "-d", "cwd"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        out = proc.stdout or ""
+    except Exception:
+        out = ""
+    cwds = {}
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        pid = parts[1]
+        cwd = parts[-1]
+        cwds[pid] = cwd
+    return cwds
+
+
+# --- report ---------------------------------------------------------------
+
+SEVERITY = {"leak": 0, "zombie": 1, "daemon": 2, "normal": 3}
+
+
+def trunc(s, n):
+    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
+
+
+def build_rows(procs, listeners, leak_fps):
+    rows = []
+    for p in procs:
+        cat = p["category"]
+        ports = sorted(listeners.get(p["pid"], set()))
+        is_leak = p["fp"] in leak_fps
+        # dev-server holding a port IS a zombie — takes priority over leak
+        # (a leaked vite preview is still a forgotten dev server).
+        is_zombie = cat == "dev-server" and bool(ports)
+        is_daemon = cat in ("agent-daemon",) and not is_leak
+        if is_zombie:
+            sev = "zombie"
+        elif is_leak:
+            sev = "leak"
+        elif is_daemon:
+            sev = "daemon"
+        else:
+            sev = "normal"
+        rows.append(
+            {
+                "pid": p["pid"],
+                "category": cat,
+                "severity": sev,
+                "ports": ports,
+                "cmd": p["cmd"],
+                "fp": p["fp"],
+                "cwd": p.get("cwd", ""),
+            }
+        )
+    return rows
+
+
+# Display order for the runtime footprint report.  Agent/MCP-facing categories
+# float to the top so the user sees the interesting stuff first.
+CATEGORY_ORDER = [
+    ("mcp", "🤖  MCP SERVERS"),
+    ("agent-daemon", "🤖  AGENT DAEMONS"),
+    ("dev-server", "🌐  DEV SERVERS"),
+    ("support", "⚙️  SUPPORT / RUNTIME"),
+    ("system", "🔒  SYSTEM"),
+    ("unknown", "❓  OTHER / UNCLASSIFIED"),
+]
+
+
+def aggregate_by_fingerprint(rows):
+    """Group rows by fingerprint.  Returns list of groups with count, pids, ports, cwd."""
+    groups = {}
+    for r in rows:
+        fp = r["fp"]
+        g = groups.setdefault(
+            fp,
+            {
+                "fp": fp,
+                "category": r["category"],
+                "severity": r["severity"],
+                "pids": [],
+                "ports": set(),
+                "cmd": r["cmd"],
+                "cwds": set(),
+            },
+        )
+        g["pids"].append(r["pid"])
+        g["ports"].update(r["ports"])
+        if r.get("cwd"):
+            g["cwds"].add(r["cwd"])
+    for g in groups.values():
+        g["pids"].sort(key=int)
+        g["ports"] = sorted(g["ports"])
+        g["cwds"] = sorted(g["cwds"])
+    return sorted(groups.values(), key=lambda g: (-len(g["pids"]), g["fp"]))
+
+
+def render_terminal(rows, counts, leak_counts, leak_pids, leak_threshold):
+    leak_fps_order = sorted(leak_counts.items(), key=lambda x: -x[1])
+
+    print()
+    print("=" * 79)
+    print(f"  RUNTIME FOOTPRINT  (leak threshold = {leak_threshold} instances)")
+    print("=" * 79)
+    print()
+
+    # LEAK section — one line per fingerprint, with instance count + pid list.
+    if leak_fps_order:
+        print("⚠️   LEAKS — multi-instance / possible duplicates")
+        print("-" * 79)
+        for fp, n in leak_fps_order:
+            pids = leak_pids.get(fp, [])
+            shown = ",".join(pids[:8])
+            tail = ", ..." if len(pids) > 8 else ""
+            print(f"  {trunc(fp, 56):<56} ×{n:<3} [{shown}{tail}]")
+        print()
+
+    def fmt_cwd(cwd, prefix="        "):
+        if not cwd:
+            return ""
+        return f"\n{prefix}cwd: {cwd}"
+
+    # Zombie dev servers get their own high-visibility block.
+    zombie_rows = [r for r in rows if r["severity"] == "zombie"]
+    if zombie_rows:
+        print("🧟  ZOMBIE DEV SERVERS — holding a port, possibly forgotten")
+        print("-" * 79)
+        for r in zombie_rows:
+            ports = ",".join(r["ports"]) if r["ports"] else ""
+            line = f"  {r['pid']:>7}  {ports:<20} {trunc(r['cmd'], 75)}"
+            print(line + fmt_cwd(r.get("cwd")))
+        print()
+
+    # Everything else grouped by category, fingerprint-aggregated.
+    rows_by_cat = {}
+    for r in rows:
+        if r["severity"] in ("leak", "zombie"):
+            # Leaks already shown above; zombies already shown above.
+            continue
+        rows_by_cat.setdefault(r["category"], []).append(r)
+
+    for cat, label in CATEGORY_ORDER:
+        cat_rows = rows_by_cat.get(cat)
+        if not cat_rows:
+            continue
+        print(label)
+        print("-" * 79)
+        groups = aggregate_by_fingerprint(cat_rows)
+        for g in groups:
+            ports = ",".join(g["ports"]) if g["ports"] else ""
+            if len(g["pids"]) > 1:
+                shown = ",".join(g["pids"][:8])
+                tail = ", ..." if len(g["pids"]) > 8 else ""
+                line = f"  {len(g['pids']):>3}×  [{shown}{tail}]  {ports:<20} {trunc(g['fp'], 60)}"
+                cwds = ", ".join(g["cwds"])
+                print(line + fmt_cwd(cwds))
+            else:
+                cmd = g["cmd"]
+                pid = g["pids"][0] if g["pids"] else "?"
+                line = f"  {pid:>7}  {ports:<20} {trunc(cmd, 75)}"
+                print(line + fmt_cwd(g["cwds"][0] if g["cwds"] else ""))
+        print()
+
+    print("-" * 79)
+    print(
+        f"  {counts['total']} tracked | "
+        f"{counts['leak']} leak · {counts['zombie']} zombie · {counts['daemon']} daemon | "
+        f"mcp {counts['mcp']} · dev-server {counts['dev']} · system {counts['system']} · unknown {counts['unknown']}"
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Runtime process semantic layer (read-only).")
+    ap.add_argument("--json", action="store_true", help="emit structured JSON instead of terminal report")
+    ap.add_argument("--leak-threshold", type=int, default=3, help="instance count to flag a fingerprint as leaked (default 3)")
+    ap.add_argument("--show-system", action="store_true", help="include system processes in output")
+    ap.add_argument("--show-normal", action="store_true", help="include non-leak/non-zombie/normal unknown procs")
+    args = ap.parse_args()
+
+    procs = collect_processes()
+    listeners = collect_listeners()
+
+    # Enrich processes with cwd so users can tell which project a vague command
+    # (e.g. "Python serve.py") actually belongs to.
+    cwds = collect_cwds([p["pid"] for p in procs])
+    for p in procs:
+        p["cwd"] = cwds.get(p["pid"], "")
+
+    # Categories that are EXEMPT from leak detection: system services are
+    # multi-instance by design on macOS; support tools are singletons by
+    # identity. Neither should inflate the leak fingerprint tally.
+    LEAK_EXEMPT = {"system", "support"}
+
+    # leak detection: group by fingerprint, count instances — but only among
+    # non-exempt categories so system daemons don't pollute the leak tally.
+    fp_groups = defaultdict(list)
+    for p in procs:
+        if p["category"] in LEAK_EXEMPT:
+            continue
+        fp_groups[p["fp"]].append(p)
+    leak_counts = {fp: len(ps) for fp, ps in fp_groups.items() if len(ps) >= args.leak_threshold}
+    leak_pids = {fp: sorted([p["pid"] for p in ps], key=int) for fp, ps in fp_groups.items() if fp in leak_counts}
+    leak_fps = set(leak_counts)
+
+    rows = build_rows(procs, listeners, leak_fps)
+
+    if not args.show_system:
+        rows = [r for r in rows if r["category"] != "system"]
+    if not args.show_normal:
+        rows = [r for r in rows if not (r["severity"] == "normal" and r["category"] == "unknown")]
+
+    counts = {
+        "total": len(rows),
+        "leak": sum(1 for r in rows if r["severity"] == "leak"),
+        "zombie": sum(1 for r in rows if r["severity"] == "zombie"),
+        "daemon": sum(1 for r in rows if r["severity"] == "daemon"),
+        "mcp": sum(1 for r in rows if r["category"] == "mcp"),
+        "dev": sum(1 for r in rows if r["category"] == "dev-server"),
+        "unknown": sum(1 for r in rows if r["category"] == "unknown"),
+        "system": sum(1 for r in rows if r["category"] == "system"),
+    }
+
+    if args.json:
+        # port list overall
+        port_map = defaultdict(list)
+        for pid, ports in listeners.items():
+            for pn in ports:
+                port_map[pn].append(pid)
+        print(
+            json.dumps(
+                {
+                    "leak_threshold": args.leak_threshold,
+                    "leaks": [
+                        {"fingerprint": fp, "count": c, "pids": leak_pids[fp]}
+                        for fp, c in sorted(leak_counts.items(), key=lambda x: -x[1])
+                    ],
+                    "processes": rows,
+                    "ports": {k: v for k, v in sorted(port_map.items())},
+                    "summary": counts,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    render_terminal(rows, counts, leak_counts, leak_pids, args.leak_threshold)
+
+
+if __name__ == "__main__":
+    main()
