@@ -76,6 +76,12 @@ After installation, config files live in `~/.config/agent-assets`:
 
 Edit `product-map.json` to add your own vendor-to-name mappings. A full example ships at `templates/agent-assets/product-map.example.json`.
 
+Edit `runtime-classification.json` to teach `asset-runtime` about your own MCP servers, agent daemons, and support tools. A full example ships at `templates/agent-assets/runtime-classification.example.json`.
+
+## Screenshots
+
+> Screenshots will be added here before the first stable release. Run `agent-assets-dashboard --serve --open` to see the live UI.
+
 ## Development
 
 ```bash

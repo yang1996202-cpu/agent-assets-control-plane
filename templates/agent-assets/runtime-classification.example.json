@@ -1,0 +1,29 @@
+{
+  "_purpose": "用户自定义进程分类规则。asset-runtime 启动时会合并到内置规则之后。每项是正则字符串。",
+  "_note": "这是示例配置，安装时会复制到 ~/.config/agent-assets/runtime-classification.json。你可以按自己环境增删。",
+  "known_services": [
+    ["gbrain", "mcp"],
+    ["my-memory-mcp", "mcp"]
+  ],
+  "mcp": [
+    "gbrain",
+    "context7-mcp",
+    "notebooklm",
+    "cc-connect",
+    "wechat-mcp",
+    "ask-gemini-mcp",
+    "docker-mcp",
+    "my-mcp"
+  ],
+  "agent_daemons": [
+    "openclaw",
+    "claude-skill-hub",
+    "skill-hub",
+    "opencli",
+    "hermes-agent",
+    "cc-connect.*gateway|gateway.*cc-connect",
+    "skill-gallery",
+    "acpx",
+    "my-agent"
+  ]
+}

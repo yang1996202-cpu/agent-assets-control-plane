@@ -26,9 +26,11 @@
 - **状态**：🟢 已完成
 - **添加**：2026-07-03
 - **完成**：2026-07-03
-- **简述**：`asset-runtime` 采集进程 RSS 内存字段，dashboard 新增「系统进程」tab，展示全部进程并支持按名称/类型筛选。
+- **简述**：dashboard 新增「系统进程」tab，展示本机全部进程（含 GUI 应用），按 CPU / 内存可视化排序，支持按类别筛选与表头排序。
 - **历史沿革**：
   - [2026-07-03] 新增系统进程视图：`bin/agent-assets-runtime` 输出 `rss` 字段；dashboard 增加「系统进程」tab 与内存列渲染。
+  - [2026-07-03] 增加 CPU 字段、进度条可视化、表头排序，支持采集 GUI 应用进程。
+  - [2026-07-03] 进程分类规则与用户环境映射外置到 `~/.config/agent-assets/runtime-classification.json` / `product-map.json`。
 
 ### macOS 系统信号全景
 - **状态**：🟢 已完成

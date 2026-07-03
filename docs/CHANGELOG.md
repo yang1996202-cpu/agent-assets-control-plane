@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-03 13:45
+
+### [REFACTOR] 开源打磨：个人信息外置、README、CONTRIBUTING、CI
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 开源前需要清理与用户个人环境强耦合的内容（中文应用映射、个人工具识别规则），并补齐 README、CONTRIBUTING、CI 等基础设施。 |
+| **根因/方案** | 将 `PRODUCT_MAP` 和进程分类规则从核心代码移到 `~/.config/agent-assets/` 下的 JSON 配置，由安装脚本从示例模板复制；重写 README.md 明确平台与使用方式；新增 CONTRIBUTING.md；新增 GitHub Actions CI 工作流；新增 docs/RELEASE_NOTES.md 模板；删除过期的 GitHub Release v0.1.0。 |
+| **改动范围** | `bin/agent-assets-runtime`、`lib/agent_assets_dashboard_paths.py`、`lib/agent_assets_dashboard_render.py`、`scripts/install.sh`、`README.md`、`CONTRIBUTING.md`、`.github/workflows/ci.yml`、`templates/agent-assets/product-map.example.json`、`templates/agent-assets/runtime-classification.example.json`、`docs/FEATURES.md`、`docs/CHANGELOG.md`、`docs/RELEASE_NOTES.md` |
+| **影响面** | 本机行为不变（配置已自动复制到 `~/.config/agent-assets/`）；代码库更适合公开 fork；新用户首次安装后可直接运行。 |
+| **状态** | ✅ 已完成 |
+
 ## 2026-07-03 13:20
 
 ### [FEAT] 系统进程视图支持 GUI 应用、CPU 占用与表头排序

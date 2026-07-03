@@ -23,8 +23,41 @@ for _P in _LIB_CANDIDATES:
     if _P and _P not in sys.path:
         sys.path.insert(0, _P)
 import agent_assets_common as lib
+import agent_assets_dashboard_paths as paths
 
 # --- classification rules -------------------------------------------------
+
+
+def _load_runtime_classification():
+    """加载用户自定义进程分类规则，合并到内置规则中。
+
+    配置文件：~/.config/agent-assets/runtime-classification.json
+    格式见 templates/agent-assets/runtime-classification.example.json
+    """
+    cfg_path = paths.RUNTIME_CLASSIFICATION
+    if not cfg_path.exists():
+        return {}, [], []
+    try:
+        data = lib.load_json(cfg_path)
+    except Exception:
+        return {}, [], []
+    if not isinstance(data, dict):
+        return {}, [], []
+
+    def _compile(items):
+        out = []
+        for item in items or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                out.append((re.compile(item[0], re.I), item[1]))
+            elif isinstance(item, str):
+                out.append(re.compile(item, re.I))
+        return out
+
+    known = _compile(data.get("known_services"))
+    mcp = _compile(data.get("mcp"))
+    daemons = _compile(data.get("agent_daemons"))
+    return known, mcp, daemons
+
 
 # 永远过滤的噪音：交互式 shell、采集命令自身、本机 IDE、系统框架等。
 CORE_NOISE_RES = [
@@ -85,38 +118,32 @@ SYSTEM_RES = [
 # These win over the generic dev-server `serve`/port rules — a known MCP serving
 # over HTTP is NOT a zombie dev server.
 KNOWN_SERVICE_RES = [
-    # gbrain is the user's memory MCP — classify as mcp even though it runs
-    # `bun ... gbrain serve --http` (contains 'serve', listens on a port).
-    (re.compile(r"\bgbrain\b", re.I), "mcp"),
     # asset-* control-plane tools are the observer itself + dashboard — they
     # serve dashboards but must never be flagged as zombie dev servers.
     (re.compile(r"\basset-(?:dashboard|runtime|register|list)\b", re.I), "support"),
     (re.compile(r"\bagent-assets-dashboard\b", re.I), "support"),
+    # gbrain is kept as a built-in example of a known MCP that also happens to
+    # contain the word "serve" and listen on a port.
+    (re.compile(r"\bgbrain\b", re.I), "mcp"),
 ]
 
 # known MCP wrapper / command signatures.
 MCP_RES = [
     re.compile(r"\bmcp\b", re.I),
-    re.compile(r"context7-mcp", re.I),
-    re.compile(r"\bgbrain\b", re.I),
-    re.compile(r"notebooklm", re.I),
-    re.compile(r"cc-connect", re.I),
-    re.compile(r"wechat-mcp", re.I),
-    re.compile(r"ask-gemini-mcp", re.I),
-    re.compile(r"docker-mcp", re.I),
     re.compile(r"\bnpx\b.*mcp", re.I),
     re.compile(r"\buvx\b.*mcp", re.I),
 ]
 
 AGENT_DAEMON_RES = [
-    re.compile(r"\bopenclaw\b", re.I),
-    re.compile(r"claude-skill-hub|skill-hub", re.I),
-    re.compile(r"\bopencli\b", re.I),
+    # hermes-agent is kept as a built-in example of an agent daemon.
     re.compile(r"\bhermes-agent\b", re.I),
-    re.compile(r"cc-connect.*gateway|gateway.*cc-connect", re.I),
-    re.compile(r"skill-gallery", re.I),
-    re.compile(r"\bacpx\b", re.I),
 ]
+
+# 合并用户自定义规则（~/.config/agent-assets/runtime-classification.json）
+_extra_known, _extra_mcp, _extra_daemons = _load_runtime_classification()
+KNOWN_SERVICE_RES.extend(_extra_known)
+MCP_RES.extend(_extra_mcp)
+AGENT_DAEMON_RES.extend(_extra_daemons)
 
 DEV_SERVER_RES = [
     # Explicit dev-server frameworks only.  Generic words like "serve" / "preview"
