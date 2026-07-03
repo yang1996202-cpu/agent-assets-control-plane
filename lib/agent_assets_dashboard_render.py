@@ -737,8 +737,21 @@ def _runtime_cmd_short(cmd, limit=90):
     return cmd[: limit - 1] + "…"
 
 
+def _format_rss(kb):
+    """把 KB 内存格式化成人类可读字符串（MB / GB）。"""
+    try:
+        kb = int(kb or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if kb <= 0:
+        return "—"
+    if kb >= 1024 * 1024:
+        return f"{kb / (1024 * 1024):.2f} GB"
+    return f"{kb / 1024:.1f} MB"
+
+
 def _aggregate_runtime_by_fp(processes):
-    """按 fingerprint 聚合进程。返回 [{fp, category, pids, ports, cmd, cwds}]。"""
+    """按 fingerprint 聚合进程。返回 [{fp, category, pids, ports, rss, cmd, cwds}]。"""
     groups = {}
     for p in processes:
         fp = p.get("fp") or p.get("cmd") or "?"
@@ -749,6 +762,7 @@ def _aggregate_runtime_by_fp(processes):
                 "category": p.get("category", "unknown"),
                 "pids": [],
                 "ports": set(),
+                "rss": 0,
                 "cmd": p.get("cmd", ""),
                 "cwds": set(),
             },
@@ -758,6 +772,7 @@ def _aggregate_runtime_by_fp(processes):
             g["pids"].append(pid)
         for port in lib.listify(p.get("ports")):
             g["ports"].add(port)
+        g["rss"] += int(p.get("rss", 0) or 0)
         if p.get("cwd"):
             g["cwds"].add(p["cwd"])
     for g in groups.values():
@@ -774,6 +789,7 @@ def _runtime_type_badge(category):
         "dev-server": ("Dev", "dev"),
         "support": ("Support", "support"),
         "system": ("System", "system"),
+        "app": ("App", "app"),
     }
     label, cls = mapping.get(category, ("Other", "other"))
     return f'<span class="tag {cls}">{lib.h(label)}</span>'
@@ -786,7 +802,7 @@ def _cwd_badge(cwd):
     return f'<a class="chip cwd-chip" href="{lib.h(href)}">{lib.h(cwd)}</a>'
 
 
-def _runtime_table_row(pid_or_count, type_badge, ports, cmd, cwd, pids_for_kill, cmd_short, filter_tags=""):
+def _runtime_table_row(pid_or_count, type_badge, ports, rss, cmd, cwd, pids_for_kill, cmd_short, filter_tags=""):
     ports_html = ", ".join(ports) if ports else '<span class="muted">—</span>'
     cwd_html = _cwd_badge(cwd)
     kill_btns = _kill_buttons_for_pids(pids_for_kill, cmd_short) if pids_for_kill else ""
@@ -795,6 +811,7 @@ def _runtime_table_row(pid_or_count, type_badge, ports, cmd, cwd, pids_for_kill,
         f'<td class="col-pid">{pid_or_count}</td>'
         f'<td class="col-type">{type_badge}</td>'
         f'<td class="col-ports">{ports_html}</td>'
+        f'<td class="col-rss">{lib.h(_format_rss(rss))}</td>'
         f'<td class="col-cmd"><code>{lib.h(cmd_short)}</code>{cwd_html}</td>'
         f'<td class="col-action">{kill_btns}</td>'
         f'</tr>'
@@ -854,6 +871,7 @@ def render_runtime_rows(data):
           <th class="col-pid">PID / 实例</th>
           <th class="col-type">类型</th>
           <th class="col-ports">端口</th>
+          <th class="col-rss">内存</th>
           <th class="col-cmd">命令 / 路径</th>
           <th class="col-action">操作</th>
         </tr>
@@ -881,8 +899,10 @@ def render_runtime_rows(data):
             cat = matching[0].get("category", "unknown") if matching else "unknown"
             ports_set = set()
             cwds = set()
+            total_rss = 0
             for p in matching:
                 ports_set.update(lib.listify(p.get("ports")))
+                total_rss += int(p.get("rss", 0) or 0)
                 if p.get("cwd"):
                     cwds.add(p["cwd"])
             pid_list_text = ", ".join(str(x) for x in pids)
@@ -893,7 +913,7 @@ def render_runtime_rows(data):
             type_badge = _runtime_type_badge(cat)
             cmd_short = _runtime_cmd_short(fp)
             cwd = sorted(cwds)[0] if cwds else ""
-            parts.append(_runtime_table_row(pid_html, type_badge, sorted(ports_set), fp, cwd, pids, cmd_short, filter_tags=f"{cat} leak"))
+            parts.append(_runtime_table_row(pid_html, type_badge, sorted(ports_set), total_rss, fp, cwd, pids, cmd_short, filter_tags=f"{cat} leak"))
         parts.append("</tbody></table></details>")
 
     # 僵尸 dev server 组
@@ -917,6 +937,7 @@ def render_runtime_rows(data):
                 f'<code>{lib.h(pid)}</code>',
                 _runtime_type_badge(cat),
                 lib.listify(p.get("ports")),
+                p.get("rss", 0),
                 p.get("cmd", ""),
                 p.get("cwd", ""),
                 [pid],
@@ -972,6 +993,7 @@ def render_runtime_rows(data):
                 pid_html,
                 _runtime_type_badge(cat),
                 g["ports"],
+                g["rss"],
                 g["cmd"],
                 cwd,
                 pids_for_kill,
@@ -1000,6 +1022,161 @@ def render_runtime_rows(data):
     if len(parts) <= 1:
         parts.append('<p class="muted">当前没有运行态数据。</p>')
     return "\n".join(parts)
+
+
+def _format_cpu(value, show_zero=False):
+    """把 CPU 百分比格式化成人类可读字符串。show_zero=True 时 0 也显示 0.0%。"""
+    try:
+        cpu = float(value or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if cpu <= 0 and not show_zero:
+        return "—"
+    return f"{cpu:.1f}%"
+
+
+_APP_BUNDLE_RE = re.compile(r"/Applications/([^/]+\.app)/")
+
+
+def _process_display_name(cmd):
+    """从原始命令提取干净易读的进程/应用名称。
+
+    规则优先级：
+    1. /Applications/Xxx.app 里的进程 → 返回 Xxx.app
+    2. 解释器跑的脚本 → 返回「解释器 脚本名」
+    3. 系统路径 → 只返回 basename
+    4. 其他 → 返回第一个 token 的 basename
+    """
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return "未知进程"
+    # 去掉 login shell 的前导横杠
+    if cmd.startswith("-"):
+        cmd = cmd[1:].lstrip()
+    # 1. 应用 bundle
+    m = _APP_BUNDLE_RE.search(cmd)
+    if m:
+        return m.group(1)
+    # 取第一个 token
+    first = cmd.split(None, 1)[0]
+    # 2. 解释器 + 脚本
+    interpreters = ("node", "python", "python3", "bun", "deno", "ruby", "php")
+    base_first = os.path.basename(first)
+    if base_first.lower().startswith(interpreters):
+        rest = cmd[len(first):].strip()
+        script = rest.split(None, 1)[0] if rest else ""
+        script_base = os.path.basename(script) if script else ""
+        if script_base:
+            return f"{base_first} {script_base}"
+        return base_first
+    # 3/4. basename
+    name = os.path.basename(first)
+    return name if name else first
+
+
+def _usage_bar_html(value, max_value, label, css_class):
+    """生成一个可视化进度条：value / max_value 的百分比宽度。"""
+    try:
+        pct = (float(value or 0) / max(float(max_value or 0), 1)) * 100
+    except (TypeError, ValueError):
+        pct = 0
+    pct = min(100, max(0, pct))
+    return f'''
+    <div class="usage-bar {lib.h(css_class)}" title="{lib.h(label)}">
+      <div class="usage-bar-fill" style="width:{pct:.1f}%"></div>
+      <span class="usage-bar-text">{lib.h(label)}</span>
+    </div>
+    '''
+
+
+def render_system_processes_rows(processes):
+    """渲染「系统进程」tab：与其他 tab 风格一致的筛选 + 表格。"""
+    if not processes:
+        return '<p class="muted">没有采集到系统进程数据。运行 asset-runtime --show-system 生成。</p>'
+
+    # 统一数值字段
+    rows = []
+    for p in processes:
+        try:
+            rss = int(p.get("rss", 0) or 0)
+        except (TypeError, ValueError):
+            rss = 0
+        try:
+            cpu = float(p.get("cpu", 0) or 0)
+        except (TypeError, ValueError):
+            cpu = 0.0
+        rows.append({
+            "pid": p.get("pid", "?"),
+            "category": p.get("category", "unknown"),
+            "cmd": p.get("cmd", ""),
+            "rss": rss,
+            "cpu": cpu,
+        })
+
+    # 分类统计
+    cat_counts = {}
+    for p in rows:
+        cat = p["category"]
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+
+    # 默认视图：排除纯 system，显示应用、agent、mcp、dev 等用户关心进程
+    non_system = [p for p in rows if p["category"] != "system"]
+    default_rows = non_system if non_system else rows
+
+    # 进度条缩放极值
+    max_cpu = max((p["cpu"] for p in rows), default=0) or 1
+    max_rss = max((p["rss"] for p in rows), default=0) or 1
+
+    # 筛选按钮
+    filter_buttons = [f'<button class="filter" data-filter="">全部 ({len(rows)})</button>']
+    if non_system:
+        filter_buttons.append(f'<button class="filter active" data-filter="user">用户进程 ({len(non_system)})</button>')
+    user_cats = [("app", "App"), ("mcp", "MCP"), ("agent-daemon", "Agent"), ("dev-server", "Dev Server"), ("support", "Support")]
+    other_cats = [(cat, cat) for cat in ["system", "unknown"] if cat_counts.get(cat)]
+    for cat, label in user_cats + other_cats:
+        n = cat_counts.get(cat, 0)
+        if n:
+            filter_buttons.append(f'<button class="filter" data-filter="{lib.h(cat)}">{lib.h(label)} ({n})</button>')
+
+    # 默认按内存降序，让高占用进程自然排在前面
+    default_rows.sort(key=lambda p: (-p["rss"], -p["cpu"]))
+
+    def _row_html(p):
+        pid = p["pid"]
+        cat = p["category"]
+        name = _process_display_name(p["cmd"])
+        type_badge = _runtime_type_badge(cat)
+        filter_tags = f"{cat} user" if cat != "system" else cat
+        kill_btns = _kill_buttons_for_pids([pid], name) if pid != "?" else ""
+        return (
+            f'<tr class="searchable" data-section="system-processes" data-filter-tags="{lib.h(filter_tags)}">'
+            f'<td class="col-name"><strong title="{lib.h(p["cmd"])}">{lib.h(name)}</strong><span class="subtle pid-hint">PID {lib.h(pid)}</span></td>'
+            f'<td class="col-cpu" data-sort-value="{p["cpu"]:.3f}">{_usage_bar_html(p["cpu"], max_cpu, _format_cpu(p["cpu"], True), "cpu")}</td>'
+            f'<td class="col-rss" data-sort-value="{p["rss"]}">{_usage_bar_html(p["rss"], max_rss, _format_rss(p["rss"]), "mem")}</td>'
+            f'<td class="col-type">{type_badge}</td>'
+            f'<td class="col-action">{kill_btns}</td>'
+            f'</tr>'
+        )
+
+    out_rows = [_row_html(p) for p in default_rows]
+
+    return f"""
+    <div class="filter-bar system-processes-filter-bar">
+      {"".join(filter_buttons)}
+    </div>
+    <table class="data-table system-processes-table" data-sortable>
+      <thead>
+        <tr>
+          <th class="col-name sortable" data-sort="name">进程</th>
+          <th class="col-cpu sortable" data-sort="cpu">CPU</th>
+          <th class="col-rss sortable" data-sort="rss">内存</th>
+          <th class="col-type">类型</th>
+          <th class="col-action">操作</th>
+        </tr>
+      </thead>
+      <tbody>{"\n".join(out_rows)}</tbody>
+    </table>
+    """
 
 
 def render_discovered_rows(rows, empty_label="没有匹配的候选项。"):

@@ -4,6 +4,7 @@ import importlib.util
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 
@@ -75,6 +76,68 @@ class TestBuildRows(unittest.TestCase):
         leak_fps = {"gbrain"}
         rows = runtime.build_rows(procs, listeners, leak_fps)
         self.assertTrue(all(r["severity"] == "leak" for r in rows))
+
+
+class TestCollectProcesses(unittest.TestCase):
+    @patch.object(runtime, "run")
+    def test_collect_processes_includes_rss_and_cpu(self, mock_run):
+        """collect_processes 必须解析 rss、cpu 字段并返回正确类型。"""
+        mock_run.return_value = """  PID  PPID   RSS  %CPU COMMAND
+    1     0  1024   0.1 /usr/sbin/launchd
+   42     1   512  12.5 node vite
+"""
+        procs = runtime.collect_processes()
+        self.assertEqual(len(procs), 2)
+        for p in procs:
+            self.assertIn("rss", p)
+            self.assertIsInstance(p["rss"], int)
+            self.assertIn("cpu", p)
+            self.assertIsInstance(p["cpu"], float)
+        # 校验具体解析值
+        launchd = next(p for p in procs if p["pid"] == "1")
+        vite = next(p for p in procs if p["pid"] == "42")
+        self.assertEqual(launchd["rss"], 1024)
+        self.assertEqual(launchd["cpu"], 0.1)
+        self.assertEqual(vite["rss"], 512)
+        self.assertEqual(vite["cpu"], 12.5)
+
+
+class TestBuildRowsRss(unittest.TestCase):
+    def test_build_rows_carries_rss_value(self):
+        """build_rows 输出应保留输入进程中的 rss 值。"""
+        procs = [
+            {"pid": "1", "ppid": "0", "rss": 1024, "cpu": 5.0, "cmd": "node vite", "category": "dev-server", "fp": "vite"}
+        ]
+        rows = runtime.build_rows(procs, {}, set())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rss"], 1024)
+
+    def test_build_rows_default_rss_when_missing(self):
+        """build_rows 对缺少 rss 的进程应默认补 0，保持向后兼容。"""
+        procs = [
+            {"pid": "1", "ppid": "0", "cmd": "node vite", "category": "dev-server", "fp": "vite"}
+        ]
+        rows = runtime.build_rows(procs, {}, set())
+        self.assertEqual(rows[0]["rss"], 0)
+
+
+class TestBuildRowsCpu(unittest.TestCase):
+    def test_build_rows_carries_cpu_value(self):
+        """build_rows 输出应保留输入进程中的 cpu 值。"""
+        procs = [
+            {"pid": "1", "ppid": "0", "rss": 1024, "cpu": 15.5, "cmd": "node vite", "category": "dev-server", "fp": "vite"}
+        ]
+        rows = runtime.build_rows(procs, {}, set())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["cpu"], 15.5)
+
+    def test_build_rows_default_cpu_when_missing(self):
+        """build_rows 对缺少 cpu 的进程应默认补 0.0，保持向后兼容。"""
+        procs = [
+            {"pid": "1", "ppid": "0", "rss": 1024, "cmd": "node vite", "category": "dev-server", "fp": "vite"}
+        ]
+        rows = runtime.build_rows(procs, {}, set())
+        self.assertEqual(rows[0]["cpu"], 0.0)
 
 
 if __name__ == "__main__":

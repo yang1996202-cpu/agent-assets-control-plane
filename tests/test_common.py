@@ -1,8 +1,13 @@
 """Tests for lib/agent_assets_common.py."""
 
+import os
 import pathlib
+import sys
 import tempfile
 import unittest
+
+ROOT = os.path.dirname(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(ROOT, "lib"))
 
 import agent_assets_common as lib
 

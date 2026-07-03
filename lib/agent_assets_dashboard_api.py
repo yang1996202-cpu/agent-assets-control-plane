@@ -287,14 +287,21 @@ def handle_launchctl(payload):
     err = (proc.stderr or "").strip()
     if proc.returncode != 0:
         user_err = err or f"launchctl 返回错误码 {proc.returncode}"
-        # KeepAlive 服务在 bootout 时可能已被自动重启，导致目标进程不存在
+        lowered = user_err.lower()
+        no_such = any(k in lowered for k in ("no such process", "no such service"))
         keep_alive = bool(plist_data.get("KeepAlive")) if isinstance(plist_data, dict) else False
-        if action == "bootout" and keep_alive and any(k in user_err.lower() for k in ("no such process", "no such service")):
+        # bootout 时目标已经不存在 = 实际已停止，不要显示失败
+        if action == "bootout" and no_such:
             return {
-                "ok": False,
-                "error": "停止失败：该服务设置了 KeepAlive，进程可能在自动重启。建议先「禁用自启」，再点「停止」。",
-                "keep_alive": True,
-            }, 500
+                "ok": True,
+                "action": action,
+                "action_zh": "已停止",
+                "label": real_label,
+                "running": False,
+                "auto_disabled": False,
+                "keep_alive": keep_alive,
+                "already_stopped": True,
+            }, 200
         return {"ok": False, "error": f"系统命令执行失败：{user_err}"}, 500
     running, auto_disabled = _launchctl_status(real_label)
     action_zh = {"enable": "已启用开机自启", "disable": "已禁用开机自启", "bootstrap": "已启动", "bootout": "已停止"}.get(action, action)

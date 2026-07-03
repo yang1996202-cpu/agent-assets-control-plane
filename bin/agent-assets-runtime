@@ -26,23 +26,11 @@ import agent_assets_common as lib
 
 # --- classification rules -------------------------------------------------
 
-# IDE / system UI / GUI app noise — not runtime blind spots, drop entirely.
-NOISE_RES = [
+# 永远过滤的噪音：交互式 shell、采集命令自身、本机 IDE、系统框架等。
+CORE_NOISE_RES = [
     re.compile(r"/Claude\.app/", re.I),
-    re.compile(r"Code Helper", re.I),
     re.compile(r"/Cursor\.app/", re.I),
-    re.compile(r"Electron Helper", re.I),
-    re.compile(r"/Google Chrome\.app/", re.I),
-    re.compile(r"/Microsoft Edge\.app/", re.I),
-    re.compile(r"/Safari\.app/", re.I),
-    re.compile(r"/Slack\.app/", re.I),
-    re.compile(r"/Finder\.app/", re.I),
-    re.compile(r"/Xcode\.app/", re.I),
-    re.compile(r"/JetBrains/", re.I),
-    re.compile(r"plugin-container", re.I),
-    re.compile(r"/Applications/[^/]+\.app/", re.I),  # GUI apps generally
     re.compile(r"/System/Library/", re.I),
-    # interactive shells / editors — not runtime blind spots
     re.compile(r"^login(?:\s|$)", re.I),
     re.compile(r"^-?(?:bash|zsh|fish)(?:\s|$)", re.I),
     re.compile(r"\bclaude(?:\.exe)?\s+--permission-mode", re.I),
@@ -50,6 +38,23 @@ NOISE_RES = [
     re.compile(r"^/bin/(?:bash|zsh|sh|dash)\b", re.I),
     re.compile(r"^ps\b", re.I),
 ]
+
+# GUI 应用及其 Helper 进程。默认过滤（专注后台运行态），--show-apps 时保留。
+APP_NOISE_RES = [
+    re.compile(r"Code Helper", re.I),
+    re.compile(r"Electron Helper", re.I),
+    re.compile(r"plugin-container", re.I),
+    re.compile(r"/Google Chrome\.app/", re.I),
+    re.compile(r"/Microsoft Edge\.app/", re.I),
+    re.compile(r"/Safari\.app/", re.I),
+    re.compile(r"/Slack\.app/", re.I),
+    re.compile(r"/Finder\.app/", re.I),
+    re.compile(r"/Xcode\.app/", re.I),
+    re.compile(r"/JetBrains/", re.I),
+    re.compile(r"/Applications/[^/]+\.app/", re.I),  # GUI apps generally
+]
+
+NOISE_RES = CORE_NOISE_RES + APP_NOISE_RES
 
 # system daemons / Apple machinery — recognized but not a blind spot.
 # Multi-instance system services (distnoted, diskimagesiod, caffeinate, ...)
@@ -210,30 +215,41 @@ def run(cmd):
     return out
 
 
-def collect_processes():
-    """Return list of dicts: pid, ppid, cmd, category, fp."""
-    out = run(["ps", "ax", "-o", "pid,ppid,command"])
+def collect_processes(show_apps=False):
+    """Return list of dicts: pid, ppid, rss, cpu, cmd, category, fp.
+
+    show_apps=True 时保留 GUI 应用进程（Chrome、微信等），用于系统进程监视视图。
+    """
+    out = run(["ps", "ax", "-o", "pid,ppid,rss,pcpu,command"])
+    active_noise = NOISE_RES if not show_apps else CORE_NOISE_RES
     procs = []
     seen_pids = set()
     for line in out.splitlines()[1:]:
-        parts = line.strip().split(None, 2)
-        if len(parts) < 3:
+        parts = line.strip().split(None, 4)
+        if len(parts) < 5:
             continue
-        pid, ppid, cmd = parts[0], parts[1], parts[2]
+        pid, ppid, rss, cpu, cmd = parts[0], parts[1], parts[2], parts[3], parts[4]
         try:
             int(pid)
+            int(rss)
+            float(cpu)
         except ValueError:
             continue
         if pid in seen_pids:
             continue
         seen_pids.add(pid)
-        if any(r.search(cmd) for r in NOISE_RES):
+        if any(r.search(cmd) for r in active_noise):
             continue
         cat = classify(cmd)
+        # GUI 应用进程单独归一类，方便前端展示
+        if show_apps and any(r.search(cmd) for r in APP_NOISE_RES):
+            cat = "app"
         procs.append(
             {
                 "pid": pid,
                 "ppid": ppid,
+                "rss": int(rss),
+                "cpu": float(cpu),
                 "cmd": cmd,
                 "category": cat,
                 "fp": fingerprint(cmd),
@@ -328,6 +344,8 @@ def build_rows(procs, listeners, leak_fps):
                 "category": cat,
                 "severity": sev,
                 "ports": ports,
+                "rss": p.get("rss", 0),
+                "cpu": p.get("cpu", 0.0),
                 "cmd": p["cmd"],
                 "fp": p["fp"],
                 "cwd": p.get("cwd", ""),
@@ -361,12 +379,14 @@ def aggregate_by_fingerprint(rows):
                 "severity": r["severity"],
                 "pids": [],
                 "ports": set(),
+                "rss": 0,
                 "cmd": r["cmd"],
                 "cwds": set(),
             },
         )
         g["pids"].append(r["pid"])
         g["ports"].update(r["ports"])
+        g["rss"] += r.get("rss", 0)
         if r.get("cwd"):
             g["cwds"].add(r["cwd"])
     for g in groups.values():
@@ -456,9 +476,10 @@ def main():
     ap.add_argument("--leak-threshold", type=int, default=3, help="instance count to flag a fingerprint as leaked (default 3)")
     ap.add_argument("--show-system", action="store_true", help="include system processes in output")
     ap.add_argument("--show-normal", action="store_true", help="include non-leak/non-zombie/normal unknown procs")
+    ap.add_argument("--show-apps", action="store_true", help="include GUI application processes (for system process monitor)")
     args = ap.parse_args()
 
-    procs = collect_processes()
+    procs = collect_processes(show_apps=args.show_apps)
     listeners = collect_listeners()
 
     # Enrich processes with cwd so users can tell which project a vague command
@@ -499,6 +520,7 @@ def main():
         "dev": sum(1 for r in rows if r["category"] == "dev-server"),
         "unknown": sum(1 for r in rows if r["category"] == "unknown"),
         "system": sum(1 for r in rows if r["category"] == "system"),
+        "app": sum(1 for r in rows if r["category"] == "app"),
     }
 
     if args.json:

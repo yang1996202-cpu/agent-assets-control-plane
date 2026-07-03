@@ -306,13 +306,15 @@ CSS = """    :root {
     }
     .runtime-table tr:last-child td { border-bottom: 0; }
     .runtime-table tr:hover td { background: #f9f9f7; }
-    .runtime-table .col-pid { width: 13%; }
+    .runtime-table .col-pid { width: 12%; }
     .runtime-table .col-type { width: 7%; }
-    .runtime-table .col-ports { width: 14%; }
-    .runtime-table .col-cmd { width: 46%; }
-    .runtime-table .col-action { width: 20%; }
+    .runtime-table .col-ports { width: 13%; }
+    .runtime-table .col-rss { width: 9%; }
+    .runtime-table .col-cmd { width: 42%; }
+    .runtime-table .col-action { width: 17%; }
     .runtime-table td.col-pid { white-space: nowrap; }
     .runtime-table td.col-type { white-space: nowrap; }
+    .runtime-table td.col-rss { white-space: nowrap; text-align: right; }
     .runtime-table td.col-ports {
       font-family: ui-monospace, monospace;
       font-size: 13px;
@@ -388,6 +390,7 @@ CSS = """    :root {
     .tag.dev { background: #ffedd5; color: #9a3412; }
     .tag.support { background: #e0f2fe; color: #075985; }
     .tag.system { background: #f3f4f6; color: #374151; }
+    .tag.app { background: #fef3c7; color: #92400e; }
     .tag.other { background: #f0f1ed; color: var(--muted); }
     .ports-bar { display: flex; gap: 8px; flex-wrap: wrap; }
     .port {
@@ -396,6 +399,49 @@ CSS = """    :root {
       background: var(--soft);
       font-size: 13px;
       font-family: ui-monospace, monospace;
+    }
+    .system-processes-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .system-processes-table th {
+      text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line);
+      color: var(--muted); font-weight: 500; font-size: 13px;
+    }
+    .system-processes-table td {
+      padding: 12px 8px; border-bottom: 1px solid var(--soft); vertical-align: middle;
+    }
+    .system-processes-table tr:hover td { background: #f9f9f7; }
+    .system-processes-table .col-name { width: 40%; }
+    .system-processes-table .col-cpu { width: 18%; }
+    .system-processes-table .col-rss { width: 18%; }
+    .system-processes-table .col-type { width: 10%; }
+    .system-processes-table .col-action { width: 14%; }
+    .system-processes-table .col-name strong {
+      display: block; font-weight: 600; font-size: 14px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+    }
+    .system-processes-table .pid-hint {
+      display: block; font-size: 12px; color: var(--muted); margin-top: 2px;
+    }
+    .system-processes-table th.sortable {
+      cursor: pointer; user-select: none;
+    }
+    .system-processes-table th.sortable::after {
+      content: "↕"; color: var(--muted); font-size: 11px; margin-left: 4px;
+    }
+    .system-processes-table th.sortable.asc::after { content: "↑"; }
+    .system-processes-table th.sortable.desc::after { content: "↓"; }
+    .usage-bar {
+      position: relative; height: 20px; background: var(--soft); border-radius: 4px;
+      overflow: hidden; min-width: 60px;
+    }
+    .usage-bar-fill {
+      position: absolute; top: 0; left: 0; height: 100%; border-radius: 4px;
+      transition: width 0.2s;
+    }
+    .usage-bar.cpu .usage-bar-fill { background: #fecdd3; }
+    .usage-bar.mem .usage-bar-fill { background: #bfdbfe; }
+    .usage-bar-text {
+      position: relative; z-index: 1; font-size: 12px; line-height: 20px;
+      padding: 0 6px; color: var(--text);
     }
     .muted { color: var(--muted); }
     .refresh-status { color: var(--muted); font-size: 13px; margin-left: 10px; }
@@ -488,6 +534,61 @@ JS = """    (function() {
           document.querySelectorAll('.signals-filter-bar .filter').forEach(b => b.classList.remove('active'));
           btn.classList.add('active');
           applySignalsFilter();
+        });
+      });
+
+      // System processes filter buttons
+      function applySystemProcessesFilter(filter) {
+        document.querySelectorAll('.system-processes-table .searchable[data-section="system-processes"]').forEach(el => {
+          const tags = (el.dataset.filterTags || '').split(/\\s+/);
+          const visible = !filter || filter === 'user' ? tags.includes('user') : tags.includes(filter);
+          el.style.display = visible ? '' : 'none';
+        });
+      }
+      document.querySelectorAll('.system-processes-filter-bar .filter').forEach(btn => {
+        btn.addEventListener('click', () => {
+          document.querySelectorAll('.system-processes-filter-bar .filter').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          applySystemProcessesFilter(btn.dataset.filter);
+        });
+      });
+      // 页面加载时应用默认筛选（通常是「用户进程」）
+      (function() {
+        const activeBtn = document.querySelector('.system-processes-filter-bar .filter.active');
+        if (activeBtn) applySystemProcessesFilter(activeBtn.dataset.filter);
+      })();
+
+      // System processes table sorting
+      document.querySelectorAll('.system-processes-table th.sortable').forEach(th => {
+        th.addEventListener('click', () => {
+          const table = th.closest('table');
+          const tbody = table.querySelector('tbody');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          const sortKey = th.dataset.sort;
+          const currentDir = th.classList.contains('asc') ? 'asc' : (th.classList.contains('desc') ? 'desc' : '');
+          const nextDir = currentDir === 'asc' ? 'desc' : 'asc';
+          table.querySelectorAll('th.sortable').forEach(h => h.classList.remove('asc', 'desc'));
+          th.classList.add(nextDir);
+
+          const getValue = (row) => {
+            if (sortKey === 'name') {
+              const cell = row.querySelector('.col-name strong');
+              return (cell ? cell.textContent : '').toLowerCase();
+            }
+            const cell = row.querySelector(`.col-${sortKey}`);
+            if (!cell) return 0;
+            const val = parseFloat(cell.dataset.sortValue);
+            return isNaN(val) ? 0 : val;
+          };
+
+          rows.sort((a, b) => {
+            let va = getValue(a), vb = getValue(b);
+            if (va < vb) return nextDir === 'asc' ? -1 : 1;
+            if (va > vb) return nextDir === 'asc' ? 1 : -1;
+            return 0;
+          });
+
+          rows.forEach(row => tbody.appendChild(row));
         });
       });
 
@@ -726,6 +827,7 @@ def build_html(
     signals_meta=None,
     live=False,
     runtime_data=None,
+    all_processes=None,
 ):
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     runtime_updated = render._runtime_updated_at(runtime_data)
@@ -736,6 +838,7 @@ def build_html(
     signals_section = signals_error_banner + (render.render_macos_signals_rows(signals_rows) if signals_rows else '<p class="muted">系统信号未加载。</p>')
     cli_section = render.render_cli_section(entrypoints)
     action_log_section = render.render_action_log()
+    system_processes_section = render.render_system_processes_rows(all_processes) if all_processes is not None else '<p class="muted">系统进程数据未加载。</p>'
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -755,6 +858,7 @@ def build_html(
       <nav class="nav">
         <button class="active" data-tab="runtime">运行态</button>
         <button data-tab="signals">系统信号</button>
+        <button data-tab="system-processes">系统进程</button>
         <button data-tab="cli">CLI 工具</button>
         <button data-tab="log">操作记录</button>
         <button data-tab="settings">设置</button>
@@ -790,6 +894,16 @@ def build_html(
           </div>
         </div>
         {signals_section}
+      </section>
+
+      <section class="section" data-section="system-processes">
+        <div class="topbar">
+          <div>
+            <h1>系统进程</h1>
+            <div class="sub">本机所有运行中进程 · 按内存占用排序</div>
+          </div>
+        </div>
+        {system_processes_section}
       </section>
 
       <section class="section" data-section="cli">
@@ -890,6 +1004,7 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, run
         _row["_human"] = render.humanize_signal(_row)
         _row["_safe"] = render.is_safe_to_control(_row)
     runtime_data = data.collect_runtime()
+    all_processes = data.collect_all_processes()
     if refresh_mcp:
         health, health_raw = data.parse_claude_mcp_health()
     else:
@@ -916,6 +1031,7 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, run
         signals_meta,
         live=live,
         runtime_data=runtime_data,
+        all_processes=all_processes,
     )
     project_summary = project_meta.get("summary", {})
     assets = agent_registry.get("assets", {})

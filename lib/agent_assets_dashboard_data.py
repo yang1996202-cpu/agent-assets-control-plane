@@ -509,6 +509,30 @@ def collect_projects():
     return data.get("projects", []), data.get("updated_at", ""), data
 
 
+def collect_all_processes():
+    """采集所有运行进程（含系统进程），用于「系统进程」监视页面。
+
+    直接调用 asset-runtime --show-system --show-normal --json，复用其分类和去噪逻辑。
+    如果 asset-runtime 不存在或失败，返回空列表。
+    """
+    if not paths.ASSET_RUNTIME.exists():
+        return []
+    try:
+        proc = subprocess.run(
+            [str(paths.ASSET_RUNTIME), "--json", "--show-system", "--show-normal", "--show-apps"],
+            cwd=str(paths.HOME),
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+        if proc.returncode != 0:
+            return []
+        data = json.loads(proc.stdout or "{}")
+        return data.get("processes", [])
+    except Exception:
+        return []
+
+
 def refresh_signals(skip_btm=False):
     """重新运行 agent-assets-macos-signals 扫描并写入 macos-signals.json。
 
