@@ -170,9 +170,13 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 # 后台异步刷新系统信号并重写 dashboard，避免前端等待超时
                 def _refresh_after_launchctl():
                     try:
-                        # bootout 后进程可能还有短暂延迟，等 2 秒再扫描确保状态准确
                         import time
-                        time.sleep(2)
+                        # bootout 后 launchd/进程可能还有短暂延迟，先等 4 秒再扫描
+                        time.sleep(4)
+                        error = data.refresh_signals(skip_btm=True)
+                        if error:
+                            sys.stderr.write(f"asset-dashboard: launchctl refresh signals failed: {error}\n")
+                        # 再扫一次运行态进程，确保 kill 后的状态同步
                         html_module.write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_signals=True, run_signals_skip_btm=True, live=False)
                     except Exception as exc:
                         sys.stderr.write(f"asset-dashboard: launchctl refresh failed: {exc}\n")

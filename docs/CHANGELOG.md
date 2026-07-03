@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-03 18:15
+
+### [BUG] launchctl 停止服务后 dashboard 仍显示「运行中」
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 在 dashboard 系统信号 tab 点击「停止」百度网盘服务（`netdisk_service`）后，`launchctl` 实际已 unload，但页面刷新后仍显示「运行中」。 |
+| **根因/方案** | dashboard 在 `launchctl` 操作后虽然会在后台刷新信号，但等待时间仅 2 秒，且未显式重写静态 HTML；同时旧 dashboard 进程缓存了修改前的 API 模块。将等待时间延长至 4 秒，显式调用 `data.refresh_signals(skip_btm=True)` 并记录错误日志，随后调用 `html_module.write_dashboard(..., run_signals=True)` 重写页面；重启 dashboard 服务以加载最新代码。 |
+| **改动范围** | `lib/agent_assets_dashboard_api.py`、`docs/CHANGELOG.md` |
+| **影响面** | 系统信号 tab 的启动/停止/启用自启/禁用自启操作后，页面约 4 秒后会自动同步最新状态；若刷新失败会在服务端日志记录。 |
+| **状态** | ✅ 已完成 |
+
 ## 2026-07-03 13:45
 
 ### [REFACTOR] 开源打磨：个人信息外置、README、CONTRIBUTING、CI
