@@ -83,6 +83,7 @@ curl -sS http://127.0.0.1:17654/api/status | python3 -m json.tool
 
 ## 最近提交
 
+- `8271e3f` refactor: modularize dashboard, extract common lib, add unit tests, and complete docs
 - `3fa9d32` checkpoint: runtime observation landing + 8-category dashboard before refactor
 - `aba5f85` Redo dashboard: 8-category model, system signals, launchd toggle
 - `e2e2d62` Refine agent assets dashboard workflow
