@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-04 02:50
+
+### [BUG] 系统信号刷新失败：旧二进制 `agent-assets-macos-signals` 与 LaunchAgent 指向过期 `asset-dashboard`
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 系统信号 tab 顶部显示「系统信号刷新失败：unrecognized arguments: --skip-btm」；常驻 dashboard 的 LaunchAgent 指向的是 6 月的旧 `asset-dashboard` 二进制。 |
+| **根因/方案** | `install.sh` 把新版 `agent-assets-macos-signals` 安装为 `asset-macos-signals`，但 `lib/agent_assets_dashboard_paths.py` 优先查找旧名 `agent-assets-macos-signals`，该旧文件仍留在 `~/.local/bin` 且不支持 `--skip-btm`。同时 `~/Library/LaunchAgents/com.yang.agent-assets-dashboard.plist` 仍指向旧 `asset-dashboard`。修复路径解析优先查找 `asset-macos-signals`、保留旧名兜底；`install.sh` 安装后删除会冲突的旧名；更新 LaunchAgent plist 指向 `agent-assets-dashboard` 并重新加载；清理过期的 `asset-dashboard`、`asset-discover`、`asset-list`、`asset-projects`、`asset-register` 等旧二进制。 |
+| **改动范围** | `lib/agent_assets_dashboard_paths.py`、`scripts/install.sh`、`docs/CHANGELOG.md`；本机配置 `~/Library/LaunchAgents/com.yang.agent-assets-dashboard.plist`、`~/.local/bin` 旧二进制。 |
+| **影响面** | 系统信号刷新不再因旧二进制报错；常驻 dashboard 现在由新版 `agent-assets-dashboard` 启动；本机旧二进制清理后减少路径冲突。 |
+| **状态** | ✅ 已完成 |
+
 ## 2026-07-04 02:30
 
 ### [BUG] 修复 launchctl 操作后页面刷新不可靠，优化系统信号关联列展示

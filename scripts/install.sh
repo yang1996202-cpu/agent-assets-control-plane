@@ -26,6 +26,9 @@ install -m 0755 "$ROOT/bin/agent-assets-runtime" "$BIN_DIR/asset-runtime"
 install -m 0755 "$ROOT/bin/agent-assets-macos-signals" "$BIN_DIR/asset-macos-signals"
 install -m 0755 "$ROOT/bin/agent-assets-contract" "$BIN_DIR/agent-assets-contract"
 
+# 清理旧的、会跟新名称冲突的二进制，避免路径解析到过期版本
+rm -f "$BIN_DIR/agent-assets-macos-signals"
+
 render_template() {
   local src="$1"
   local dst="$2"

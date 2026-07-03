@@ -65,8 +65,11 @@ if not ASSET_RUNTIME.exists():
     if repo_local_runtime.exists():
         ASSET_RUNTIME = repo_local_runtime
 
-ASSET_MACOS_SIGNALS = pathlib.Path(os.environ.get("AGENT_ASSETS_MACOS_SIGNALS_CMD", str(STABLE_BIN_DIR / "agent-assets-macos-signals"))).expanduser()
+ASSET_MACOS_SIGNALS = pathlib.Path(os.environ.get("AGENT_ASSETS_MACOS_SIGNALS_CMD", str(STABLE_BIN_DIR / "asset-macos-signals"))).expanduser()
 if not ASSET_MACOS_SIGNALS.exists():
+    legacy_signals = STABLE_BIN_DIR / "agent-assets-macos-signals"
     repo_local_signals = SCRIPT_DIR / "agent-assets-macos-signals"
-    if repo_local_signals.exists():
+    if legacy_signals.exists():
+        ASSET_MACOS_SIGNALS = legacy_signals
+    elif repo_local_signals.exists():
         ASSET_MACOS_SIGNALS = repo_local_signals
