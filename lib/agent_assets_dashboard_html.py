@@ -222,7 +222,7 @@ CSS = """    :root {
     }
     .section { display: none; min-width: 0; overflow-x: auto; }
     .section.active { display: block; }
-    .signal-table { width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 16px; }
+    .signal-table { width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 16px; table-layout: fixed; }
     .signal-table caption {
       text-align: left;
       font-weight: 650;
@@ -233,25 +233,53 @@ CSS = """    :root {
       text-align: left;
       padding: 10px 8px;
       border-bottom: 1px solid var(--soft);
-      vertical-align: top;
+      vertical-align: middle;
     }
     .signal-table th { color: var(--muted); font-weight: 500; font-size: 13px; }
     .signal-table .subtle { color: var(--muted); font-size: 13px; }
     .signal-table .muted { color: var(--muted); }
     .signal-table .ctrl-icon { margin-right: 6px; }
-    .signal-table { table-layout: fixed; }
-    .signal-table .col-name { width: 28%; }
-    .signal-table .col-type { width: 12%; }
-    .signal-table .col-state { width: 10%; }
+    .signal-table .col-name { width: 24%; }
+    .signal-table .col-type { width: 10%; }
+    .signal-table .col-state { width: 9%; }
     .signal-table .col-resource { width: 14%; font-size: 13px; white-space: nowrap; }
-    .signal-table .col-ports { width: 12%; }
-    .signal-table .col-linked { width: 12%; }
-    .signal-table .action-cell { width: 16%; }
+    .signal-table .col-ports { width: 11%; white-space: nowrap; }
+    .signal-table .col-linked { width: 12%; white-space: nowrap; }
+    .signal-table .action-cell { width: 20%; white-space: nowrap; }
+    .signal-table .col-linked .chip {
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: inline-block;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+    .signal-table .linked-more {
+      display: inline-block;
+      padding: 1px 5px;
+      border-radius: 999px;
+      background: var(--soft);
+      font-size: 11px;
+      color: var(--muted);
+      vertical-align: middle;
+      margin-left: 4px;
+      white-space: nowrap;
+    }
     .signal-table td:first-child { word-break: break-word; }
     .signal-table td:first-child > div { margin-bottom: 2px; }
     .signal-table td:first-child .plist-path { font-family: ui-monospace, monospace; font-size: 12px; }
-    .action-stack { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+    .action-stack { display: inline-flex; flex-direction: column; gap: 3px; align-items: flex-start; }
     .action-stack .table-action { white-space: nowrap; }
+    .auto-state {
+      display: inline-block;
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 11px;
+      white-space: nowrap;
+      line-height: 1.2;
+    }
+    .auto-state.on { background: #dcfce7; color: #166534; }
+    .auto-state.off { background: #fee2e2; color: #b42318; }
     .cli-group {
       margin-bottom: 16px;
       background: #fff;
@@ -752,38 +780,83 @@ JS = """    (function() {
         });
       });
 
+      // Poll /api/status until the backend signals refresh has completed.
+      function waitForSignalsRefresh(startedAt, maxWaitMs, intervalMs) {
+        maxWaitMs = maxWaitMs || 12000;
+        intervalMs = intervalMs || 800;
+        return new Promise(function(resolve) {
+          var deadline = Date.now() + maxWaitMs;
+          function check() {
+            fetch('/api/status')
+              .then(function(res) { return res.json(); })
+              .then(function(status) {
+                var ts = status.last_signals_refresh_at;
+                if (ts && new Date(ts).getTime() > startedAt) {
+                  resolve({ok: true, refreshed: true});
+                  return;
+                }
+                if (Date.now() >= deadline) {
+                  resolve({ok: true, refreshed: false, timeout: true});
+                  return;
+                }
+                setTimeout(check, intervalMs);
+              })
+              .catch(function() {
+                if (Date.now() >= deadline) {
+                  resolve({ok: true, refreshed: false, timeout: true});
+                  return;
+                }
+                setTimeout(check, intervalMs);
+              });
+          }
+          check();
+        });
+      }
+
+      async function handleLaunchctl(btn, payload) {
+        var action = btn.dataset.action;
+        var plist = btn.dataset.plist;
+        var label = btn.dataset.label;
+        if (!action || (!plist && !label)) {
+          showToast('缺少服务标识，无法操作', 'err');
+          return;
+        }
+        btn.disabled = true;
+        showToast('操作中...', '');
+        var opStarted = Date.now();
+        try {
+          const res = await fetch('/api/launchctl', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json();
+          if (data.ok) {
+            var msg = data.action_zh || '操作成功';
+            if (data.keep_alive) {
+              msg += '（KeepAlive 服务停止后可能自动重启）';
+            }
+            showToast('操作成功，正在刷新状态...', 'ok');
+            await waitForSignalsRefresh(opStarted);
+            window.location.reload();
+          } else {
+            showToast(data.error || '操作失败', 'err');
+            btn.disabled = false;
+          }
+        } catch (e) {
+          showToast('请求失败', 'err');
+          btn.disabled = false;
+        }
+      }
+
       // Launchctl control
       document.querySelectorAll('.js-launchctl').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const label = btn.dataset.label;
-          const plist = btn.dataset.plist;
-          const action = btn.dataset.action;
-          if (!action) return;
-          if (!plist && !label) {
-            showToast('缺少服务标识，无法操作', 'err');
-            return;
-          }
-          btn.disabled = true;
-          try {
-            const res = await fetch('/api/launchctl', {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({plist: plist, label: label, action: action})
-            });
-            const data = await res.json();
-            if (data.ok) {
-              let msg = data.action_zh || '操作成功';
-              if (data.keep_alive) {
-                msg += '（该服务设置了 KeepAlive，停止后可能自动重启；如需彻底关闭，建议先禁用自启）';
-              }
-              showToast(msg, 'ok');
-            } else {
-              showToast(data.error || '操作失败', 'err');
-            }
-            window.location.reload();
-          } catch (e) {
-            showToast('请求失败', 'err');
-          }
+        btn.addEventListener('click', () => {
+          handleLaunchctl(btn, {
+            plist: btn.dataset.plist,
+            label: btn.dataset.label,
+            action: btn.dataset.action
+          });
         });
       });
 
@@ -794,27 +867,7 @@ JS = """    (function() {
           const action = btn.dataset.action;
           if (!plist || !action) return;
           if (!confirm('确认撤销这条 launchctl 操作？')) return;
-          btn.disabled = true;
-          try {
-            const res = await fetch('/api/launchctl', {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({plist: plist, action: action})
-            });
-            const data = await res.json();
-            if (data.ok) {
-              let msg = data.action_zh || '操作成功';
-              if (data.keep_alive) {
-                msg += '（该服务设置了 KeepAlive，停止后可能自动重启；如需彻底关闭，建议先禁用自启）';
-              }
-              showToast(msg, 'ok');
-            } else {
-              showToast(data.error || '操作失败', 'err');
-            }
-            window.location.reload();
-          } catch (e) {
-            showToast('请求失败', 'err');
-          }
+          await handleLaunchctl(btn, {plist: plist, action: action});
         });
       });
 
@@ -1082,6 +1135,14 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, run
         if is_agent_app or is_agent_host:
             agent_subject_count += 1
     needs_review = sum(1 for row in discovered_rows if not row.get("registered") and row.get("review_status", "new") == "new")
+    dashboard_state = lib.load_json(paths.DASHBOARD_STATE)
+    last_signals_refresh_at = dashboard_state.get("last_signals_refresh_at", "")
+    # 首次生成时初始化时间戳，让前端轮询有基准可比
+    if not last_signals_refresh_at:
+        last_signals_refresh_at = lib.now_iso()
+        dashboard_state["last_signals_refresh_at"] = last_signals_refresh_at
+        paths.DASHBOARD_STATE.parent.mkdir(parents=True, exist_ok=True)
+        lib.write_json(paths.DASHBOARD_STATE, dashboard_state)
     summary = {
         "assets": len(assets),
         "agent_subjects": agent_subject_count,
@@ -1109,6 +1170,7 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, run
         "scan_mode": discovered_meta.get("scan_mode", "daily"),
         "mcp_host_only": mcp_audit["summary"]["host_only"],
         "mcp_registry_only": mcp_audit["summary"]["registry_only"],
+        "last_signals_refresh_at": last_signals_refresh_at,
     }
     return html_text, summary
 

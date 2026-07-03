@@ -87,5 +87,32 @@ class TestUsageBarHtml(unittest.TestCase):
         self.assertIn('width:0.0%', html)
 
 
+class TestRenderLinkedAssets(unittest.TestCase):
+    def test_empty_returns_placeholder(self):
+        self.assertIn("未关联", render._render_linked_assets([]))
+
+    def test_single_shows_chip(self):
+        html = render._render_linked_assets(["agent-assets-system:stable_entrypoints"])
+        self.assertIn("agent-assets-system:stable_entrypoints", html)
+        self.assertNotIn("+", html)
+
+    def test_multiple_shows_first_and_count_badge(self):
+        html = render._render_linked_assets([
+            "agent-assets-system:stable_entrypoints",
+            "agent-assets-dashboard:source_paths",
+            "agent-assets-runtime:processes",
+        ])
+        self.assertIn("agent-assets-system:stable_entrypoints", html)
+        self.assertIn("+2", html)
+
+    def test_multiple_includes_full_list_in_title(self):
+        html = render._render_linked_assets([
+            "agent-assets-system:stable_entrypoints",
+            "agent-assets-dashboard:source_paths",
+        ])
+        self.assertIn('title="', html)
+        self.assertIn("agent-assets-dashboard:source_paths", html)
+
+
 if __name__ == "__main__":
     unittest.main()

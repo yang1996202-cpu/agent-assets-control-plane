@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-04 02:30
+
+### [BUG] 修复 launchctl 操作后页面刷新不可靠，优化系统信号关联列展示
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 系统信号 tab 点击「停止/启动/禁用自启/启用自启」后页面立即 reload，但后端异步刷新需 4 秒，用户常看到旧状态；「关联」列长 chip 把行撑得很高，表格难看。 |
+| **根因/方案** | 后端：`handle_launchctl()` 执行命令后立即用 `launchctl print` 校验真实状态并修正 `action_zh`；后台刷新失败时将 `_refresh_error` 写入 `macos-signals.json`，成功时将 `last_signals_refresh_at` 写入 `dashboard-state.json`。前端：`js-launchctl` / `js-launchctl-undo` 点击后禁用按钮、toast 提示，轮询 `/api/status` 的 `last_signals_refresh_at`，最多 12 秒后 reload。渲染：系统信号「关联」列最多显示 1 个 chip，超出用 `+N` badge 并 title 展示完整列表；表格列宽与垂直对齐优化，避免换行撑高。 |
+| **改动范围** | `lib/agent_assets_dashboard_api.py`、`lib/agent_assets_dashboard_html.py`、`lib/agent_assets_dashboard_render.py`、`lib/agent_assets_dashboard_paths.py`、`tests/test_dashboard_api.py`、`tests/test_dashboard_render.py`、`docs/PRD.md`、`docs/CHANGELOG.md` |
+| **影响面** | 系统信号 tab 的 launchctl 操作交互改为轮询等待；`/api/status` 新增 `last_signals_refresh_at`；系统信号表格「关联」列与操作区视觉更紧凑；不改动采集逻辑，向后兼容。 |
+| **状态** | ✅ 已完成 |
+
 ## 2026-07-04 02:24
 
 ### [FEAT] 系统进程 UI 清爽化，系统信号新增进程资源列

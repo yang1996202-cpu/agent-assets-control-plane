@@ -66,6 +66,57 @@ flowchart LR
     C --> D
 ```
 
+## 8. 迭代：launchctl 操作刷新可靠性与系统信号 UI 优化
+
+### 8.1 背景
+
+系统信号 tab 允许用户直接对 LaunchAgent 执行启动、停止、启用自启、禁用自启。但 launchctl 是异步生效的，后台完整刷新需要约 4 秒；前端旧的 `window.location.reload()` 在请求返回后立即刷新，导致用户经常看到旧状态，反馈「点了没反应」。同时，系统信号表格的「关联」列直接渲染所有 `linked_assets` chip，长标识符（如 `agent-assets-system:stable_entrypoints`）会把行撑得很高，视觉混乱。
+
+### 8.2 需求
+
+1. **操作后状态必须可靠同步**：
+   - 后端执行 launchctl 后立即用 `launchctl print` 做一次快速状态校验，得到真实的 running / disabled 状态。
+   - 用这个真实状态修正返回给前端的 `action_zh`。
+   - 保留后台异步完整刷新（约 4 秒后重跑 `agent-assets-macos-signals` 并重写 `dashboard.html`），但失败时把错误写入 `macos-signals.json` 的 `_refresh_error` 字段，成功时写入 `last_signals_refresh_at` 时间戳到 `~/.config/agent-assets/dashboard-state.json`。
+2. **前端轮询等待刷新完成**：
+   - 点击 launchctl 按钮后禁用按钮并显示 toast「操作中...」。
+   - 请求 `/api/launchctl` 成功后显示 toast「操作成功，正在刷新状态...」。
+   - 轮询 `/api/status` 检查 `last_signals_refresh_at`，最多等待 12 秒，检测到更新后再 reload。
+   - 失败时显示具体错误并恢复按钮。
+3. **系统信号「关联」列清爽化**：
+   - 最多显示 1 个 chip；超过 1 个时显示为「首个 chip + `+N`」badge。
+   - hover 时用 `title` 展示完整列表。
+   - 无关联显示「未关联」。
+4. **表格布局优化**：名称、资源、端口、操作列保持单行，避免 chip 或「自启·已启用/已禁用」span 撑高行。
+
+### 8.3 数据流
+
+```mermaid
+flowchart TD
+    A[用户点击 launchctl 按钮] --> B[前端禁用按钮并显示 toast]
+    B --> C[POST /api/launchctl]
+    C --> D[后端执行 launchctl]
+    D --> E[立即 launchctl print 校验状态]
+    E --> F[返回真实 action_zh 并追加 action-log]
+    F --> G[后台线程 sleep 4s 后 refresh_signals]
+    G --> H{刷新成功?}
+    H -->|是| I[写入 dashboard-state.json last_signals_refresh_at]
+    H -->|否| J[写入 macos-signals.json _refresh_error]
+    F --> K[前端收到成功响应]
+    K --> L[轮询 /api/status last_signals_refresh_at]
+    L -->|更新时间大于操作开始| M[window.location.reload]
+    L -->|12秒超时| M
+```
+
+### 8.4 涉及文件
+
+- `lib/agent_assets_dashboard_api.py`：快速状态校验、后台刷新错误/时间戳处理。
+- `lib/agent_assets_dashboard_html.py`：前端轮询 JS、表格 CSS、`/api/status` summary 增加时间戳字段。
+- `lib/agent_assets_dashboard_render.py`：关联列截断渲染、自启状态紧凑样式。
+- `lib/agent_assets_dashboard_paths.py`：新增 `DASHBOARD_STATE` 路径常量。
+- `tests/test_dashboard_api.py`：新增 launchctl 状态映射与刷新错误处理测试。
+- `tests/test_dashboard_render.py`：新增关联列截断测试。
+
 ## 7. 8 分类模型
 
 每资产只有一个主类型，形态标签可选：

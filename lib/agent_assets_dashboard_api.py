@@ -168,19 +168,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             )
             if http_status == 200:
                 # 后台异步刷新系统信号并重写 dashboard，避免前端等待超时
-                def _refresh_after_launchctl():
-                    try:
-                        import time
-                        # bootout 后 launchd/进程可能还有短暂延迟，先等 4 秒再扫描
-                        time.sleep(4)
-                        error = data.refresh_signals(skip_btm=True)
-                        if error:
-                            sys.stderr.write(f"asset-dashboard: launchctl refresh signals failed: {error}\n")
-                        # 再扫一次运行态进程，确保 kill 后的状态同步
-                        html_module.write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_signals=True, run_signals_skip_btm=True, live=False)
-                    except Exception as exc:
-                        sys.stderr.write(f"asset-dashboard: launchctl refresh failed: {exc}\n")
-                threading.Thread(target=_refresh_after_launchctl, daemon=True).start()
+                threading.Thread(target=_refresh_after_launchctl, kwargs={"skip_btm": True}, daemon=True).start()
             self.send_json(result, status=http_status)
             return
         if parsed.path == "/api/kill-process":
@@ -220,7 +208,7 @@ def _launchctl_status(label):
         if proc.returncode == 0:
             for line in proc.stdout.splitlines():
                 ls = line.strip()
-                if ls.startswith("state =") and "running" in ls:
+                if ls.startswith("state =") and "running" in ls and "not running" not in ls:
                     running = True
                 if ls.startswith("pid =") and not ls.rstrip().endswith("= 0"):
                     running = True
@@ -237,6 +225,73 @@ def _launchctl_status(label):
         except Exception:
             pass
     return running, auto_disabled
+
+
+def _load_dashboard_state():
+    """读取 dashboard 状态文件；不存在时返回空 dict。"""
+    return lib.load_json(paths.DASHBOARD_STATE)
+
+
+def _save_dashboard_state(state):
+    """原子写入 dashboard 状态文件。"""
+    paths.DASHBOARD_STATE.parent.mkdir(parents=True, exist_ok=True)
+    lib.write_json(paths.DASHBOARD_STATE, state)
+
+
+def _touch_last_signals_refresh_at():
+    """后台刷新成功后更新时间戳，供前端轮询判断刷新是否完成。"""
+    state = _load_dashboard_state()
+    state["last_signals_refresh_at"] = lib.now_iso()
+    _save_dashboard_state(state)
+
+
+def _record_signals_refresh_error(error):
+    """把后台刷新错误持久化到 macos-signals.json，让 build_dashboard 展示错误 banner。"""
+    raw = lib.load_json(paths.MACOS_SIGNALS)
+    if not isinstance(raw, dict):
+        raw = {}
+    summary = raw.setdefault("summary", {})
+    summary["_refresh_error"] = str(error)
+    raw["summary"] = summary
+    lib.write_json(paths.MACOS_SIGNALS, raw)
+
+
+def _clear_signals_refresh_error():
+    """后台刷新成功后清除 macos-signals.json 里的旧错误标记。"""
+    raw = lib.load_json(paths.MACOS_SIGNALS)
+    if isinstance(raw, dict) and isinstance(raw.get("summary"), dict) and "_refresh_error" in raw["summary"]:
+        del raw["summary"]["_refresh_error"]
+        lib.write_json(paths.MACOS_SIGNALS, raw)
+
+
+def _refresh_after_launchctl(skip_btm=True):
+    """launchctl 操作后的后台完整刷新。
+
+    背景：launchctl 命令返回后服务状态可能还有短暂延迟（如 KeepAlive 自动重启），
+    因此等待 4 秒后再重新采集系统信号并重写 dashboard。
+    设计意图：把「异步刷新 + 状态持久化」逻辑集中到这里，便于前端轮询和错误展示。
+    关键约束：
+    - 失败时把错误写入 macos-signals.json 的 _refresh_error，build_dashboard 会展示 banner。
+    - 成功时更新 dashboard-state.json 的 last_signals_refresh_at，前端轮询据此判断完成。
+    - 只调用一次 refresh_signals，避免重复运行采集脚本。
+    """
+    try:
+        import time
+        # bootout 后 launchd/进程可能还有短暂延迟，先等 4 秒再扫描
+        time.sleep(4)
+        error = data.refresh_signals(skip_btm=skip_btm)
+        if error:
+            _record_signals_refresh_error(error)
+            sys.stderr.write(f"asset-dashboard: launchctl refresh signals failed: {error}\n")
+        else:
+            _clear_signals_refresh_error()
+        # 再扫一次运行态进程，确保 kill 后的状态同步；不再重新跑 signals 采集
+        html_module.write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_signals=False, live=False)
+        if not error:
+            _touch_last_signals_refresh_at()
+    except Exception as exc:
+        _record_signals_refresh_error(str(exc))
+        sys.stderr.write(f"asset-dashboard: launchctl refresh failed: {exc}\n")
 
 
 def handle_launchctl(payload):
@@ -296,19 +351,31 @@ def handle_launchctl(payload):
         keep_alive = bool(plist_data.get("KeepAlive")) if isinstance(plist_data, dict) else False
         # bootout 时目标已经不存在 = 实际已停止，不要显示失败
         if action == "bootout" and no_such:
+            _running, _auto_disabled = _launchctl_status(real_label)
             return {
                 "ok": True,
                 "action": action,
                 "action_zh": "已停止",
                 "label": real_label,
-                "running": False,
-                "auto_disabled": False,
+                "running": _running,
+                "auto_disabled": _auto_disabled,
                 "keep_alive": keep_alive,
                 "already_stopped": True,
             }, 200
         return {"ok": False, "error": f"系统命令执行失败：{user_err}"}, 500
     running, auto_disabled = _launchctl_status(real_label)
-    action_zh = {"enable": "已启用开机自启", "disable": "已禁用开机自启", "bootstrap": "已启动", "bootout": "已停止"}.get(action, action)
+    base_zh = {"enable": "已启用开机自启", "disable": "已禁用开机自启", "bootstrap": "已启动", "bootout": "已停止"}.get(action, action)
+    # 用真实状态修正文案，避免 action_zh 与实际状态矛盾（如 KeepAlive 导致 bootout 后仍在跑）
+    if action == "bootout" and running:
+        action_zh = "已停止（KeepAlive 可能导致自动重启）"
+    elif action == "bootstrap" and not running:
+        action_zh = "已启动（进程尚未运行或启动失败）"
+    elif action == "disable" and not auto_disabled:
+        action_zh = "已禁用自启（状态待刷新确认）"
+    elif action == "enable" and auto_disabled:
+        action_zh = "已启用自启（状态待刷新确认）"
+    else:
+        action_zh = base_zh
     keep_alive = bool(plist_data.get("KeepAlive")) if isinstance(plist_data, dict) else False
     return {"ok": True, "action": action, "action_zh": action_zh, "label": real_label, "running": running, "auto_disabled": auto_disabled, "keep_alive": keep_alive}, 200
 

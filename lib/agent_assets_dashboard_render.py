@@ -577,6 +577,25 @@ def _launchctl_disabled_set():
         return set()
 
 
+def _render_linked_assets(linked):
+    """截断渲染系统信号的「关联」列。
+
+    背景：linked_assets 可能包含很长的 chip（如 `agent-assets-system:stable_entrypoints`），
+    全部渲染会把表格行撑得很高。
+    设计意图：最多显示 1 个 chip；超过 1 个时显示为「首个 chip + `+N`」badge，
+    并用 title 属性暴露完整列表，保持行高紧凑。
+    约束：无关联时返回「未关联」占位；传入值会被 lib.listify 统一处理。
+    """
+    values = lib.listify(linked)
+    if not values:
+        return '<span class="muted">未关联</span>'
+    first = lib.chip(values[0])
+    if len(values) == 1:
+        return first
+    full = ", ".join(str(v) for v in values)
+    return f'{first}<span class="linked-more" title="{lib.h(full)}">+{len(values) - 1}</span>'
+
+
 def _signal_row_html(row, disabled, resource_html):
     title, note = row.get("_human") or humanize_signal(row)
     raw_label = row.get("label") or row.get("name") or row.get("identifier") or "未命名"
@@ -648,7 +667,7 @@ def _signal_row_html(row, disabled, resource_html):
       <td class="col-state">{state_badge(state, state_label)}<span class="subtle">{lib.h(exit_text)}</span></td>
       <td class="col-resource">{lib.h(resource_html)}</td>
       <td class="col-ports"><span class="subtle">{lib.h(port_text)}</span></td>
-      <td class="col-linked">{render_chips(linked) if linked else '<span class="muted">未关联</span>'}</td>
+      <td class="col-linked">{_render_linked_assets(linked)}</td>
       <td class="action-cell">{actions}</td>
     </tr>
     """
