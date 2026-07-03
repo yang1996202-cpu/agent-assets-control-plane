@@ -240,6 +240,13 @@ CSS = """    :root {
     .signal-table .muted { color: var(--muted); }
     .signal-table .ctrl-icon { margin-right: 6px; }
     .signal-table { table-layout: fixed; }
+    .signal-table .col-name { width: 28%; }
+    .signal-table .col-type { width: 12%; }
+    .signal-table .col-state { width: 10%; }
+    .signal-table .col-resource { width: 14%; font-size: 13px; white-space: nowrap; }
+    .signal-table .col-ports { width: 12%; }
+    .signal-table .col-linked { width: 12%; }
+    .signal-table .action-cell { width: 16%; }
     .signal-table td:first-child { word-break: break-word; }
     .signal-table td:first-child > div { margin-bottom: 2px; }
     .signal-table td:first-child .plist-path { font-family: ui-monospace, monospace; font-size: 12px; }
@@ -400,26 +407,37 @@ CSS = """    :root {
       font-size: 13px;
       font-family: ui-monospace, monospace;
     }
+    .processes-panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 16px;
+    }
     .system-processes-table { width: 100%; border-collapse: collapse; font-size: 14px; }
     .system-processes-table th {
-      text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line);
+      text-align: left; padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfbf8;
       color: var(--muted); font-weight: 500; font-size: 13px;
     }
     .system-processes-table td {
-      padding: 12px 8px; border-bottom: 1px solid var(--soft); vertical-align: middle;
+      padding: 10px 12px; border-bottom: 1px solid var(--soft); vertical-align: middle;
     }
+    .system-processes-table tr:last-child td { border-bottom: 0; }
     .system-processes-table tr:hover td { background: #f9f9f7; }
-    .system-processes-table .col-name { width: 40%; }
-    .system-processes-table .col-cpu { width: 18%; }
-    .system-processes-table .col-rss { width: 18%; }
+    .system-processes-table .col-name { width: 44%; }
+    .system-processes-table .col-cpu { width: 16%; }
+    .system-processes-table .col-rss { width: 16%; }
     .system-processes-table .col-type { width: 10%; }
     .system-processes-table .col-action { width: 14%; }
     .system-processes-table .col-name strong {
-      display: block; font-weight: 600; font-size: 14px;
+      display: block; font-weight: 650; font-size: 14.5px;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
     }
     .system-processes-table .pid-hint {
       display: block; font-size: 12px; color: var(--muted); margin-top: 2px;
+      font-variant-numeric: tabular-nums;
     }
     .system-processes-table th.sortable {
       cursor: pointer; user-select: none;
@@ -429,19 +447,34 @@ CSS = """    :root {
     }
     .system-processes-table th.sortable.asc::after { content: "↑"; }
     .system-processes-table th.sortable.desc::after { content: "↓"; }
+    .system-processes-table th.sortable.asc,
+    .system-processes-table th.sortable.desc {
+      color: var(--text); font-weight: 650; background: #eceee8;
+    }
+    .usage-cell {
+      display: flex; align-items: center; gap: 8px;
+      min-width: 80px;
+    }
     .usage-bar {
-      position: relative; height: 20px; background: var(--soft); border-radius: 4px;
-      overflow: hidden; min-width: 60px;
+      flex: 1;
+      height: 6px;
+      background: var(--soft);
+      border-radius: 3px;
+      overflow: hidden;
+      min-width: 40px;
     }
     .usage-bar-fill {
-      position: absolute; top: 0; left: 0; height: 100%; border-radius: 4px;
+      height: 100%;
+      border-radius: 3px;
       transition: width 0.2s;
     }
-    .usage-bar.cpu .usage-bar-fill { background: #fecdd3; }
-    .usage-bar.mem .usage-bar-fill { background: #bfdbfe; }
-    .usage-bar-text {
-      position: relative; z-index: 1; font-size: 12px; line-height: 20px;
-      padding: 0 6px; color: var(--text);
+    .usage-bar.cpu .usage-bar-fill { background: #93c5fd; }
+    .usage-bar.mem .usage-bar-fill { background: #86efac; }
+    .usage-value {
+      font-size: 12px; color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      min-width: 3.5em; text-align: right;
     }
     .muted { color: var(--muted); }
     .refresh-status { color: var(--muted); font-size: 13px; margin-left: 10px; }
@@ -835,7 +868,7 @@ def build_html(
     runtime_section = render.render_runtime_rows(runtime_data) if runtime_data else '<p class="muted">运行态数据未加载。</p>'
     signals_refresh_error = (signals_meta or {}).get("_refresh_error", "")
     signals_error_banner = f'<div class="alert-banner">⚠️ 系统信号刷新失败：{lib.h(signals_refresh_error)}</div>' if signals_refresh_error else ""
-    signals_section = signals_error_banner + (render.render_macos_signals_rows(signals_rows) if signals_rows else '<p class="muted">系统信号未加载。</p>')
+    signals_section = signals_error_banner + (render.render_macos_signals_rows(signals_rows, process_list=all_processes) if signals_rows else '<p class="muted">系统信号未加载。</p>')
     cli_section = render.render_cli_section(entrypoints)
     action_log_section = render.render_action_log()
     system_processes_section = render.render_system_processes_rows(all_processes) if all_processes is not None else '<p class="muted">系统进程数据未加载。</p>'

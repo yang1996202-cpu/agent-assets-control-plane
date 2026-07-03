@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-04 02:24
+
+### [FEAT] 系统进程 UI 清爽化，系统信号新增进程资源列
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 系统进程 tab 视觉风格与其它板块不一致、表格信息噪音大；系统信号 tab 看不到 running 服务对应的 CPU / 内存占用。 |
+| **根因/方案** | 系统进程：统一使用卡片式面板、更克制的细进度条 + 数值布局、弱化 PID、高亮当前排序列，筛选按钮精简为全部 / 用户进程 / App / MCP / Dev Server / Support / system / unknown。系统信号：渲染层按 pid 匹配 `collect_all_processes()` 返回的进程列表，为 running 且 processes 非空的服务补充「资源」列，格式 `CPU X% · 内存 Y MB`。 |
+| **改动范围** | `lib/agent_assets_dashboard_render.py`、`lib/agent_assets_dashboard_html.py`、`tests/test_dashboard_render.py`、`docs/CHANGELOG.md` |
+| **影响面** | 系统进程 tab 视觉更清爽、排序与筛选行为不变；系统信号 tab 新增「资源」列，macos-signals.json 采集逻辑未改动；dashboard 生成后无需重启即可看到新静态页面。 |
+| **状态** | ✅ 已完成 |
+
 ## 2026-07-03 18:15
 
 ### [BUG] launchctl 停止服务后 dashboard 仍显示「运行中」

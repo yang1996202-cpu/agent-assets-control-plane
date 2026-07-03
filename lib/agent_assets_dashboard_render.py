@@ -577,7 +577,7 @@ def _launchctl_disabled_set():
         return set()
 
 
-def _signal_row_html(row, disabled):
+def _signal_row_html(row, disabled, resource_html):
     title, note = row.get("_human") or humanize_signal(row)
     raw_label = row.get("label") or row.get("name") or row.get("identifier") or "未命名"
     kind = row.get("_signal_kind") or "其他"
@@ -643,17 +643,19 @@ def _signal_row_html(row, disabled):
         name_cell += f'<div class="subtle">{lib.h(note)}</div>'
     return f"""
     <tr class="searchable" data-section="signals" data-control="{lib.h(control)}" data-filter-tags="{lib.h(filter_tags)}" data-text="{lib.h(raw_label)} {lib.h(title)} {lib.h(kind)} {lib.h(json.dumps(row, ensure_ascii=False))}">
-      <td>{name_cell}</td>
-      <td>{lib.h(kind)}</td>
-      <td>{state_badge(state, state_label)}<span class="subtle">{lib.h(exit_text)}</span></td>
-      <td><span class="subtle">{lib.h(port_text)}</span></td>
-      <td>{render_chips(linked) if linked else '<span class="muted">未关联</span>'}</td>
+      <td class="col-name">{name_cell}</td>
+      <td class="col-type">{lib.h(kind)}</td>
+      <td class="col-state">{state_badge(state, state_label)}<span class="subtle">{lib.h(exit_text)}</span></td>
+      <td class="col-resource">{lib.h(resource_html)}</td>
+      <td class="col-ports"><span class="subtle">{lib.h(port_text)}</span></td>
+      <td class="col-linked">{render_chips(linked) if linked else '<span class="muted">未关联</span>'}</td>
       <td class="action-cell">{actions}</td>
     </tr>
     """
 
 
-def render_macos_signals_rows(rows):
+def render_macos_signals_rows(rows, process_list=None):
+    """渲染「系统信号」tab；若传入 process_list，会给 running 行补充 CPU / 内存资源。"""
     if not rows:
         return '<p class="muted">还没有系统信号。运行 asset-macos-signals 生成。</p>'
     groups = {"user-launchd": [], "system-launchd": [], "app-running": [], "login-item": []}
@@ -665,6 +667,7 @@ def render_macos_signals_rows(rows):
             (r.get("_human") or ("", ""))[0],
         ))
     disabled = _launchctl_disabled_set()
+    process_lookup = _build_process_lookup(process_list)
 
     # 横向筛选栏：按可控性分组
     control_buttons = [f'<button class="filter active" data-filter="">全部 ({len(rows)})</button>']
@@ -702,11 +705,12 @@ def render_macos_signals_rows(rows):
         parts.append(f"""
         <table class="signal-table" data-control="{lib.h(key)}">
           <caption><span class="ctrl-icon">{icon}</span> <strong>{lib.h(label)}</strong> <span class="muted">({len(grp)})</span><span class="subtle"> — {lib.h(note)}</span></caption>
-          <thead><tr><th>名称</th><th>类型</th><th>状态</th><th>端口</th><th>关联</th><th class="action-cell">操作</th></tr></thead>
+          <thead><tr><th class="col-name">名称</th><th class="col-type">类型</th><th class="col-state">状态</th><th class="col-resource">资源</th><th class="col-ports">端口</th><th class="col-linked">关联</th><th class="action-cell">操作</th></tr></thead>
           <tbody>
         """)
         for row in grp:
-            parts.append(_signal_row_html(row, disabled))
+            resource_html = _signal_resource_text(row, process_lookup)
+            parts.append(_signal_row_html(row, disabled, resource_html))
         parts.append("</tbody></table>")
     return "\n".join(parts)
 
@@ -1056,22 +1060,94 @@ def _process_display_name(cmd):
 
 
 def _usage_bar_html(value, max_value, label, css_class):
-    """生成一个可视化进度条：value / max_value 的百分比宽度。"""
+    """生成一个克制的小进度条，类似 iOS / macOS 活动监视器的用量条。
+
+    设计意图：把数值和图形分离，减少单元格内的视觉噪音；
+             进度条只用来在同列中快速对比相对大小，不抢进程名的注意力。
+    约束：返回的 HTML 用在「系统进程」表格的 CPU / 内存列；max_value 为 0 时按 1 处理避免除零。
+    """
     try:
         pct = (float(value or 0) / max(float(max_value or 0), 1)) * 100
     except (TypeError, ValueError):
         pct = 0
     pct = min(100, max(0, pct))
     return f'''
-    <div class="usage-bar {lib.h(css_class)}" title="{lib.h(label)}">
-      <div class="usage-bar-fill" style="width:{pct:.1f}%"></div>
-      <span class="usage-bar-text">{lib.h(label)}</span>
+    <div class="usage-cell" title="{lib.h(label)}">
+      <div class="usage-bar {lib.h(css_class)}">
+        <div class="usage-bar-fill" style="width:{pct:.1f}%"></div>
+      </div>
+      <span class="usage-value">{lib.h(label)}</span>
     </div>
     '''
 
 
+def _build_process_lookup(processes):
+    """把进程列表按 pid 建成查找表，key 统一为字符串，方便与 signals 里的 pid 匹配。"""
+    lookup = {}
+    for p in processes or []:
+        pid = p.get("pid")
+        if pid is None:
+            continue
+        key = str(pid)
+        if key not in lookup:
+            lookup[key] = p
+    return lookup
+
+
+def _signal_resource_text(row, process_lookup):
+    """计算一个系统信号行对应的运行进程资源文本。
+
+    背景：signals 数据里只记录 pid，不记录 CPU / RSS；dashboard 已经在采进程列表，
+          可以按 pid 匹配，把资源用量补充显示在表格里。
+    设计意图：只读渲染层补充，不动 macos-signals.json 的采集逻辑。
+    约束：
+    - 仅对 running=true 且 processes 非空的行计算；其余返回 "—"。
+    - 多进程资源做聚合，因为有些服务会拉起多个子进程。
+    - 进程列表里匹配不到任何 pid 时返回 "—"。
+    """
+    if not row.get("running"):
+        return "—"
+    procs = row.get("processes") or []
+    if not procs:
+        return "—"
+
+    total_cpu = 0.0
+    total_rss = 0
+    matched = False
+    for p in procs:
+        pid = p.get("pid")
+        if pid is None:
+            continue
+        info = process_lookup.get(str(pid))
+        if not info:
+            continue
+        matched = True
+        try:
+            total_cpu += float(info.get("cpu") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            total_rss += int(info.get("rss") or 0)
+        except (TypeError, ValueError):
+            pass
+
+    if not matched:
+        return "—"
+
+    cpu_text = _format_cpu(total_cpu, show_zero=True)
+    rss_text = _format_rss(total_rss) if total_rss > 0 else "—"
+    return f"CPU {cpu_text} · 内存 {rss_text}"
+
+
 def render_system_processes_rows(processes):
-    """渲染「系统进程」tab：与其他 tab 风格一致的筛选 + 表格。"""
+    """渲染「系统进程」tab：清爽、克制的进程列表，风格与「运行态」「系统信号」保持一致。
+
+    设计意图：
+    - 进程名是最突出的信息，PID 作为辅助信息尽量弱化。
+    - CPU / 内存列只保留必要的小进度条 + 数值，避免大块彩色条抢注意力。
+    - 表头排序默认按内存降序，并高亮当前排序列。
+    - 筛选按钮保留：全部 / 用户进程 / App / MCP / Dev Server / Support / system / unknown。
+    """
     if not processes:
         return '<p class="muted">没有采集到系统进程数据。运行 asset-runtime --show-system 生成。</p>'
 
@@ -1108,12 +1184,12 @@ def render_system_processes_rows(processes):
     max_cpu = max((p["cpu"] for p in rows), default=0) or 1
     max_rss = max((p["rss"] for p in rows), default=0) or 1
 
-    # 筛选按钮
+    # 筛选按钮：全部 / 用户进程 / App / MCP / Dev Server / Support / system / unknown
     filter_buttons = [f'<button class="filter" data-filter="">全部 ({len(rows)})</button>']
     if non_system:
         filter_buttons.append(f'<button class="filter active" data-filter="user">用户进程 ({len(non_system)})</button>')
-    user_cats = [("app", "App"), ("mcp", "MCP"), ("agent-daemon", "Agent"), ("dev-server", "Dev Server"), ("support", "Support")]
-    other_cats = [(cat, cat) for cat in ["system", "unknown"] if cat_counts.get(cat)]
+    user_cats = [("app", "App"), ("mcp", "MCP"), ("dev-server", "Dev Server"), ("support", "Support")]
+    other_cats = [("system", "System"), ("unknown", "Unknown")]
     for cat, label in user_cats + other_cats:
         n = cat_counts.get(cat, 0)
         if n:
@@ -1131,7 +1207,7 @@ def render_system_processes_rows(processes):
         kill_btns = _kill_buttons_for_pids([pid], name) if pid != "?" else ""
         return (
             f'<tr class="searchable" data-section="system-processes" data-filter-tags="{lib.h(filter_tags)}">'
-            f'<td class="col-name"><strong title="{lib.h(p["cmd"])}">{lib.h(name)}</strong><span class="subtle pid-hint">PID {lib.h(pid)}</span></td>'
+            f'<td class="col-name"><strong title="{lib.h(p["cmd"])}">{lib.h(name)}</strong><span class="pid-hint">PID {lib.h(pid)}</span></td>'
             f'<td class="col-cpu" data-sort-value="{p["cpu"]:.3f}">{_usage_bar_html(p["cpu"], max_cpu, _format_cpu(p["cpu"], True), "cpu")}</td>'
             f'<td class="col-rss" data-sort-value="{p["rss"]}">{_usage_bar_html(p["rss"], max_rss, _format_rss(p["rss"]), "mem")}</td>'
             f'<td class="col-type">{type_badge}</td>'
@@ -1145,18 +1221,20 @@ def render_system_processes_rows(processes):
     <div class="filter-bar system-processes-filter-bar">
       {"".join(filter_buttons)}
     </div>
-    <table class="data-table system-processes-table" data-sortable>
-      <thead>
-        <tr>
-          <th class="col-name sortable" data-sort="name">进程</th>
-          <th class="col-cpu sortable" data-sort="cpu">CPU</th>
-          <th class="col-rss sortable" data-sort="rss">内存</th>
-          <th class="col-type">类型</th>
-          <th class="col-action">操作</th>
-        </tr>
-      </thead>
-      <tbody>{"\n".join(out_rows)}</tbody>
-    </table>
+    <div class="processes-panel">
+      <table class="data-table system-processes-table" data-sortable>
+        <thead>
+          <tr>
+            <th class="col-name sortable" data-sort="name">进程</th>
+            <th class="col-cpu sortable" data-sort="cpu">CPU</th>
+            <th class="col-rss sortable desc" data-sort="rss">内存</th>
+            <th class="col-type">类型</th>
+            <th class="col-action">操作</th>
+          </tr>
+        </thead>
+        <tbody>{"\n".join(out_rows)}</tbody>
+      </table>
+    </div>
     """
 
 
