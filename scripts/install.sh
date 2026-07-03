@@ -27,7 +27,23 @@ install -m 0755 "$ROOT/bin/agent-assets-macos-signals" "$BIN_DIR/asset-macos-sig
 install -m 0755 "$ROOT/bin/agent-assets-contract" "$BIN_DIR/agent-assets-contract"
 
 # 清理旧的、会跟新名称冲突的二进制，避免路径解析到过期版本
-rm -f "$BIN_DIR/agent-assets-macos-signals"
+# 这些旧名称已不再维护，留下会导致 dashboard 调用到不支持新参数的版本。
+rm -f \
+  "$BIN_DIR/agent-assets-macos-signals" \
+  "$BIN_DIR/asset-dashboard" \
+  "$BIN_DIR/asset-dashboard.bak"* \
+  "$BIN_DIR/asset-discover" \
+  "$BIN_DIR/asset-list" \
+  "$BIN_DIR/asset-projects" \
+  "$BIN_DIR/asset-register"
+
+# 清理早期版本遗留、当前代码已不再引用的缓存/报告/备份文件
+rm -f \
+  "$ASSETS_HOME/macos-signals-review.json" \
+  "$ASSETS_HOME/PROJECT_STATUS.md" \
+  "$ASSETS_HOME/skill-inventory-report.html" \
+  "$ASSETS_HOME/skill-inventory-report.md" \
+  "$ASSETS_HOME/registry.json.bak"*
 
 render_template() {
   local src="$1"

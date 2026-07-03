@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-04 02:55
+
+### [REFACTOR] install.sh 自动清理旧二进制与过期缓存文件
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 本机残留多个早期版本的二进制（`asset-dashboard`、`asset-discover` 等）和缓存/报告/备份文件，容易跟新版路径解析冲突，导致重复出现旧 bug。 |
+| **根因/方案** | `scripts/install.sh` 增加清理步骤：删除已废弃的 `asset-*` 旧二进制、删除当前代码不再引用的 `macos-signals-review.json`、`PROJECT_STATUS.md`、`skill-inventory-report.*`、`registry.json.bak*` 等文件。 |
+| **改动范围** | `scripts/install.sh`、`docs/CHANGELOG.md`；本机已手动清理 `~/.local/bin/` 旧二进制与 `~/.config/agent-assets/` 过期文件。 |
+| **影响面** | 重新运行 `install.sh` 会自动保持环境干净；减少旧文件导致的路径冲突和误调用。 |
+| **状态** | ✅ 已完成 |
+
 ## 2026-07-04 02:50
 
 ### [BUG] 系统信号刷新失败：旧二进制 `agent-assets-macos-signals` 与 LaunchAgent 指向过期 `asset-dashboard`
