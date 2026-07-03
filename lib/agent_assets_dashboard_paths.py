@@ -36,6 +36,7 @@ MCP_HEALTH_CACHE = pathlib.Path(os.environ.get("AGENT_ASSETS_MCP_HEALTH_CACHE", 
 OUT = pathlib.Path(os.environ.get("AGENT_ASSETS_DASHBOARD_HTML", str(ASSETS_HOME / "dashboard.html"))).expanduser()
 START_FILE = pathlib.Path(os.environ.get("AGENT_ASSETS_START_FILE", str(HOME / "AGENT_START_HERE.md"))).expanduser()
 ACTION_LOG = pathlib.Path(os.environ.get("AGENT_ASSETS_ACTION_LOG", str(ASSETS_HOME / "action-log.json"))).expanduser()
+PRODUCT_MAP = pathlib.Path(os.environ.get("AGENT_ASSETS_PRODUCT_MAP", str(ASSETS_HOME / "product-map.json"))).expanduser()
 CLAUDE = pathlib.Path(os.environ.get("AGENT_ASSETS_CLAUDE", str(STABLE_BIN_DIR / "claude"))).expanduser()
 
 ASSET_DISCOVER = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVER_CMD", str(STABLE_BIN_DIR / "agent-assets-discover"))).expanduser()

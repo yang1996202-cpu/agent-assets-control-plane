@@ -48,6 +48,7 @@ render_template "$ROOT/templates/agent-assets/AGENT_CONTRACT.md" "$ASSETS_HOME/A
 render_template "$ROOT/templates/agent-assets/README.md" "$ASSETS_HOME/README.md"
 render_template "$ROOT/templates/agent-assets/registry.example.json" "$ASSETS_HOME/registry.json"
 render_template "$ROOT/templates/agent-assets/discovery-review.example.json" "$ASSETS_HOME/discovery-review.json"
+render_template "$ROOT/templates/agent-assets/product-map.example.json" "$ASSETS_HOME/product-map.json"
 render_template "$ROOT/templates/mcp/registry.example.json" "$MCP_HOME/registry.json"
 
 printf '\nInstalled Agent Assets Control Plane.\n'

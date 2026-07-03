@@ -22,54 +22,35 @@ import agent_assets_dashboard_paths as paths
 
 
 # ---- 系统信号：厂商→产品人话映射 ----
-PRODUCT_MAP = [
-    ("openclaw", "OpenClaw 网关", "你的 OpenClaw agent 网关服务"),
-    ("gbrain", "gbrain 记忆服务", "你的 gbrain 本地记忆 MCP"),
-    ("cc-connect", "cc-connect 桥接", "你的消息桥接脚本"),
-    ("asset-dashboard", "本控制台", "就是这个 Agent Assets 控制台"),
-    ("new-api-macos", "new-api 网关", "你装的 AI API 网关"),
-    ("run_server.sh", "自定义脚本", "你自己的服务脚本"),
-    ("run_refresh_loop.sh", "自定义脚本", "你自己的刷新循环脚本"),
-    ("run_morning_brief.sh", "自定义脚本", "你自己的早报脚本"),
+# 默认只保留通用、无个人环境色彩的映射。用户可在 ~/.config/agent-assets/product-map.json
+# 中按自己机器增删；安装脚本会从 templates/agent-assets/product-map.example.json 复制一份。
+_DEFAULT_PRODUCT_MAP = [
+    ("asset-dashboard", "Agent Assets 控制台", "本 dashboard"),
     ("com.docker.vmnetd", "Docker 网络守护", "Docker 系统级虚拟网络守护"),
     ("com.docker.socket", "Docker socket", "Docker 系统级 socket 守护"),
     ("docker", "Docker", "Docker 容器引擎"),
-    ("贝锐向日葵", "向日葵", "贝锐 Oray 远程控制（含多个组件）"),
-    ("best oray", "向日葵", "贝锐 Oray 远程控制"),
-    ("oray", "向日葵", "贝锐 Oray 远程控制"),
-    ("todesk", "ToDesk", "ToDesk 远程控制（含卸载助手）"),
-    ("youqu", "ToDesk", "ToDesk 远程控制"),
-    ("clash-verge", "Clash Verge", "Clash Verge 网络代理"),
-    ("clash-ver", "Clash Verge", "Clash Verge 网络代理"),
-    ("clashxpro", "ClashX Pro", "ClashX Pro 网络代理"),
-    ("west2online", "ClashX 系列", "西二在线 ClashX 代理辅助"),
-    ("metacubex", "ClashX", "ClashX 网络代理"),
-    ("clashx", "ClashX", "ClashX 网络代理"),
-    ("sogou", "搜狗输入法", "搜狗输入法及语音/斗图插件"),
-    ("squirrel", "鼠须管", "RIME 鼠须管输入法"),
-    ("百度网盘", "百度网盘", "百度网盘"),
-    ("baidu", "百度网盘", "百度网盘"),
-    ("ninxsoft", "mist", "mist 系统镜像重装工具"),
-    ("mist", "mist", "mist 系统镜像重装工具（作者 Nindi Gill）"),
     ("google.keystone", "Google 自动更新", "Google 软件后台更新服务"),
     ("googleupdater", "Google 自动更新", "Google 软件后台更新服务"),
-    ("payguard", "支付宝控件", "支付宝安全控件"),
-    ("alipay", "支付宝", "支付宝相关"),
-    ("闪电说", "闪电说", "闪电说 App"),
-    ("tanwei", "闪电说", "闪电说（武汉探微）"),
-    ("codexbar", "CodexBar", "Codex 菜单栏辅助工具"),
-    ("com.openai.codex", "OpenAI Codex", "OpenAI Codex 应用"),
-    ("codex", "OpenAI Codex", "OpenAI Codex"),
-    ("ima.copilot", "腾讯 ima", "腾讯 ima.copilot 知识助手"),
-    ("autoclaw", "AutoClaw", "AutoClaw agent 应用"),
-    ("夸克", "夸克", "夸克浏览器"),
-    ("quark", "夸克", "夸克"),
-    ("donglemonitor", "donglemonitor", "加密狗/许可证监控（待你确认用途）"),
-    ("com.vortex", "Vortex 助手", "Vortex 应用辅助（待你确认）"),
-    ("drivemanagerd", "drivemanagerd", "驱动管理守护（待你确认归属）"),
     ("播客", "Apple 播客", "macOS 系统自带"),
     ("股市", "Apple 股市", "macOS 系统自带"),
 ]
+
+
+def _load_product_map():
+    """加载用户自定义的厂商→产品映射；没有或损坏时返回默认最小映射。"""
+    if paths.PRODUCT_MAP.exists():
+        try:
+            data = lib.load_json(paths.PRODUCT_MAP)
+            entries = data.get("map") if isinstance(data, dict) else data
+            if isinstance(entries, list):
+                return [tuple(item) for item in entries if isinstance(item, (list, tuple)) and len(item) >= 2]
+        except Exception:
+            pass
+    return _DEFAULT_PRODUCT_MAP
+
+
+PRODUCT_MAP = _load_product_map()
+
 
 
 CONTROL_META = {

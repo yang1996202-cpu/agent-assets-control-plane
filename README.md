@@ -1,105 +1,95 @@
 # Agent Assets Control Plane
 
-**本机运行态观测台**（2026-06 定位演进）。
+[![CI](https://github.com/yang1996202-cpu/agent-assets-control-plane/actions/workflows/ci.yml/badge.svg)](https://github.com/yang1996202-cpu/agent-assets-control-plane/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](pyproject.toml)
 
-A local control plane for AI-agent-facing tools.
+> **Local runtime observatory for AI-agent-facing tools on macOS.**
 
-> **定位演进**：最初是"AI Agent 资产控制面"——登记所有资产让 Agent 知道装了啥。
-> 实测预登记必然失败（工具流动快、手动维护零容错、registry 长期和实际脱节）：Agent 自己能查本机装了啥（多问一句即可），预登记是反向添乱。
-> 所以核心收缩为**观测运行态盲区**——什么在后台跑、有没有泄漏、有没有僵尸 dev server、哪些常驻、占哪些端口。
-> 这不需要维护纪律，跑一次扫一次。详见 `docs/architecture.md` 的 Runtime Observation。
+This project answers one question: **what is running on this machine right now?**
 
-四个观测入口：
+Agent stacks scatter tools across package managers, MCP servers hide in host configs, dev servers get forgotten, and launchd services silently auto-start. Pre-registering every tool in a static registry does not scale. Instead, Agent Assets Control Plane scans the local runtime on demand and shows you:
 
-- `agent-assets-dashboard` — 仪表盘 `http://127.0.0.1:17654`（MCP audit / 系统信号 / 发现候选 / runtime 盲区）
-- `asset-runtime` — 进程盲区扫描：泄漏（如 context7-mcp 被多 host 各拉一份）、僵尸 dev server、常驻 daemon、端口占用
-- `asset-macos-signals` — launchd 全景 + 开机自启 + 端口监听
-- `agent-assets-discover` — 磁盘上的 CLI / 工具入口清点
+- running processes (apps, agents, MCP servers, dev servers, system daemons)
+- memory and CPU usage per process
+- listening ports and who owns them
+- macOS launchd services, login items, and startup items
+- discovered CLI entrypoints and project roots
 
-> **退役**：`registry.json` 静态索引 + `agent-assets-register` 不再强制喂，当历史快照。
-> **保留**：Agent contract（路径指引）——Agent 查"X 装哪了"仍有用，按需查，不是预登记。
+It is read-first, opinionated-second: it does not move files or install software unless you explicitly ask.
 
-Two linked surfaces, one source of truth:
+## Platform
 
-- **Agent contract** — plain files that tell any new agent where local CLIs, MCP servers, skills, projects, and registries live.
-- **Human dashboard** — a browser UI that scans and visualizes the same assets so you can see what is installed, registered, or needs review.
-
-This project does **not** move package-manager internals into one directory. npm, uv, pip, Homebrew, and apps keep their own storage. It standardizes the control plane:
-
-- stable wrappers in `~/.local/bin`
-- registry files in `~/.config/agent-assets`
-- historical project index in `~/.config/agent-assets/projects.json`
-- MCP registry in `~/.config/mcp`
-- durable projects under `~/projects`
-- local dashboard at `http://127.0.0.1:17654/`
-
-## Why
-
-Agent stacks become unmanageable fast: tools scatter across package managers, MCP servers hide in host configs, and every new agent asks "where is X?"
-
-The fix is not "one folder for everything." It is a stable local contract plus a visible inventory.
-
-**但更深的盲区是运行态**：装得多、跑得多，后台一堆看不见的东西——MCP 被多个 host 各拉一份（泄漏）、开发预览服务器忘关（僵尸）、各种 daemon 常驻、端口被占。这些登记簿看不到（它们没绑 plist、不在 registry），只有按需扫描运行态才照得出来。观测台就是干这个的。
+**macOS only.** The dashboard relies on `launchctl`, `lsof`, and macOS-specific plist paths. Linux/Windows support would require separate collectors.
 
 ## Install
 
 ```bash
-git clone https://github.com/yang1996202-cpu/agent-assets-control-plane.git ~/projects/agent-assets-control-plane
-cd ~/projects/agent-assets-control-plane
+git clone https://github.com/yang1996202-cpu/agent-assets-control-plane.git
+cd agent-assets-control-plane
 ./scripts/install.sh
 ```
 
-Creates `~/AGENT_START_HERE.md`, registry files, and CLI wrappers.
+`install.sh` copies CLI wrappers to `~/.local/bin`, library modules to `~/.local/lib/agent-assets`, and config files to `~/.config/agent-assets`. Make sure `~/.local/bin` is on your `PATH`.
 
-## Run
+## Usage
 
 ```bash
-# Static dashboard
-agent-assets-dashboard
-
-# Live dashboard with one-click scan
+# Launch the live dashboard and open it in your browser
 agent-assets-dashboard --serve --open
 
-# --- 运行态观测（核心，按需跑、只读）---
-# 进程盲区：泄漏 / 僵尸 dev server / 常驻 daemon / 端口占用
+# Or generate a static HTML snapshot
+agent-assets-dashboard
+
+# Runtime scan from the terminal
 asset-runtime
-asset-runtime --json          # 结构化输出（dashboard 消费）
+asset-runtime --json
 
-# launchd 全景 + 开机自启 + 端口监听
+# macOS launchd / startup / login item scan
 asset-macos-signals
-
-# --- 静态清点（保留能力，不再强制登记）---
-# Scan from CLI
-agent-assets-discover
-
-# Index downloaded / cloned / legacy project folders without moving files
-agent-assets-projects
-
-# List registered assets
-agent-assets-list
-agent-assets-list mcp
-
-# Register a tool
-agent-assets-register \
-  --id example-tool \
-  --category cli \
-  --entrypoint ~/.local/bin/example-tool \
-  --source ~/projects/example-tool \
-  --note "What this tool does"
 ```
 
-## Tell A New Agent
+The live dashboard runs on `http://127.0.0.1:17654` and binds to localhost only.
 
-> Read `~/AGENT_START_HERE.md` first, then follow the local agent-assets rules.
+## What each tool does
 
-The agent inspects the registry and discovery output before asking you where a tool lives.
+| Tool | Purpose |
+|---|---|
+| `agent-assets-dashboard` | Browser UI: runtime, system signals, CLI tools, action log |
+| `asset-runtime` | Process scan: leaks, zombie dev servers, daemons, ports, CPU/memory |
+| `asset-macos-signals` | launchd plists, BTM, login items, system extensions, port listeners |
+| `agent-assets-discover` | Disk scan for CLI / MCP / agent entrypoints |
+| `agent-assets-projects` | Index `~/projects` and other project roots without moving files |
+| `agent-assets-list` | Print registry contents |
+| `agent-assets-register` | Manually register a tool (optional, registry is no longer required) |
+
+## Configuration
+
+After installation, config files live in `~/.config/agent-assets`:
+
+| File | Purpose |
+|---|---|
+| `registry.json` | Static asset registry (optional) |
+| `product-map.json` | Friendly names for system-signal vendors (e.g. map `oray` to `向日葵`) |
+| `discovery-review.json` | Review decisions for discovered candidates |
+| `action-log.json` | Dashboard kill / launchctl action history |
+
+Edit `product-map.json` to add your own vendor-to-name mappings. A full example ships at `templates/agent-assets/product-map.example.json`.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+All code is pure Python standard library; no `pip install` is required.
 
 ## Security
 
-Never put secrets into registries. Record only where the host stores them.
+- The dashboard binds to `127.0.0.1` only. Do not expose it on a public interface.
+- `kill-process` and `launchctl` actions are gated by whitelists and path checks.
+- Never store secrets in registry or config files; record only where your host stores them.
 
-The dashboard is for localhost only. Do not expose it on a public interface.
+## License
 
-## Status
-
-Early v0. 运行态观测台（核心）：`asset-runtime`（进程盲区）、`asset-macos-signals`（launchd / 开机自启）、`agent-assets-dashboard`（仪表盘）。保留能力：file-based registry、local scanner、project index、dashboard review、one-click cross-check。registry 登记退役为可选。Planned：schema validation、packaged install、runtime 视图深化（进程树反查 / CPU 内存排序）。
+MIT. See [LICENSE](LICENSE).
