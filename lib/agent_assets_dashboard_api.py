@@ -16,6 +16,7 @@ import pathlib
 import plistlib
 import subprocess
 import sys
+import threading
 import urllib.parse
 
 import agent_assets_common as lib
@@ -158,16 +159,46 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/launchctl":
             result, http_status = handle_launchctl(payload)
+            data.append_action_log(
+                "launchctl",
+                result.get("label", payload.get("label", "")),
+                payload.get("action", ""),
+                result.get("action_zh") or result.get("error", "unknown"),
+                detail=payload.get("plist", ""),
+            )
             if http_status == 200:
-                try:
-                    html_module.write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, live=False)
-                except Exception:
-                    pass
+                # 后台异步刷新系统信号并重写 dashboard，避免前端等待超时
+                def _refresh_after_launchctl():
+                    try:
+                        # bootout 后进程可能还有短暂延迟，等 2 秒再扫描确保状态准确
+                        import time
+                        time.sleep(2)
+                        html_module.write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_signals=True, run_signals_skip_btm=True, live=False)
+                    except Exception as exc:
+                        sys.stderr.write(f"asset-dashboard: launchctl refresh failed: {exc}\n")
+                threading.Thread(target=_refresh_after_launchctl, daemon=True).start()
             self.send_json(result, status=http_status)
             return
         if parsed.path == "/api/kill-process":
             result, http_status = handle_kill_process(payload)
+            data.append_action_log(
+                "kill-process",
+                str(result.get("pid", payload.get("pid", ""))),
+                payload.get("mode", ""),
+                result.get("verb") or result.get("error", "unknown"),
+            )
             self.send_json(result, status=http_status)
+            return
+        if parsed.path == "/api/refresh-all":
+            result, http_status = handle_refresh_all()
+            self.send_json(result, status=http_status)
+            return
+        if parsed.path == "/api/clear-action-log":
+            try:
+                data.clear_action_log()
+                self.send_json({"ok": True})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
         self.send_json({"ok": False, "error": "not found"}, status=404)
 
@@ -205,20 +236,31 @@ def _launchctl_status(label):
 
 
 def handle_launchctl(payload):
-    """执行用户级 LaunchAgent 的 enable/disable/bootstrap/bootout。严格白名单（~/Library/LaunchAgents）+ 从 plist 读真实 Label，不信任前端。返回 (result, http_status)。"""
+    """执行 LaunchAgent 的 enable/disable/bootstrap/bootout。
+
+    可操作范围：
+    - ~/Library/LaunchAgents/（用户级）
+    - /Library/LaunchAgents/（全局用户级，通常无需 sudo）
+    /Library/LaunchDaemons/ 等系统级目录仍禁止前端直接操作。
+
+    从 plist 读真实 Label，不信任前端。返回 (result, http_status)。
+    """
     plist = str(payload.get("plist") or "")
     action = str(payload.get("action") or "")
     if action not in {"enable", "disable", "bootstrap", "bootout"}:
         return {"ok": False, "error": "非法操作"}, 400
     home_agents = str(pathlib.Path.home() / "Library" / "LaunchAgents")
-    if not plist or not plist.startswith(home_agents + "/") or not os.path.isfile(plist):
-        return {"ok": False, "error": "plist 不在用户级目录(~/Library/LaunchAgents)或不存在"}, 400
+    global_agents = "/Library/LaunchAgents"
+    allowed_prefixes = [home_agents + "/", global_agents + "/"]
+    if not plist or not any(plist.startswith(p) for p in allowed_prefixes) or not os.path.isfile(plist):
+        reason = "找不到该服务的配置文件，无法从面板开关。它可能装在了系统守护目录，或 plist 已被删除"
+        return {"ok": False, "error": reason, "reason": "not_operable_launchagent"}, 400
     try:
         with open(plist, "rb") as fh:
             plist_data = plistlib.load(fh)
         real_label = str(plist_data.get("Label") or "").strip() if isinstance(plist_data, dict) else ""
     except Exception as exc:
-        return {"ok": False, "error": f"读取 plist 失败: {exc}"}, 400
+        return {"ok": False, "error": f"无法读取该服务的 plist 文件：{exc}"}, 400
     # Label fallback：空占位 plist（如 Google Keystone stub）读不到，按 文件名stem → 前端label 兜底
     if not real_label:
         real_label = os.path.splitext(os.path.basename(plist))[0]
@@ -228,7 +270,7 @@ def handle_launchctl(payload):
             real_label = cand
     # label 用于 domain-target(gui/uid/<label>)，含 / 会破坏解析，拒绝
     if not real_label or "/" in real_label or "\x00" in real_label:
-        return {"ok": False, "error": "无法确定 launchd Label（plist 为空且无可用文件名）"}, 400
+        return {"ok": False, "error": "无法识别该服务的 launchd Label，plist 可能为空或损坏"}, 400
     domain = f"gui/{os.getuid()}"
     if action == "bootstrap":
         cmd = ["launchctl", "bootstrap", domain, plist]
@@ -241,13 +283,23 @@ def handle_launchctl(payload):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     except Exception as exc:
-        return {"ok": False, "error": f"执行失败: {exc}"}, 500
+        return {"ok": False, "error": f"执行 launchctl 失败：{exc}"}, 500
     err = (proc.stderr or "").strip()
     if proc.returncode != 0:
-        return {"ok": False, "error": err or f"launchctl 退出码 {proc.returncode}"}, 500
+        user_err = err or f"launchctl 返回错误码 {proc.returncode}"
+        # KeepAlive 服务在 bootout 时可能已被自动重启，导致目标进程不存在
+        keep_alive = bool(plist_data.get("KeepAlive")) if isinstance(plist_data, dict) else False
+        if action == "bootout" and keep_alive and any(k in user_err.lower() for k in ("no such process", "no such service")):
+            return {
+                "ok": False,
+                "error": "停止失败：该服务设置了 KeepAlive，进程可能在自动重启。建议先「禁用自启」，再点「停止」。",
+                "keep_alive": True,
+            }, 500
+        return {"ok": False, "error": f"系统命令执行失败：{user_err}"}, 500
     running, auto_disabled = _launchctl_status(real_label)
     action_zh = {"enable": "已启用开机自启", "disable": "已禁用开机自启", "bootstrap": "已启动", "bootout": "已停止"}.get(action, action)
-    return {"ok": True, "action": action, "action_zh": action_zh, "label": real_label, "running": running, "auto_disabled": auto_disabled}, 200
+    keep_alive = bool(plist_data.get("KeepAlive")) if isinstance(plist_data, dict) else False
+    return {"ok": True, "action": action, "action_zh": action_zh, "label": real_label, "running": running, "auto_disabled": auto_disabled, "keep_alive": keep_alive}, 200
 
 
 def _is_kill_safe_pid(pid_str, cmd):
@@ -287,6 +339,25 @@ def _is_kill_safe_pid(pid_str, cmd):
     return True, "ok"
 
 
+def handle_refresh_all():
+    """刷新所有数据源：runtime、macos-signals、discovery、projects，并重新生成静态 HTML。"""
+    try:
+        if paths.ASSET_RUNTIME.exists():
+            subprocess.run([str(paths.ASSET_RUNTIME), "--json"], cwd=str(paths.HOME), capture_output=True, text=True, timeout=25)
+    except Exception:
+        pass
+    try:
+        if paths.ASSET_MACOS_SIGNALS.exists():
+            subprocess.run([str(paths.ASSET_MACOS_SIGNALS)], cwd=str(paths.HOME), capture_output=True, text=True, timeout=60)
+    except Exception:
+        pass
+    try:
+        html_module.write_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, live=False)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+    return {"ok": True}, 200
+
+
 def handle_kill_process(payload):
     """终止单个 runtime 进程。安全模型：白名单 + 禁系统路径 + Host 127.0.0.1（由 server 绑定保证）。返回 (result, http_status)。"""
     pid = str(payload.get("pid") or "")
@@ -323,10 +394,61 @@ def handle_kill_process(payload):
         return {"ok": False, "error": err or f"kill 退出码 {proc.returncode}", "pid": pid}, 500
     sys.stderr.write(f"asset-dashboard: kill OK pid={pid} mode={mode} cmd={cmd[:120]}\n")
     verb = "已发送 SIGTERM" if mode == "term" else "已发送 SIGKILL"
+    # 后台异步刷新运行态，让用户稍后看到进程已消失
+    def _refresh_after_kill():
+        try:
+            # kill 后进程可能还有短暂延迟，等 1 秒再扫描确保状态准确
+            import time
+            time.sleep(1)
+            html_module.write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_signals=True, run_signals_skip_btm=True, live=False)
+        except Exception as exc:
+            sys.stderr.write(f"asset-dashboard: kill refresh failed: {exc}\n")
+    threading.Thread(target=_refresh_after_kill, daemon=True).start()
     return {"ok": True, "pid": pid, "mode": mode, "verb": verb, "cmd": cmd}, 200
 
 
+def _cleanup_existing_dashboard(port):
+    """启动前清理占用目标端口的旧 dashboard 进程，避免多个实例互相覆盖数据。
+
+    通过 lsof 找到监听该端口的进程，只杀掉命令行包含 agent-assets-dashboard 的进程，
+    避免误杀其他服务。
+    """
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5
+        )
+        if proc.returncode != 0:
+            return
+        pids = set()
+        for line in proc.stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                pid = int(parts[1])
+            except ValueError:
+                continue
+            # 确认是 dashboard 进程才杀
+            ps = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=3)
+            cmd = (ps.stdout or "").strip()
+            if "agent-assets-dashboard" in cmd:
+                pids.add(pid)
+        for pid in sorted(pids):
+            sys.stderr.write(f"asset-dashboard: cleaning up old instance pid={pid} on port {port}\n")
+            try:
+                subprocess.run(["kill", "-TERM", str(pid)], capture_output=True, timeout=5)
+            except Exception:
+                pass
+        if pids:
+            import time
+            time.sleep(0.5)
+    except Exception:
+        pass
+
+
 def serve(host, port, open_browser=False):
+    _cleanup_existing_dashboard(port)
     server = http.server.ThreadingHTTPServer((host, port), DashboardHandler)
     url = f"http://{host}:{port}/"
     html_module.write_dashboard(run_discovery=True, refresh_mcp=False, live=False)

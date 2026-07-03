@@ -24,6 +24,44 @@ import agent_assets_dashboard_paths as paths
 RUNTIME_WHITELIST = {}
 
 
+def load_action_log():
+    """加载操作日志；文件不存在时返回空结构。"""
+    data = lib.load_json(paths.ACTION_LOG)
+    if not isinstance(data, dict):
+        return {"entries": []}
+    data.setdefault("entries", [])
+    return data
+
+
+def append_action_log(action, target, mode, result, detail=""):
+    """在操作日志前部追加一条记录，保留最近 200 条。
+
+    detail 用于存放可重放操作所需的额外上下文，如 launchctl 的 plist 路径。
+    """
+    log = load_action_log()
+    entries = log.setdefault("entries", [])
+    entries.insert(
+        0,
+        {
+            "time": lib.now_iso(),
+            "action": action,
+            "target": target,
+            "mode": mode,
+            "result": str(result),
+            "detail": detail,
+        },
+    )
+    log["entries"] = entries[:200]
+    log["updated_at"] = lib.now_iso()
+    lib.write_json(paths.ACTION_LOG, log)
+
+
+def clear_action_log():
+    """清空操作日志文件；文件不存在时静默成功。"""
+    if paths.ACTION_LOG.exists():
+        lib.write_json(paths.ACTION_LOG, {"entries": [], "updated_at": lib.now_iso()})
+
+
 def infer_source_path(raw_path, resolved_path, package_name):
     candidate = pathlib.Path(resolved_path or raw_path)
     if package_name and "node_modules" in candidate.parts:
@@ -293,7 +331,9 @@ def collect_entrypoints(agent_registry):
 
 
 def entrypoint_kind(entry, categories):
+    """判断一个稳定入口属于哪类。"""
     name = pathlib.Path(entry).name
+    lower = name.lower()
     if str(entry).endswith(".app"):
         return "app"
     if name.endswith("-mcp") or "mcp" in categories:
@@ -302,7 +342,14 @@ def entrypoint_kind(entry, categories):
         return "agent-command"
     if "dashboard" in categories:
         return "dashboard"
-    if "package-manager" in categories or "cli-runtime" in categories:
+    if "package-manager" in categories or "cli-runtime" in categories or "support" in categories:
+        return "runtime"
+    # 常见解释器 / 包管理器 / 运行时，即使没在 registry 里标 support，也归 runtime
+    runtime_prefixes = ("python", "pip", "node", "npm", "npx", "bun", "deno", "uv", "cargo", "rustc", "go", "ruby", "gem", "bundle", "php", "composer")
+    if lower.startswith(runtime_prefixes):
+        return "runtime"
+    # 系统级路径里的解释器工具
+    if "/python.framework/" in str(entry).lower() or "/usr/local/bin/node" == str(entry).lower():
         return "runtime"
     return "cli"
 
@@ -460,6 +507,31 @@ def refresh_projects():
 def collect_projects():
     data = lib.load_json(paths.PROJECT_INDEX)
     return data.get("projects", []), data.get("updated_at", ""), data
+
+
+def refresh_signals(skip_btm=False):
+    """重新运行 agent-assets-macos-signals 扫描并写入 macos-signals.json。
+
+    用于 launchctl 操作后同步刷新状态，让用户立即看到真实结果。
+    skip_btm=True 时跳过 sfltool 等可能触发密码提示的调用。
+    命令不存在或执行失败时返回错误字符串，成功时返回空字符串。
+    """
+    if not paths.ASSET_MACOS_SIGNALS.exists():
+        return f"agent-assets-macos-signals not found: {paths.ASSET_MACOS_SIGNALS}"
+    try:
+        cmd = [str(paths.ASSET_MACOS_SIGNALS)]
+        if skip_btm:
+            cmd.append("--skip-btm")
+        proc = subprocess.run(
+            cmd,
+            cwd=str(paths.HOME),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip() if proc.returncode != 0 else ""
+    except Exception as exc:
+        return f"agent-assets-macos-signals failed: {exc}"
 
 
 def collect_runtime():

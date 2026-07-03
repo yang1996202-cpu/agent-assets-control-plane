@@ -35,6 +35,7 @@ PROJECT_INDEX = pathlib.Path(
 MCP_HEALTH_CACHE = pathlib.Path(os.environ.get("AGENT_ASSETS_MCP_HEALTH_CACHE", str(ASSETS_HOME / "mcp-health-cache.json"))).expanduser()
 OUT = pathlib.Path(os.environ.get("AGENT_ASSETS_DASHBOARD_HTML", str(ASSETS_HOME / "dashboard.html"))).expanduser()
 START_FILE = pathlib.Path(os.environ.get("AGENT_ASSETS_START_FILE", str(HOME / "AGENT_START_HERE.md"))).expanduser()
+ACTION_LOG = pathlib.Path(os.environ.get("AGENT_ASSETS_ACTION_LOG", str(ASSETS_HOME / "action-log.json"))).expanduser()
 CLAUDE = pathlib.Path(os.environ.get("AGENT_ASSETS_CLAUDE", str(STABLE_BIN_DIR / "claude"))).expanduser()
 
 ASSET_DISCOVER = pathlib.Path(os.environ.get("AGENT_ASSETS_DISCOVER_CMD", str(STABLE_BIN_DIR / "agent-assets-discover"))).expanduser()
@@ -60,3 +61,9 @@ if not ASSET_RUNTIME.exists():
     repo_local_runtime = SCRIPT_DIR / "agent-assets-runtime"
     if repo_local_runtime.exists():
         ASSET_RUNTIME = repo_local_runtime
+
+ASSET_MACOS_SIGNALS = pathlib.Path(os.environ.get("AGENT_ASSETS_MACOS_SIGNALS_CMD", str(STABLE_BIN_DIR / "agent-assets-macos-signals"))).expanduser()
+if not ASSET_MACOS_SIGNALS.exists():
+    repo_local_signals = SCRIPT_DIR / "agent-assets-macos-signals"
+    if repo_local_signals.exists():
+        ASSET_MACOS_SIGNALS = repo_local_signals

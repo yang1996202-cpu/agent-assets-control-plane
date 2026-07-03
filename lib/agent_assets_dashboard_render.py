@@ -73,8 +73,8 @@ PRODUCT_MAP = [
 
 
 CONTROL_META = {
-    "user-launchd": ("🟢", "你的·可开关", "用户级 LaunchAgent，开机自启 + 现在跑/停都能在此控制"),
-    "system-launchd": ("⚪", "系统级·别动", "系统/全局级守护，需 sudo，前端不操作"),
+    "user-launchd": ("🟢", "你的·可开关", "~/Library/LaunchAgents 与 /Library/LaunchAgents，可在此控制"),
+    "system-launchd": ("⚪", "系统级·别动", "/Library/LaunchDaemons 等系统守护，需 sudo，前端不操作"),
     "app-running": ("⚡", "在跑", "正在运行的应用进程；停止=杀进程，被 launchd 管的会自启"),
     "login-item": ("🔑", "登录项", "登录项/后台项，在系统设置 > 通用 > 登录项里管理"),
 }
@@ -539,17 +539,29 @@ def humanize_signal(row):
 
 
 def is_safe_to_control(row):
-    """只有用户级 LaunchAgent（~/Library/LaunchAgents）才允许前端开关。系统级/全局级一律拒绝。"""
+    """用户级（~/Library/LaunchAgents）和全局用户级（/Library/LaunchAgents）允许前端开关。
+
+    系统守护目录（/Library/LaunchDaemons）需 sudo，前端不直接操作。
+    """
     plist = row.get("launch_plist") or ""
+    if not plist:
+        return False
     home_agents = str(pathlib.Path.home() / "Library" / "LaunchAgents")
-    return bool(plist) and row.get("launch_role") == "user-agent" and plist.startswith(home_agents + "/")
+    global_agents = "/Library/LaunchAgents"
+    role = row.get("launch_role")
+    if role == "user-agent" and plist.startswith(home_agents + "/"):
+        return True
+    if role == "global-agent" and plist.startswith(global_agents + "/"):
+        return True
+    return False
 
 
 def signal_control_key(row):
     """可控性分组键：user-launchd(可开关) / system-launchd(系统级) / app-running(在跑) / login-item(登录项)。"""
     plist = row.get("launch_plist") or ""
     if plist:
-        return "user-launchd" if row.get("launch_role") == "user-agent" else "system-launchd"
+        role = row.get("launch_role")
+        return "user-launchd" if role in {"user-agent", "global-agent"} else "system-launchd"
     if row.get("listeners") or row.get("running"):
         return "app-running"
     return "login-item"
@@ -607,37 +619,47 @@ def _signal_row_html(row, disabled):
     else:
         port_text = "—"
     exit_code = row.get("launch_last_exit_code")
-    exit_text = "" if exit_code in (None, "(never exited)") else f" · exit {exit_code}"
+    exit_text = "" if exit_code in (None, "", "(never exited)") else f" · exit {exit_code}"
     filter_tags = " ".join([state, control] + tags)
-    # 操作区：仅用户级 LaunchAgent 给开关；其余只读提示
+    # 操作区：仅用户级 LaunchAgent 且 plist 真实存在才给开关；其余只读提示
     actions = ""
     if safe and plist:
         cmd_label = row.get("label") or raw_label
         is_auto_disabled = cmd_label in disabled
         if state == "running":
-            run_btn = f'<button class="table-action js-launchctl" data-plist="{lib.h(plist)}" data-label="{lib.h(cmd_label)}" data-action="bootout">⏸ 停止</button>'
+            run_btn = f'<button class="table-action js-launchctl" title="立即停止该 LaunchAgent" data-plist="{lib.h(plist)}" data-label="{lib.h(cmd_label)}" data-action="bootout">⏸ 停止</button>'
         else:
-            run_btn = f'<button class="table-action js-launchctl" data-plist="{lib.h(plist)}" data-label="{lib.h(cmd_label)}" data-action="bootstrap">▶ 启动</button>'
+            run_btn = f'<button class="table-action js-launchctl" title="立即启动该 LaunchAgent" data-plist="{lib.h(plist)}" data-label="{lib.h(cmd_label)}" data-action="bootstrap">▶ 启动</button>'
         if is_auto_disabled:
-            auto_state = '<span class="auto-state off">自启·已禁用</span>'
-            auto_btn = f'<button class="table-action js-launchctl" data-plist="{lib.h(plist)}" data-label="{lib.h(cmd_label)}" data-action="enable">开机启用</button>'
+            auto_state = '<span class="auto-state off" title="当前不会随用户登录自动启动">自启·已禁用</span>'
+            auto_btn = f'<button class="table-action js-launchctl" title="允许该 LaunchAgent 随用户登录自动启动" data-plist="{lib.h(plist)}" data-label="{lib.h(cmd_label)}" data-action="enable">开机启用</button>'
         else:
-            auto_state = '<span class="auto-state on">自启·已启用</span>'
-            auto_btn = f'<button class="table-action js-launchctl" data-plist="{lib.h(plist)}" data-label="{lib.h(cmd_label)}" data-action="disable">禁用自启</button>'
+            auto_state = '<span class="auto-state on" title="当前会随用户登录自动启动">自启·已启用</span>'
+            auto_btn = f'<button class="table-action js-launchctl" title="禁止该 LaunchAgent 随用户登录自动启动" data-plist="{lib.h(plist)}" data-label="{lib.h(cmd_label)}" data-action="disable">禁用自启</button>'
         actions = f'<div class="action-stack">{run_btn}{auto_btn}{auto_state}</div>'
+    elif control == "user-launchd" and not safe:
+        # plist 被删除或不在用户级目录：明确告诉用户为什么不能操作，同时保留当前真实状态
+        home_agents = str(pathlib.Path.home() / "Library" / "LaunchAgents")
+        if plist and not plist.startswith(home_agents + "/"):
+            actions = '<span class="muted" title="plist 不在 ~/Library/LaunchAgents，前端无法开关">不在用户目录 · 不可操作</span>'
+        elif plist and not os.path.isfile(plist):
+            state_hint = "进程可能还在跑，但重启后无法自启" if state == "running" else "服务未运行且 plist 已丢失"
+            actions = f'<span class="muted" title="{lib.h(state_hint)}">plist 已删除 · 不可操作</span>'
+        else:
+            actions = '<span class="muted">不可操作</span>'
     elif control == "system-launchd":
-        actions = '<span class="muted">系统级·需 sudo</span>'
+        actions = '<span class="muted" title="位于 /Library/LaunchDaemons，需用 sudo 在终端执行 launchctl">系统守护 · 需 sudo</span>'
     elif control == "login-item":
         actions = '<span class="muted">系统设置管理</span>'
     else:
         actions = '<span class="muted">—</span>'
-    name_cell = f'<strong>{lib.h(title)}</strong>'
+    name_cell = f'<div><strong>{lib.h(title)}</strong></div>'
     if str(title) != str(raw_label):
-        name_cell += f'<span class="subtle">{lib.h(raw_label)}</span>'
+        name_cell += f'<div class="subtle">{lib.h(raw_label)}</div>'
     if plist:
-        name_cell += f'<span class="subtle plist-path">{lib.h(plist)}</span>'
+        name_cell += f'<div class="subtle plist-path">{lib.h(plist)}</div>'
     if note:
-        name_cell += f'<span class="subtle">{lib.h(note)}</span>'
+        name_cell += f'<div class="subtle">{lib.h(note)}</div>'
     return f"""
     <tr class="searchable" data-section="signals" data-control="{lib.h(control)}" data-filter-tags="{lib.h(filter_tags)}" data-text="{lib.h(raw_label)} {lib.h(title)} {lib.h(kind)} {lib.h(json.dumps(row, ensure_ascii=False))}">
       <td>{name_cell}</td>
@@ -662,14 +684,42 @@ def render_macos_signals_rows(rows):
             (r.get("_human") or ("", ""))[0],
         ))
     disabled = _launchctl_disabled_set()
-    parts = []
+
+    # 横向筛选栏：按可控性分组
+    control_buttons = [f'<button class="filter active" data-filter="">全部 ({len(rows)})</button>']
+    for key in ["user-launchd", "system-launchd", "app-running", "login-item"]:
+        grp = groups.get(key) or []
+        if grp:
+            icon, label, _ = CONTROL_META[key]
+            control_buttons.append(f'<button class="filter" data-filter="{lib.h(key)}">{icon} {lib.h(label)} ({len(grp)})</button>')
+
+    # 状态筛选
+    state_counts = {}
+    for row in rows:
+        if row.get("launch_state") == "running" or row.get("running"):
+            state_counts["running"] = state_counts.get("running", 0) + 1
+        elif row.get("launch_plist"):
+            state_counts["not-running"] = state_counts.get("not-running", 0) + 1
+        else:
+            state_counts["registered"] = state_counts.get("registered", 0) + 1
+    state_buttons = [
+        f'<button class="filter active" data-state-filter="">全部状态</button>',
+        f'<button class="filter" data-state-filter="running">运行中 ({state_counts.get("running", 0)})</button>',
+        f'<button class="filter" data-state-filter="not-running">未运行 ({state_counts.get("not-running", 0)})</button>',
+        f'<button class="filter" data-state-filter="registered">已登记 ({state_counts.get("registered", 0)})</button>',
+    ]
+
+    parts = [
+        f'<div class="filter-bar signals-filter-bar">{"".join(control_buttons)}</div>',
+        f'<div class="filter-bar signals-state-filter-bar">{"".join(state_buttons)}</div>',
+    ]
     for key in ["user-launchd", "system-launchd", "app-running", "login-item"]:
         grp = groups.get(key) or []
         if not grp:
             continue
         icon, label, note = CONTROL_META[key]
         parts.append(f"""
-        <table class="signal-table">
+        <table class="signal-table" data-control="{lib.h(key)}">
           <caption><span class="ctrl-icon">{icon}</span> <strong>{lib.h(label)}</strong> <span class="muted">({len(grp)})</span><span class="subtle"> — {lib.h(note)}</span></caption>
           <thead><tr><th>名称</th><th>类型</th><th>状态</th><th>端口</th><th>关联</th><th class="action-cell">操作</th></tr></thead>
           <tbody>
@@ -736,12 +786,12 @@ def _cwd_badge(cwd):
     return f'<a class="chip cwd-chip" href="{lib.h(href)}">{lib.h(cwd)}</a>'
 
 
-def _runtime_table_row(pid_or_count, type_badge, ports, cmd, cwd, pids_for_kill, cmd_short):
+def _runtime_table_row(pid_or_count, type_badge, ports, cmd, cwd, pids_for_kill, cmd_short, filter_tags=""):
     ports_html = ", ".join(ports) if ports else '<span class="muted">—</span>'
     cwd_html = _cwd_badge(cwd)
     kill_btns = _kill_buttons_for_pids(pids_for_kill, cmd_short) if pids_for_kill else ""
     return (
-        f'<tr class="searchable" data-section="runtime">'
+        f'<tr class="searchable" data-section="runtime" data-filter-tags="{lib.h(filter_tags)}">'
         f'<td class="col-pid">{pid_or_count}</td>'
         f'<td class="col-type">{type_badge}</td>'
         f'<td class="col-ports">{ports_html}</td>'
@@ -758,16 +808,16 @@ def _kill_buttons_for_pids(pids, cmd_short):
         pid = pids[0]
         return (
             f'<div class="action-cell">'
-            f'<button class="table-action js-kill-process" data-pid="{lib.h(pid)}" data-cmd="{lib.h(cmd_short)}" data-mode="term">终止</button>'
-            f'<button class="table-action js-kill-process danger" data-pid="{lib.h(pid)}" data-cmd="{lib.h(cmd_short)}" data-mode="kill">强制</button>'
+            f'<button class="table-action js-kill-process" title="优雅终止 (SIGTERM)，给进程清理机会" data-pid="{lib.h(pid)}" data-cmd="{lib.h(cmd_short)}" data-mode="term">终止</button>'
+            f'<button class="table-action js-kill-process danger" title="强制终止 (SIGKILL)，立即结束，无法拦截" data-pid="{lib.h(pid)}" data-cmd="{lib.h(cmd_short)}" data-mode="kill">强制</button>'
             f'</div>'
         )
     # Multi-instance: one "terminate all" / "force all" button that sends all pids.
     pids_json = lib.h(str(list(pids)).replace("'", '"'))
     return (
         f'<div class="action-cell">'
-        f'<button class="table-action js-kill-process" data-pid="{pids_json}" data-cmd="{lib.h(cmd_short)}" data-mode="term">全部终止</button>'
-        f'<button class="table-action js-kill-process danger" data-pid="{pids_json}" data-cmd="{lib.h(cmd_short)}" data-mode="kill">全部强制</button>'
+        f'<button class="table-action js-kill-process" title="优雅终止 (SIGTERM)" data-pid="{pids_json}" data-cmd="{lib.h(cmd_short)}" data-mode="term">全部终止</button>'
+        f'<button class="table-action js-kill-process danger" title="强制终止 (SIGKILL)" data-pid="{pids_json}" data-cmd="{lib.h(cmd_short)}" data-mode="kill">全部强制</button>'
         f'</div>'
     )
 
@@ -814,13 +864,13 @@ def render_runtime_rows(data):
     # 泄漏组
     if leaks:
         parts.append(f"""
-        <div class="runtime-group">
-          <div class="runtime-group-title">
+        <details class="runtime-group" open>
+          <summary class="runtime-group-title">
             <span>⚠️</span>
             <strong>泄漏</strong>
             <span class="muted">({len(leaks)})</span>
             <span class="subtle">— 同一指纹出现多次</span>
-          </div>
+          </summary>
           {table_head}
         """)
         for row in leaks:
@@ -843,20 +893,20 @@ def render_runtime_rows(data):
             type_badge = _runtime_type_badge(cat)
             cmd_short = _runtime_cmd_short(fp)
             cwd = sorted(cwds)[0] if cwds else ""
-            parts.append(_runtime_table_row(pid_html, type_badge, sorted(ports_set), fp, cwd, pids, cmd_short))
-        parts.append("</tbody></table></div>")
+            parts.append(_runtime_table_row(pid_html, type_badge, sorted(ports_set), fp, cwd, pids, cmd_short, filter_tags=f"{cat} leak"))
+        parts.append("</tbody></table></details>")
 
     # 僵尸 dev server 组
     zombie_rows = [p for p in processes if p.get("severity") == "zombie"]
     if zombie_rows:
         parts.append(f"""
-        <div class="runtime-group">
-          <div class="runtime-group-title">
+        <details class="runtime-group" open>
+          <summary class="runtime-group-title">
             <span>🧟</span>
             <strong>僵尸 Dev server</strong>
             <span class="muted">({len(zombie_rows)})</span>
             <span class="subtle">— serve / 监听类 dev server 还挂着</span>
-          </div>
+          </summary>
           {table_head}
         """)
         for p in sorted(zombie_rows, key=lambda r: r.get("pid", "")):
@@ -871,8 +921,9 @@ def render_runtime_rows(data):
                 p.get("cwd", ""),
                 [pid],
                 cmd_short,
+                filter_tags="dev-server zombie",
             ))
-        parts.append("</tbody></table></div>")
+        parts.append("</tbody></table></details>")
 
     # 按 category 分组
     non_alert = [p for p in processes if p.get("severity") not in ("leak", "zombie")]
@@ -895,13 +946,13 @@ def render_runtime_rows(data):
             continue
         aggregated = _aggregate_runtime_by_fp(grp)
         parts.append(f"""
-        <div class="runtime-group">
-          <div class="runtime-group-title">
+        <details class="runtime-group" open>
+          <summary class="runtime-group-title">
             <span>{icon}</span>
             <strong>{lib.h(label)}</strong>
             <span class="muted">({len(grp)})</span>
             <span class="subtle">— {lib.h(note)}</span>
-          </div>
+          </summary>
           {table_head}
         """)
         for g in aggregated:
@@ -925,25 +976,26 @@ def render_runtime_rows(data):
                 cwd,
                 pids_for_kill,
                 display_cmd,
+                filter_tags=cat,
             ))
-        parts.append("</tbody></table></div>")
+        parts.append("</tbody></table></details>")
 
     # 端口占用组
     if ports:
         port_rows = sorted(ports.items())
         parts.append(f"""
-        <div class="runtime-group">
-          <div class="runtime-group-title">
+        <details class="runtime-group" open>
+          <summary class="runtime-group-title">
             <span>🔌</span>
             <strong>端口占用</strong>
             <span class="muted">({len(port_rows)})</span>
-          </div>
+          </summary>
           <div class="ports-bar">
         """)
         for port_key, pid_list in port_rows:
             pids = lib.listify(pid_list)
             parts.append(f'<span class="port" title="PID: {lib.h(", ".join(str(x) for x in pids))}">{lib.h(port_key)}</span>')
-        parts.append("</div></div>")
+        parts.append("</div></details>")
 
     if len(parts) <= 1:
         parts.append('<p class="muted">当前没有运行态数据。</p>')
@@ -1135,35 +1187,159 @@ def render_runtime_filter_bar():
     return """
     <div class="filter-bar runtime-filter-bar">
       <button class="filter active" data-filter="">全部</button>
-      <button class="filter" data-filter="agent-mcp">Agent / MCP</button>
+      <button class="filter" data-filter="mcp">MCP</button>
+      <button class="filter" data-filter="agent-daemon">Agent</button>
       <button class="filter" data-filter="dev-server">Dev Server</button>
+      <button class="filter" data-filter="support-system">支撑 / 系统</button>
       <button class="filter" data-filter="other">其他</button>
     </div>
     """
 
 
 def render_cli_entrypoints(entrypoints):
-    rows = []
-    for row in sorted(entrypoints, key=lambda r: r.get("path", "")):
-        path = row.get("path", "")
-        name = pathlib.Path(path).name or path
-        state = row.get("state", "missing")
-        state_label = label_for_state(state)
-        path_html = _cwd_badge(path) if path else '<span class="muted">—</span>'
-        rows.append(f"""
-        <tr class="searchable" data-section="entrypoints" data-text="{lib.h(name)} {lib.h(path)} {lib.h(state)}">
-          <td><code>{lib.h(name)}</code></td>
-          <td>{path_html}</td>
-          <td><span class="state state-{lib.h(state.replace('_', '-'))}">{lib.h(state_label)}</span></td>
+    """已废弃：CLI 入口现在放在独立 tab 中展示，请使用 render_cli_section。"""
+    return ""
+
+
+def render_cli_section(entrypoints):
+    """渲染 CLI 工具独立 tab：顶部横向筛选 + 单一大表格。
+
+    不再用嵌套 details，用户直接点筛选按钮切换类别，一屏看完。
+    对 kind=cli 的入口再按「是否在 ~/.local/bin 下」细分为 local_cli / other_cli。
+    """
+    if not entrypoints:
+        return '<p class="muted">没有找到 CLI 入口。</p>'
+
+    groups = {}
+    for row in entrypoints:
+        kind = row.get("kind", "other")
+        if kind == "cli":
+            path = str(row.get("path", ""))
+            if path.startswith(str(lib.STABLE_BIN_DIR) + "/"):
+                kind = "local_cli"
+            else:
+                kind = "other_cli"
+        groups.setdefault(kind, []).append(row)
+
+    order = [
+        ("agent-command", "Agent 命令"),
+        ("mcp-wrapper", "MCP 包装器"),
+        ("local_cli", "本机 CLI 工具"),
+        ("other_cli", "其他 CLI 入口"),
+        ("runtime", "运行时 / 支撑"),
+        ("dashboard", "控制台"),
+        ("app", "应用入口"),
+        ("other", "其他"),
+    ]
+
+    # 只渲染有数据的分组按钮
+    filter_buttons = [f'<button class="filter active" data-filter="">全部 ({len(entrypoints)})</button>']
+    for kind, label in order:
+        rows = groups.get(kind, [])
+        if rows:
+            filter_buttons.append(f'<button class="filter" data-filter="{lib.h(kind)}">{lib.h(label)} ({len(rows)})</button>')
+
+    all_rows = []
+    for kind, _label in order:
+        for row in groups.get(kind, []):
+            all_rows.append((kind, row))
+
+    body = _cli_entrypoint_rows(all_rows)
+    return f"""
+    <div class="filter-bar cli-filter-bar">
+      {"".join(filter_buttons)}
+    </div>
+    <table class="data-table cli-table">
+      <thead><tr><th>路径</th><th>类型</th><th>状态</th><th>归属</th></tr></thead>
+      <tbody>{body}</tbody>
+    </table>
+    """
+
+
+def _cli_entrypoint_rows(rows):
+    out = []
+    for kind, row in rows:
+        owner_text = ", ".join(row.get("owners", [])) if row.get("owners") else "未登记归属"
+        filter_tags = kind
+        out.append(f"""
+        <tr class="searchable" data-section="cli" data-filter-tags="{lib.h(filter_tags)}">
+          <td>{lib.chip(row.get("path", ""))}</td>
+          <td>{state_badge(kind)}</td>
+          <td>{state_badge(row.get("state", "unknown"))}</td>
+          <td>{lib.h(owner_text)}</td>
         </tr>
         """)
-    body = "\n".join(rows) if rows else '<tr><td colspan="3" class="muted">没有找到 CLI 入口。</td></tr>'
+    return "\n".join(out)
+
+
+def render_action_log():
+    """渲染操作记录 tab：展示用户在 dashboard 上的 kill / launchctl 操作历史，并支持撤销 launchctl。
+
+    设计意图：
+    - 结果列只显示简短状态（成功/失败），避免技术性错误文案撑坏表格。
+    - 失败原因默认折叠，用户需要时才展开看详情。
+    - 提供清空记录按钮，方便用户清理过期或测试记录。
+    """
+    log = data.load_action_log()
+    entries = log.get("entries", [])
+    if not entries:
+        return '<p class="muted">暂无操作记录。终止进程或开关 LaunchAgent 后会自动记录。</p>'
+
+    launchctl_undo_map = {
+        "bootstrap": "bootout",
+        "bootout": "bootstrap",
+        "enable": "disable",
+        "disable": "enable",
+    }
+
+    rows = []
+    for entry in entries[:50]:
+        action = entry.get("action", "")
+        mode = entry.get("mode", "")
+        detail = entry.get("detail", "")
+        result_text = str(entry.get("result", ""))
+        # 判断成功/失败：后端成功时返回 "已..."，失败时包含「无法」「失败」「错误」等词
+        lower_result = result_text.lower()
+        is_ok = result_text.startswith("已") and not any(w in lower_result for w in ("失败", "错误", "无法"))
+        if is_ok:
+            status_badge = '<span class="log-status ok">成功</span>'
+            detail_html = ""
+        else:
+            status_badge = '<span class="log-status err">失败</span>'
+            # 失败原因折叠展示，避免撑坏表格
+            detail_html = f'<details class="log-detail"><summary>查看原因</summary><pre>{lib.h(result_text)}</pre></details>'
+
+        undo_btn = ""
+        if action == "launchctl" and detail and mode in launchctl_undo_map:
+            undo_action = launchctl_undo_map[mode]
+            undo_label = {"bootout": "停止", "bootstrap": "启动", "enable": "启用自启", "disable": "禁用自启"}.get(undo_action, undo_action)
+            undo_btn = f'<button class="table-action js-launchctl-undo" data-plist="{lib.h(detail)}" data-action="{lib.h(undo_action)}" data-original="{lib.h(mode)}">撤销：{lib.h(undo_label)}</button>'
+
+        mode_label = mode
+        if action == "launchctl":
+            mode_label = {"bootstrap": "启动", "bootout": "停止", "enable": "启用自启", "disable": "禁用自启"}.get(mode, mode)
+        elif action == "kill-process":
+            mode_label = {"term": "优雅终止", "kill": "强制终止"}.get(mode, mode)
+
+        rows.append(f"""
+        <tr>
+          <td class="col-time">{lib.h(entry.get("time", ""))}</td>
+          <td class="col-action">{lib.h(action)}</td>
+          <td class="col-target">{lib.h(entry.get("target", ""))}</td>
+          <td class="col-mode">{lib.h(mode_label)}</td>
+          <td class="col-result">{status_badge}{detail_html}</td>
+          <td class="col-undo">{undo_btn}</td>
+        </tr>
+        """)
     return f"""
     <div class="card">
-      <div class="card-title">本机 CLI 入口</div>
-      <table class="data-table">
-        <thead><tr><th>名称</th><th>路径</th><th>状态</th></tr></thead>
-        <tbody>{body}</tbody>
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
+        <span>操作记录（最近 50 条）</span>
+        <button class="table-action js-clear-action-log" title="清空所有操作记录">清空记录</button>
+      </div>
+      <table class="data-table action-log-table">
+        <thead><tr><th>时间</th><th>动作</th><th>目标</th><th>模式</th><th>结果</th><th>撤销</th></tr></thead>
+        <tbody>{"\n".join(rows)}</tbody>
       </table>
     </div>
     """

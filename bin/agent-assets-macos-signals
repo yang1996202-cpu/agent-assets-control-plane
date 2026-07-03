@@ -294,23 +294,48 @@ def linked_assets(paths, text, refs):
     return linked
 
 
+def _word_boundary_re(pattern):
+    """为短标识符生成带单词边界的正则，避免 'cc-connect' 匹配到任意命令行子串。"""
+    escaped = re.escape(pattern)
+    return re.compile(rf"(?<![a-z0-9_-]){escaped}(?![a-z0-9_-])", re.I)
+
+
 def match_processes(item, processes):
-    patterns = []
-    for value in (item.get("label"), item.get("name"), item.get("identifier")):
+    """按 plist 中的标识符/路径匹配实际进程。
+
+    长标识符（如完整 bundle id）和完整路径允许子串匹配；
+    短名字（如 cc-connect）必须作为独立单词出现，避免把搜索/脚本命令误判为服务进程。
+    """
+    # 严格匹配：完整 label/identifier 和完整路径
+    strict_patterns = []
+    for value in (item.get("label"), item.get("identifier")):
         value = lib.normalize_identifier(value)
         if value and len(value) >= 4:
-            patterns.append(value.lower())
+            strict_patterns.append(value.lower())
     for path in item.get("paths", []):
         if path:
-            patterns.append(path.lower())
-            basename = pathlib.Path(path).name.lower()
-            if len(basename) >= 4 and basename not in GENERIC_PROCESS_NAMES and not basename.endswith(".plist"):
-                patterns.append(basename)
-    patterns = sorted(set(patterns), key=len, reverse=True)
+            strict_patterns.append(path.lower())
+
+    # 单词边界匹配：短名字和可执行文件名
+    word_patterns = []
+    name = lib.normalize_identifier(item.get("name"))
+    if name and len(name) >= 4:
+        word_patterns.append(_word_boundary_re(name))
+    for path in item.get("paths", []):
+        if not path:
+            continue
+        basename = pathlib.Path(path).name.lower()
+        if len(basename) >= 4 and basename not in GENERIC_PROCESS_NAMES and not basename.endswith(".plist"):
+            word_patterns.append(_word_boundary_re(basename))
+
+    strict_patterns = sorted(set(strict_patterns), key=len, reverse=True)
     matches = []
     for proc in processes:
         args_l = proc["args"].lower()
-        if any(pattern and pattern in args_l for pattern in patterns):
+        if any(pattern and pattern in args_l for pattern in strict_patterns):
+            matches.append(proc)
+            continue
+        if any(rx.search(proc["args"]) for rx in word_patterns):
             matches.append(proc)
     return matches[:8]
 
@@ -391,9 +416,9 @@ def upsert(items, key, **values):
         "paths": [],
         "sources": [],
     })
-    for scalar in ("label", "name", "identifier", "developer", "team_identifier", "launch_role", "launch_state", "launch_pid", "launch_last_exit_code", "launch_plist"):
+    for scalar in ("label", "name", "identifier", "developer", "team_identifier", "launch_role", "launch_state", "launch_pid", "launch_available", "launch_last_exit_code", "launch_plist"):
         value = values.get(scalar)
-        if value and not item.get(scalar):
+        if value is not None and not item.get(scalar):
             item[scalar] = value
     lib.append_unique(item, "paths", values.get("paths", []))
     lib.append_unique(item, "sources", values.get("sources", []))
@@ -447,6 +472,7 @@ def build_items(raw):
             launch_role=row["role"],
             launch_state=launch.get("state", ""),
             launch_pid=launch.get("pid", ""),
+            launch_available=launch.get("available", True),
             launch_last_exit_code=launch.get("last_exit_code", ""),
             launch_plist=row["plist"],
             launch_run_at_load=row.get("run_at_load"),
@@ -466,8 +492,10 @@ def build_items(raw):
             listeners_by_pid.setdefault(listener["pid"], []).append(listener)
     for item in items.values():
         launch_pid = str(item.get("launch_pid") or "")
+        launch_available = item.get("launch_available", True)
         matched = [proc for proc in processes if str(proc["pid"]) == launch_pid] if launch_pid.isdigit() else []
-        if not matched:
+        if not matched and launch_available is not False:
+            # launchctl 明确报告服务不存在时，不再模糊匹配，避免把命令行里的名字误判为进程
             matched = match_processes(item, processes)
         item["processes"] = matched
         item["running"] = bool(matched) or item.get("launch_state") == "running" or bool(item.get("launch_pid"))
@@ -519,13 +547,13 @@ def summarize(items, raw):
     return summary
 
 
-def scan():
+def scan(skip_btm=False):
     raw = {
-        "btm": parse_btm(),
+        "btm": {"records": [], "raw_error": "", "returncode": 0} if skip_btm else parse_btm(),
         "launch_plists": parse_launch_plists(),
         "privileged_helpers": parse_privileged_helpers(),
-        "system_extensions": parse_system_extensions(),
-        "login_items": parse_login_items(),
+        "system_extensions": parse_system_extensions() if not skip_btm else {"extensions": [], "raw_error": "", "returncode": 0},
+        "login_items": parse_login_items() if not skip_btm else [],
         "processes": parse_processes(),
         "listeners": parse_listeners(),
     }
@@ -554,9 +582,10 @@ def main():
     parser = argparse.ArgumentParser(description="Index macOS login/background/launchd/service traces without changing them.")
     parser.add_argument("--json", action="store_true", help="Print the full JSON payload.")
     parser.add_argument("--no-write", action="store_true", help="Do not write macos-signals.json.")
+    parser.add_argument("--skip-btm", action="store_true", help="Skip BTM/system_extensions/login_items to avoid password prompts on some systems.")
     args = parser.parse_args()
 
-    payload = scan()
+    payload = scan(skip_btm=args.skip_btm)
     if not args.no_write:
         lib.write_json(OUT, payload)
     if args.json:

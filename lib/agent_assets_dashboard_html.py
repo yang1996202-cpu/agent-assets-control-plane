@@ -77,7 +77,7 @@ CSS = """    :root {
       font-size: 14px;
     }
     .nav button.active { background: #eceee8; font-weight: 650; }
-    main { padding: 28px 32px 60px; min-width: 0; }
+    main { padding: 28px 32px 60px; min-width: 0; overflow-x: auto; }
     h1 { margin: 0 0 6px; font-size: 28px; }
     .sub { color: var(--muted); font-size: 14px; }
     .topbar {
@@ -136,6 +136,36 @@ CSS = """    :root {
     .alert-item.ok { background: #f0fdf4; border-color: #86efac; }
     .alert-item b { display: block; font-size: 26px; }
     .alert-item span { color: var(--muted); font-size: 13px; }
+    .alert-banner {
+      background: #fff7ed;
+      border: 1px solid #fdba74;
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-bottom: 16px;
+      color: #9a3412;
+      font-size: 14px;
+    }
+    .toast {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      z-index: 9999;
+      max-width: 360px;
+      padding: 12px 16px;
+      border-radius: 10px;
+      font-size: 14px;
+      color: #1f2328;
+      background: #fff;
+      border: 1px solid var(--line);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.12);
+      opacity: 0;
+      transform: translateY(-10px);
+      transition: opacity 0.2s, transform 0.2s;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast-ok { background: #f0fdf4; border-color: #86efac; color: #14532d; }
+    .toast-err { background: #fef2f2; border-color: #fecaca; color: #7f1d1d; }
     .data-table {
       width: 100%;
       border-collapse: collapse;
@@ -155,7 +185,42 @@ CSS = """    :root {
       vertical-align: top;
     }
     .data-table tr:hover td { background: #f9f9f7; }
-    .section { display: none; min-width: 0; }
+    .action-log-table { table-layout: fixed; }
+    .action-log-table .col-time { width: 16%; white-space: nowrap; }
+    .action-log-table .col-action { width: 12%; }
+    .action-log-table .col-target { width: 20%; word-break: break-word; }
+    .action-log-table .col-mode { width: 12%; }
+    .action-log-table .col-result { width: 25%; }
+    .action-log-table .col-undo { width: 15%; }
+    .log-status {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .log-status.ok { background: #e1f5e8; color: var(--green); }
+    .log-status.err { background: #fde8e6; color: var(--red); }
+    .log-detail {
+      margin-top: 6px;
+      font-size: 13px;
+    }
+    .log-detail summary {
+      color: var(--blue);
+      cursor: pointer;
+      user-select: none;
+    }
+    .log-detail pre {
+      margin: 6px 0 0;
+      padding: 8px;
+      background: #f6f6f3;
+      border-radius: 6px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+      font-size: 12px;
+    }
+    .section { display: none; min-width: 0; overflow-x: auto; }
     .section.active { display: block; }
     .signal-table { width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 16px; }
     .signal-table caption {
@@ -174,15 +239,51 @@ CSS = """    :root {
     .signal-table .subtle { color: var(--muted); font-size: 13px; }
     .signal-table .muted { color: var(--muted); }
     .signal-table .ctrl-icon { margin-right: 6px; }
-    .runtime-group { margin-bottom: 24px; }
-    .runtime-group-title {
+    .signal-table { table-layout: fixed; }
+    .signal-table td:first-child { word-break: break-word; }
+    .signal-table td:first-child > div { margin-bottom: 2px; }
+    .signal-table td:first-child .plist-path { font-family: ui-monospace, monospace; font-size: 12px; }
+    .action-stack { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+    .action-stack .table-action { white-space: nowrap; }
+    .cli-group {
+      margin-bottom: 16px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .cli-group summary {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 14px;
+      font-size: 15px;
+      font-weight: 650;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+    }
+    .cli-group summary::-webkit-details-marker { display: none; }
+    .cli-group table { border-top: 1px solid var(--line); }
+    .runtime-group {
+      margin-bottom: 16px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .runtime-group summary {
       display: flex;
       align-items: center;
       gap: 8px;
       font-size: 15px;
       font-weight: 650;
-      margin-bottom: 8px;
+      padding: 12px 14px;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
     }
+    .runtime-group summary::-webkit-details-marker { display: none; }
     .runtime-group-title .muted { color: var(--muted); font-weight: normal; }
     .runtime-group-title .subtle { color: var(--muted); font-weight: normal; font-size: 13px; margin-left: 4px; }
     .runtime-table {
@@ -190,10 +291,6 @@ CSS = """    :root {
       border-collapse: collapse;
       font-size: 14px;
       table-layout: fixed;
-      background: #fff;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: hidden;
     }
     .runtime-table th, .runtime-table td {
       padding: 10px 12px;
@@ -308,16 +405,43 @@ CSS = """    :root {
 
 
 JS = """    (function() {
+      function showToast(message, type) {
+        const toast = document.createElement('div');
+        toast.className = 'toast ' + (type ? 'toast-' + type : '');
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        requestAnimationFrame(() => toast.classList.add('show'));
+        setTimeout(() => {
+          toast.classList.remove('show');
+          setTimeout(() => toast.remove(), 200);
+        }, 3000);
+      }
       const tabs = document.querySelectorAll('.nav button[data-tab]');
       const sections = document.querySelectorAll('.section');
+      function switchTab(tabName, updateHash) {
+        const targetBtn = Array.from(tabs).find(b => b.dataset.tab === tabName);
+        const targetSection = document.querySelector('section[data-section="' + tabName + '"]');
+        if (!targetBtn || !targetSection) return;
+        tabs.forEach(b => b.classList.remove('active'));
+        sections.forEach(s => s.classList.remove('active'));
+        targetBtn.classList.add('active');
+        targetSection.classList.add('active');
+        if (updateHash !== false) {
+          history.replaceState(null, '', '#tab=' + tabName);
+        }
+      }
       tabs.forEach(btn => {
         btn.addEventListener('click', () => {
-          tabs.forEach(b => b.classList.remove('active'));
-          sections.forEach(s => s.classList.remove('active'));
-          btn.classList.add('active');
-          document.querySelector('section[data-section="' + btn.dataset.tab + '"]').classList.add('active');
+          switchTab(btn.dataset.tab);
         });
       });
+      // 页面加载时根据 URL hash 恢复 tab
+      (function() {
+        const m = location.hash.match(/^#tab=([a-z-]+)$/);
+        if (m && m[1]) {
+          switchTab(m[1], false);
+        }
+      })();
 
       // Runtime filter buttons
       document.querySelectorAll('.runtime-filter-bar .filter').forEach(btn => {
@@ -329,9 +453,83 @@ JS = """    (function() {
             const tags = (row.dataset.filterTags || '').split(/\\s+/);
             let visible = false;
             if (!filter) { visible = true; }
-            else if (filter === 'agent-mcp') { visible = tags.includes('mcp') || tags.includes('agent-daemon'); }
+            else if (filter === 'mcp') { visible = tags.includes('mcp'); }
+            else if (filter === 'agent-daemon') { visible = tags.includes('agent-daemon'); }
             else if (filter === 'dev-server') { visible = tags.includes('dev-server') || tags.includes('zombie'); }
-            else if (filter === 'other') { visible = tags.includes('support') || tags.includes('unknown') || tags.includes('system'); }
+            else if (filter === 'support-system') { visible = tags.includes('support') || tags.includes('system'); }
+            else if (filter === 'other') { visible = tags.includes('unknown'); }
+            row.style.display = visible ? '' : 'none';
+          });
+          // 隐藏无可见行的分组
+          document.querySelectorAll('.runtime-group').forEach(g => {
+            const visibleRows = g.querySelectorAll('.searchable:not([style*="display: none"])');
+            g.style.display = visibleRows.length ? '' : 'none';
+          });
+        });
+      });
+
+      // CLI filter buttons
+      document.querySelectorAll('.cli-filter-bar .filter').forEach(btn => {
+        btn.addEventListener('click', () => {
+          document.querySelectorAll('.cli-filter-bar .filter').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          const filter = btn.dataset.filter;
+          document.querySelectorAll('.cli-table .searchable[data-section="cli"]').forEach(row => {
+            const tags = (row.dataset.filterTags || '').split(/\\s+/);
+            const visible = !filter || tags.includes(filter);
+            row.style.display = visible ? '' : 'none';
+          });
+        });
+      });
+
+      // Signals filter buttons
+      document.querySelectorAll('.signals-filter-bar .filter').forEach(btn => {
+        btn.addEventListener('click', () => {
+          document.querySelectorAll('.signals-filter-bar .filter').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          applySignalsFilter();
+        });
+      });
+
+      // Signals state filter buttons
+      document.querySelectorAll('.signals-state-filter-bar .filter').forEach(btn => {
+        btn.addEventListener('click', () => {
+          document.querySelectorAll('.signals-state-filter-bar .filter').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          applySignalsFilter();
+        });
+      });
+
+      function applySignalsFilter() {
+        const controlFilter = (document.querySelector('.signals-filter-bar .filter.active') || {}).dataset.filter || '';
+        const stateFilter = (document.querySelector('.signals-state-filter-bar .filter.active') || {}).dataset.stateFilter || '';
+        document.querySelectorAll('.signal-table').forEach(table => {
+          const control = table.dataset.control || '';
+          const controlMatch = !controlFilter || control === controlFilter;
+          let hasVisibleRow = false;
+          table.querySelectorAll('.searchable[data-section="signals"]').forEach(row => {
+            const tags = (row.dataset.filterTags || '').split(/\\s+/);
+            const stateMatch = !stateFilter || tags.includes(stateFilter);
+            const visible = controlMatch && stateMatch;
+            row.style.display = visible ? '' : 'none';
+            if (visible) hasVisibleRow = true;
+          });
+          table.style.display = controlMatch && hasVisibleRow ? '' : 'none';
+        });
+      }
+
+      // Generic filter-chip buttons (CLI, assets, projects, etc.)
+      document.querySelectorAll('.filter-chip').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const section = btn.dataset.filterSection;
+          const filter = btn.dataset.filter;
+          const container = btn.closest('.card') || document.querySelector('section[data-section="' + section + '"]');
+          if (!container) return;
+          container.querySelectorAll('.filter-chip[data-filter-section="' + section + '"]').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          container.querySelectorAll('.searchable[data-section="' + section + '"]').forEach(row => {
+            const tags = (row.dataset.filterTags || '').split(/\\s+/);
+            const visible = !filter || tags.includes(filter);
             row.style.display = visible ? '' : 'none';
           });
         });
@@ -361,6 +559,28 @@ JS = """    (function() {
         });
       }
 
+      // Refresh all data sources
+      const refreshAllBtn = document.getElementById('refresh-all');
+      if (refreshAllBtn) {
+        refreshAllBtn.addEventListener('click', async () => {
+          refreshAllBtn.disabled = true;
+          refreshStatus.textContent = '全量刷新中（可能需几十秒）...';
+          try {
+            const res = await fetch('/api/refresh-all', {method: 'POST'});
+            const data = await res.json();
+            if (data.ok) {
+              window.location.reload();
+            } else {
+              refreshStatus.textContent = data.error || '刷新失败';
+            }
+          } catch (e) {
+            refreshStatus.textContent = '网络错误';
+          } finally {
+            refreshAllBtn.disabled = false;
+          }
+        });
+      }
+
       // Refresh signals
       const sigRefresh = document.getElementById('refresh-signals');
       const sigStatus = document.getElementById('signals-status');
@@ -386,10 +606,14 @@ JS = """    (function() {
               body: JSON.stringify({pid: pid, mode: mode})
             });
             const data = await res.json();
-            alert(data.result || data.error || '未知结果');
+            if (data.ok) {
+              showToast(data.verb || '操作成功', 'ok');
+            } else {
+              showToast(data.error || '操作失败', 'err');
+            }
             window.location.reload();
           } catch (e) {
-            alert('请求失败');
+            showToast('请求失败', 'err');
           }
         });
       });
@@ -398,21 +622,84 @@ JS = """    (function() {
       document.querySelectorAll('.js-launchctl').forEach(btn => {
         btn.addEventListener('click', async () => {
           const label = btn.dataset.label;
-          const domain = btn.dataset.domain;
+          const plist = btn.dataset.plist;
           const action = btn.dataset.action;
-          if (!label || !action) return;
+          if (!action) return;
+          if (!plist && !label) {
+            showToast('缺少服务标识，无法操作', 'err');
+            return;
+          }
           btn.disabled = true;
           try {
             const res = await fetch('/api/launchctl', {
               method: 'POST',
               headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({label: label, domain: domain, action: action})
+              body: JSON.stringify({plist: plist, label: label, action: action})
             });
             const data = await res.json();
-            alert(data.result || data.error || '未知结果');
+            if (data.ok) {
+              let msg = data.action_zh || '操作成功';
+              if (data.keep_alive) {
+                msg += '（该服务设置了 KeepAlive，停止后可能自动重启；如需彻底关闭，建议先禁用自启）';
+              }
+              showToast(msg, 'ok');
+            } else {
+              showToast(data.error || '操作失败', 'err');
+            }
             window.location.reload();
           } catch (e) {
-            alert('请求失败');
+            showToast('请求失败', 'err');
+          }
+        });
+      });
+
+      // Undo launchctl from action log
+      document.querySelectorAll('.js-launchctl-undo').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const plist = btn.dataset.plist;
+          const action = btn.dataset.action;
+          if (!plist || !action) return;
+          if (!confirm('确认撤销这条 launchctl 操作？')) return;
+          btn.disabled = true;
+          try {
+            const res = await fetch('/api/launchctl', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({plist: plist, action: action})
+            });
+            const data = await res.json();
+            if (data.ok) {
+              let msg = data.action_zh || '操作成功';
+              if (data.keep_alive) {
+                msg += '（该服务设置了 KeepAlive，停止后可能自动重启；如需彻底关闭，建议先禁用自启）';
+              }
+              showToast(msg, 'ok');
+            } else {
+              showToast(data.error || '操作失败', 'err');
+            }
+            window.location.reload();
+          } catch (e) {
+            showToast('请求失败', 'err');
+          }
+        });
+      });
+
+      // Clear action log
+      document.querySelectorAll('.js-clear-action-log').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          if (!confirm('确定要清空所有操作记录吗？此操作不可恢复。')) return;
+          btn.disabled = true;
+          try {
+            const res = await fetch('/api/clear-action-log', {method: 'POST'});
+            const data = await res.json();
+            if (data.ok) {
+              showToast('操作记录已清空', 'ok');
+            } else {
+              showToast(data.error || '清空失败', 'err');
+            }
+            window.location.reload();
+          } catch (e) {
+            showToast('请求失败', 'err');
           }
         });
       });
@@ -444,7 +731,11 @@ def build_html(
     runtime_updated = render._runtime_updated_at(runtime_data)
     live_attr = "true" if live else "false"
     runtime_section = render.render_runtime_rows(runtime_data) if runtime_data else '<p class="muted">运行态数据未加载。</p>'
-    signals_section = render.render_macos_signals_rows(signals_rows) if signals_rows else '<p class="muted">系统信号未加载。</p>'
+    signals_refresh_error = (signals_meta or {}).get("_refresh_error", "")
+    signals_error_banner = f'<div class="alert-banner">⚠️ 系统信号刷新失败：{lib.h(signals_refresh_error)}</div>' if signals_refresh_error else ""
+    signals_section = signals_error_banner + (render.render_macos_signals_rows(signals_rows) if signals_rows else '<p class="muted">系统信号未加载。</p>')
+    cli_section = render.render_cli_section(entrypoints)
+    action_log_section = render.render_action_log()
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -464,6 +755,8 @@ def build_html(
       <nav class="nav">
         <button class="active" data-tab="runtime">运行态</button>
         <button data-tab="signals">系统信号</button>
+        <button data-tab="cli">CLI 工具</button>
+        <button data-tab="log">操作记录</button>
         <button data-tab="settings">设置</button>
       </nav>
     </aside>
@@ -476,13 +769,13 @@ def build_html(
           </div>
           <div style="display:flex;align-items:center;gap:10px;">
             <span id="refresh-status" class="refresh-status"></span>
-            <button class="btn primary" id="refresh-runtime">刷新</button>
+            <button class="btn" id="refresh-all" title="重新采集 runtime、系统信号、发现候选、项目索引">刷新全部</button>
+            <button class="btn primary" id="refresh-runtime">刷新运行态</button>
           </div>
         </div>
         {render.render_runtime_filter_bar()}
         {render.render_alert_cards(runtime_data)}
         {runtime_section}
-        {render.render_cli_entrypoints(entrypoints)}
       </section>
 
       <section class="section" data-section="signals">
@@ -499,12 +792,42 @@ def build_html(
         {signals_section}
       </section>
 
+      <section class="section" data-section="cli">
+        <div class="topbar">
+          <div>
+            <h1>CLI 工具</h1>
+            <div class="sub">本机已登记或可执行的命令行入口</div>
+          </div>
+        </div>
+        {cli_section}
+      </section>
+
+      <section class="section" data-section="log">
+        <div class="topbar">
+          <div>
+            <h1>操作记录</h1>
+            <div class="sub">你在本面板上执行的终止进程、启动 / 停止 LaunchAgent 等操作</div>
+          </div>
+        </div>
+        {action_log_section}
+      </section>
+
       <section class="section" data-section="settings">
         <div class="topbar">
           <div>
             <h1>设置</h1>
-            <div class="sub">配置路径与工具信息</div>
+            <div class="sub">配置路径与刷新说明</div>
           </div>
+        </div>
+        <div class="card">
+          <div class="card-title">数据刷新说明</div>
+          <ul class="muted">
+            <li>本页面是<strong>快照</strong>，不是实时监控。</li>
+            <li>「刷新运行态」只重新采集当前在跑的进程。</li>
+            <li>「刷新全部」会重新跑 discovery、projects、runtime、macos-signals，并更新静态 HTML。</li>
+            <li>你在外面新装了工具 / 改了 launchd，需要点「刷新全部」才能看到最新状态。</li>
+            <li>「操作记录」记录你在本面板上执行的终止进程和 LaunchAgent 开关操作。</li>
+          </ul>
         </div>
         <div class="card">
           <div class="card-title">配置路径</div>
@@ -532,16 +855,19 @@ def build_html(
 """
 
 
-def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, live=False, discovery_mode="daily"):
+def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, run_signals=False, run_signals_skip_btm=False, live=False, discovery_mode="daily"):
     agent_registry = lib.load_json(paths.REGISTRY)
     mcp_registry = lib.load_json(paths.MCP_REGISTRY)
     discovery_raw = data.refresh_discovery(mode=discovery_mode) if run_discovery else ""
     project_raw = data.refresh_projects() if run_projects else ""
+    signals_refresh_error = data.refresh_signals(skip_btm=run_signals_skip_btm) if run_signals else ""
     discovered_rows, discovered_at, discovered_meta = data.collect_discovered()
     project_rows, project_at, project_meta = data.collect_projects()
     signals_raw = lib.load_json(paths.MACOS_SIGNALS) if paths.MACOS_SIGNALS.exists() else {}
     signals_rows = signals_raw.get("items", []) if isinstance(signals_raw, dict) else []
     signals_meta = dict(signals_raw.get("summary", {}) if isinstance(signals_raw, dict) else {})
+    if signals_refresh_error:
+        signals_meta["_refresh_error"] = signals_refresh_error
     _raw = signals_raw.get("raw", {}) if isinstance(signals_raw, dict) else {}
     signals_meta["login_items"] = _raw.get("login_items", []) if isinstance(_raw, dict) else []
     _sext = _raw.get("system_extensions") if isinstance(_raw, dict) else None
@@ -638,8 +964,8 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, liv
     return html_text, summary
 
 
-def write_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, live=False):
-    html_text, summary = build_dashboard(run_discovery=run_discovery, refresh_mcp=refresh_mcp, run_projects=run_projects, live=live)
+def write_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, run_signals=False, run_signals_skip_btm=False, live=False):
+    html_text, summary = build_dashboard(run_discovery=run_discovery, refresh_mcp=refresh_mcp, run_projects=run_projects, run_signals=run_signals, run_signals_skip_btm=run_signals_skip_btm, live=live)
     paths.OUT.parent.mkdir(parents=True, exist_ok=True)
     paths.OUT.write_text(html_text, encoding="utf-8")
     return summary
