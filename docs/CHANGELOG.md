@@ -6,10 +6,10 @@
 
 | 字段 | 内容 |
 |---|---|
-| **问题/需求** | 用户在系统外杀掉腾讯 ima 等后台进程后，dashboard 仍显示「运行中」，因为 `macos-signals.json` 是快照。 |
-| **根因/方案** | 渲染层对「后台进程/在跑」类行做实时 PID 存在性校验：如果快照显示 running 但实际 pid 已不存在，状态显示为「已停止（进程已退出）」。同时在 dashboard 服务启动一个后台线程，每 5 分钟静默刷新一次系统信号并重写页面，让快照不会过旧。 |
-| **改动范围** | `lib/agent_assets_dashboard_render.py`（新增 `_pid_exists`、实时校验）、`lib/agent_assets_dashboard_api.py`（后台定时刷新线程 + 锁）、`docs/CHANGELOG.md` |
-| **影响面** | 系统信号 tab 对后台进程的状态更准确；launchctl 操作后的刷新与定时刷新通过锁互斥；不改动 macos-signals 采集逻辑。 |
+| **问题/需求** | 用户在系统外杀掉腾讯 ima 等后台进程后，dashboard 仍显示「运行中」；搜狗输入法等 launchd 服务操作后，同一应用的多服务状态不一致。 |
+| **根因/方案** | `macos-signals.json` 是快照，会滞后。渲染层对所有 running 行做实时 PID 存在性校验：如果快照显示 running 但实际 pid 已不存在，状态显示为「已停止（进程已退出）」。同时在 dashboard 服务启动一个后台线程，每 5 分钟静默刷新一次系统信号并重写页面，让快照不会过旧。 |
+| **改动范围** | `lib/agent_assets_dashboard_render.py`（新增 `_pid_exists`、实时校验扩展到所有 running 行）、`lib/agent_assets_dashboard_api.py`（后台定时刷新线程 + 锁）、`docs/CHANGELOG.md` |
+| **影响面** | 系统信号 tab 对后台进程和 launchd 服务的状态更准确；launchctl 操作后的刷新与定时刷新通过锁互斥；不改动 macos-signals 采集逻辑。 |
 | **状态** | ✅ 已完成 |
 
 ## 2026-07-04 03:10
