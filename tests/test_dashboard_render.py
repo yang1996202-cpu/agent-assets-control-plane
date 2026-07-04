@@ -159,7 +159,9 @@ class TestRenderMemorySummaryCard(unittest.TestCase):
         self.assertIn("内存总览", html)
         self.assertIn("16.00 GB", html)
         self.assertIn("12.00 GB", html)
-        self.assertIn("进程列表只包含本 dashboard 采集到的用户态进程", html)
+        self.assertIn("未覆盖进程", html)
+        self.assertIn("8.00 GB", html)  # used 12 - rss 4
+        self.assertIn("系统守护进程", html)
 
     def test_returns_empty_when_no_stats(self):
         self.assertEqual(render._render_memory_summary_card(None, 0), "")

@@ -519,6 +519,7 @@ CSS = """    :root {
     .mem-bar-fill.wired { background: #a78bfa; }
     .mem-bar-fill.compressed { background: #f87171; }
     .mem-bar-fill.cached { background: #fbbf24; }
+    .mem-bar-fill.uncovered { background: #9ca3af; }
     .mem-bar-fill.free { background: #86efac; }
     .mem-bar-value {
       flex: 0 0 4.5em;

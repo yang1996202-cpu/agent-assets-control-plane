@@ -1258,6 +1258,7 @@ def _render_memory_summary_card(mem_stats, processes_total_rss_gb):
     free = mem_stats.get("free_gb", 0)
     available = mem_stats.get("available_gb", 0)
     used_pct = (used / total * 100) if total else 0
+    uncovered = max(0.0, used - processes_total_rss_gb)
 
     def _bar(label, value, color):
         pct = (value / total * 100) if total else 0
@@ -1283,10 +1284,12 @@ def _render_memory_summary_card(mem_stats, processes_total_rss_gb):
         {_bar("联动内存", wired, "wired")}
         {_bar("被压缩", compressed, "compressed")}
         {_bar("缓存文件", file_backed, "cached")}
+        {_bar("未覆盖进程", uncovered, "uncovered")}
       </div>
       <p class="memory-hint muted">
-        下方进程列表只包含本 dashboard 采集到的用户态进程（合计约 {lib.h(_format_gb(processes_total_rss_gb))}），
-        不包含 kernel、系统守护进程、压缩页、文件缓存等，因此会小于系统总已用内存。
+        下方列表只覆盖本 dashboard 采集到的用户态进程（合计约 {lib.h(_format_gb(processes_total_rss_gb))}）。
+        与系统总已用 {lib.h(_format_gb(used))} 相差约 {lib.h(_format_gb(uncovered))}，
+        差值主要来自 root 系统守护进程（launchd / kernel_task / WindowServer 等）、压缩内存、共享库 / GPU 显存等未列入列表的部分。
       </p>
     </div>
     """
