@@ -678,12 +678,14 @@ def _signal_row_html(row, disabled, resource_html, show_title=True):
         name_cell += f'<div class="subtle plist-path">{lib.h(plist)}</div>'
     if note:
         name_cell += f'<div class="subtle">{lib.h(note)}</div>'
+    state_sort_value = {"running": 0, "not-running": 1, "registered": 2}.get(state, 3)
+    resource_sort_value = 0 if resource_html == "—" else 1
     return f"""
     <tr class="searchable" data-section="signals" data-control="{lib.h(control)}" data-filter-tags="{lib.h(filter_tags)}" data-text="{lib.h(raw_label)} {lib.h(title)} {lib.h(kind)} {lib.h(json.dumps(row, ensure_ascii=False))}">
       <td class="col-name">{name_cell}</td>
       <td class="col-type">{lib.h(kind)}</td>
-      <td class="col-state">{state_badge(state, state_label)}<span class="subtle">{lib.h(exit_text)}</span></td>
-      <td class="col-resource">{lib.h(resource_html)}</td>
+      <td class="col-state" data-sort-value="{state_sort_value}">{state_badge(state, state_label)}<span class="subtle">{lib.h(exit_text)}</span></td>
+      <td class="col-resource" data-sort-value="{resource_sort_value}">{lib.h(resource_html)}</td>
       <td class="col-ports"><span class="subtle">{lib.h(port_text)}</span></td>
       <td class="col-linked">{_render_linked_assets(linked)}</td>
       <td class="action-cell">{actions}</td>
@@ -714,25 +716,8 @@ def render_macos_signals_rows(rows, process_list=None):
             icon, label, _ = CONTROL_META[key]
             control_buttons.append(f'<button class="filter" data-filter="{lib.h(key)}">{icon} {lib.h(label)} ({len(grp)})</button>')
 
-    # 状态筛选
-    state_counts = {}
-    for row in rows:
-        if row.get("launch_state") == "running" or row.get("running"):
-            state_counts["running"] = state_counts.get("running", 0) + 1
-        elif row.get("launch_plist"):
-            state_counts["not-running"] = state_counts.get("not-running", 0) + 1
-        else:
-            state_counts["registered"] = state_counts.get("registered", 0) + 1
-    state_buttons = [
-        f'<button class="filter active" data-state-filter="">全部状态</button>',
-        f'<button class="filter" data-state-filter="running">运行中 ({state_counts.get("running", 0)})</button>',
-        f'<button class="filter" data-state-filter="not-running">未运行 ({state_counts.get("not-running", 0)})</button>',
-        f'<button class="filter" data-state-filter="registered">登录项/扩展 ({state_counts.get("registered", 0)})</button>',
-    ]
-
     parts = [
         f'<div class="filter-bar signals-filter-bar">{"".join(control_buttons)}</div>',
-        f'<div class="filter-bar signals-state-filter-bar">{"".join(state_buttons)}</div>',
     ]
     for key in ["user-launchd", "system-launchd", "app-running", "login-item"]:
         grp = groups.get(key) or []
@@ -742,7 +727,7 @@ def render_macos_signals_rows(rows, process_list=None):
         parts.append(f"""
         <table class="signal-table" data-control="{lib.h(key)}">
           <caption><span class="ctrl-icon">{icon}</span> <strong>{lib.h(label)}</strong> <span class="muted">({len(grp)})</span><span class="subtle"> — {lib.h(note)}</span></caption>
-          <thead><tr><th class="col-name">名称</th><th class="col-type">类型</th><th class="col-state">状态</th><th class="col-resource">资源</th><th class="col-ports">端口</th><th class="col-linked">关联</th><th class="action-cell">操作</th></tr></thead>
+          <thead><tr><th class="col-name sortable" data-sort="name">名称</th><th class="col-type sortable" data-sort="type">类型</th><th class="col-state sortable" data-sort="state">状态</th><th class="col-resource sortable" data-sort="resource">资源</th><th class="col-ports">端口</th><th class="col-linked">关联</th><th class="action-cell">操作</th></tr></thead>
           <tbody>
         """)
         # 预计算每个展示标题出现的次数，用于判断是否需要分组

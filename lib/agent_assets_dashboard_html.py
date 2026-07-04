@@ -277,6 +277,16 @@ CSS = """    :root {
     }
     .signal-table .signal-group-header + tr td { padding-top: 8px; }
     .signal-table .group-subname { font-family: ui-monospace, monospace; font-size: 12px; }
+    .signal-table th.sortable {
+      cursor: pointer; user-select: none;
+    }
+    .signal-table th.sortable::after {
+      content: "↕"; color: var(--muted); font-size: 11px; margin-left: 4px;
+    }
+    .signal-table th.sortable.asc::after { content: "↑"; }
+    .signal-table th.sortable.desc::after { content: "↓"; }
+    .signal-table th.sortable.asc,
+    .signal-table th.sortable.desc { color: var(--text); }
     .action-stack { display: inline-flex; flex-direction: column; gap: 3px; align-items: flex-start; }
     .action-stack .table-action { white-space: nowrap; }
     .auto-state {
@@ -662,32 +672,59 @@ JS = """    (function() {
         });
       });
 
-      // Signals state filter buttons
-      document.querySelectorAll('.signals-state-filter-bar .filter').forEach(btn => {
-        btn.addEventListener('click', () => {
-          document.querySelectorAll('.signals-state-filter-bar .filter').forEach(b => b.classList.remove('active'));
-          btn.classList.add('active');
-          applySignalsFilter();
-        });
-      });
-
       function applySignalsFilter() {
         const controlFilter = (document.querySelector('.signals-filter-bar .filter.active') || {}).dataset.filter || '';
-        const stateFilter = (document.querySelector('.signals-state-filter-bar .filter.active') || {}).dataset.stateFilter || '';
         document.querySelectorAll('.signal-table').forEach(table => {
           const control = table.dataset.control || '';
           const controlMatch = !controlFilter || control === controlFilter;
           let hasVisibleRow = false;
           table.querySelectorAll('.searchable[data-section="signals"]').forEach(row => {
-            const tags = (row.dataset.filterTags || '').split(/\\s+/);
-            const stateMatch = !stateFilter || tags.includes(stateFilter);
-            const visible = controlMatch && stateMatch;
+            const visible = controlMatch;
             row.style.display = visible ? '' : 'none';
             if (visible) hasVisibleRow = true;
           });
           table.style.display = controlMatch && hasVisibleRow ? '' : 'none';
         });
       }
+
+      // Signal table sorting (name / type / state / resource)
+      document.querySelectorAll('.signal-table th.sortable').forEach(th => {
+        th.addEventListener('click', () => {
+          const table = th.closest('table');
+          const tbody = table.querySelector('tbody');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          const sortKey = th.dataset.sort;
+          const currentDir = th.classList.contains('asc') ? 'asc' : (th.classList.contains('desc') ? 'desc' : '');
+          const nextDir = currentDir === 'asc' ? 'desc' : 'asc';
+          table.querySelectorAll('th.sortable').forEach(h => h.classList.remove('asc', 'desc'));
+          th.classList.add(nextDir);
+
+          const getValue = (row) => {
+            if (row.classList.contains('signal-group-header')) return '';
+            if (sortKey === 'name') {
+              const cell = row.querySelector('.col-name strong, .col-name .group-subname');
+              return (cell ? cell.textContent : '').toLowerCase();
+            }
+            if (sortKey === 'type') {
+              const cell = row.querySelector('.col-type');
+              return (cell ? cell.textContent : '').toLowerCase();
+            }
+            const cell = row.querySelector(`.col-${sortKey}`);
+            if (!cell) return 0;
+            const val = parseFloat(cell.dataset.sortValue);
+            return isNaN(val) ? 0 : val;
+          };
+
+          rows.sort((a, b) => {
+            let va = getValue(a), vb = getValue(b);
+            if (va < vb) return nextDir === 'asc' ? -1 : 1;
+            if (va > vb) return nextDir === 'asc' ? 1 : -1;
+            return 0;
+          });
+
+          rows.forEach(row => tbody.appendChild(row));
+        });
+      });
 
       // Generic filter-chip buttons (CLI, assets, projects, etc.)
       document.querySelectorAll('.filter-chip').forEach(btn => {
