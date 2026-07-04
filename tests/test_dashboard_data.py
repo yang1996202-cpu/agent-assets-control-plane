@@ -61,6 +61,51 @@ class TestBuildMcpAudit(unittest.TestCase):
         self.assertEqual(audit["summary"]["host_refs"], 0)
 
 
+class TestCollectSystemMemory(unittest.TestCase):
+    def test_parses_vm_stat_and_sysctl(self):
+        """collect_system_memory 能正确解析 vm_stat 和 sysctl 输出并返回 GB 数值。"""
+        vm_stdout = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                1000.
+Pages active:                            10000.
+Pages inactive:                          10000.
+Pages speculative:                         500.
+Pages wired down:                         5000.
+Pages purgeable:                           200.
+Anonymous pages:                         15000.
+File-backed pages:                        2000.
+Pages occupied by compressor:             1000.
+"""
+        sysctl_stdout = """hw.memsize: 17179869184
+hw.pagesize: 16384
+"""
+
+        def _fake_run(cmd, **kwargs):
+            proc = MagicMock()
+            proc.returncode = 0
+            if cmd[0] == "vm_stat":
+                proc.stdout = vm_stdout
+            else:
+                proc.stdout = sysctl_stdout
+            return proc
+
+        with patch.object(dash_data.subprocess, "run", side_effect=_fake_run):
+            stats = dash_data.collect_system_memory()
+
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["total_gb"], 16.0)
+        # app = anonymous pages
+        self.assertAlmostEqual(stats["app_gb"], 15000 * 16384 / (1024 ** 3), places=4)
+        self.assertAlmostEqual(stats["wired_gb"], 5000 * 16384 / (1024 ** 3), places=4)
+        self.assertAlmostEqual(stats["compressed_gb"], 1000 * 16384 / (1024 ** 3), places=4)
+        # used = app + wired + compressed
+        expected_used = (15000 + 5000 + 1000) * 16384 / (1024 ** 3)
+        self.assertAlmostEqual(stats["used_gb"], expected_used, places=4)
+
+    def test_returns_none_on_failure(self):
+        with patch.object(dash_data.subprocess, "run", side_effect=Exception("boom")):
+            self.assertIsNone(dash_data.collect_system_memory())
+
+
 class TestCollectAllProcesses(unittest.TestCase):
     """覆盖 collect_all_processes() 的核心路径。"""
 

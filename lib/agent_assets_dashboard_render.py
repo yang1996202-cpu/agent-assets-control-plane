@@ -1224,6 +1224,74 @@ def _aggregate_system_processes(processes):
     return sorted(groups.values(), key=lambda g: (-g["rss"], -g["cpu"]))
 
 
+def _format_gb(value, digits=2):
+    """把 GB 数值格式化为人类可读字符串。"""
+    try:
+        gb = float(value or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if gb <= 0:
+        return "0 GB"
+    if gb < 1:
+        return f"{gb * 1024:.1f} MB"
+    return f"{gb:.{digits}f} GB"
+
+
+def _render_memory_summary_card(mem_stats, processes_total_rss_gb):
+    """渲染系统进程页顶部的内存总览卡片。
+
+    背景：进程列表的 RSS 加总只是用户态可见进程的一部分，远小于系统实际已用内存。
+          如果不展示系统级内存统计，用户会以为 dashboard 统计有误。
+    设计意图：用类似 macOS 活动监视器的口径展示总内存、已用、App、联动（Wired）、
+             被压缩、缓存文件、可用/空闲，并在下方说明「进程列表只覆盖部分用户态进程」。
+    约束：mem_stats 为 None 时不渲染；processes_total_rss_gb 用于对比说明。
+    """
+    if not mem_stats:
+        return ""
+
+    total = mem_stats.get("total_gb", 0)
+    used = mem_stats.get("used_gb", 0)
+    app = mem_stats.get("app_gb", 0)
+    wired = mem_stats.get("wired_gb", 0)
+    compressed = mem_stats.get("compressed_gb", 0)
+    file_backed = mem_stats.get("file_backed_gb", 0)
+    free = mem_stats.get("free_gb", 0)
+    available = mem_stats.get("available_gb", 0)
+    used_pct = (used / total * 100) if total else 0
+
+    def _bar(label, value, color):
+        pct = (value / total * 100) if total else 0
+        return (
+            f'<div class="mem-bar-row">'
+            f'<span class="mem-bar-label">{lib.h(label)}</span>'
+            f'<div class="mem-bar-track"><div class="mem-bar-fill {lib.h(color)}" style="width:{pct:.1f}%"></div></div>'
+            f'<span class="mem-bar-value">{lib.h(_format_gb(value))}</span>'
+            f'</div>'
+        )
+
+    return f"""
+    <div class="memory-summary card">
+      <div class="memory-summary-head">
+        <div>
+          <h4>内存总览</h4>
+          <div class="memory-total">已用 {lib.h(_format_gb(used))} / 总计 {lib.h(_format_gb(total))} <span class="muted">({used_pct:.1f}%)</span></div>
+        </div>
+        <div class="memory-availability">可用 {lib.h(_format_gb(available))}</div>
+      </div>
+      <div class="memory-bars">
+        {_bar("App 内存", app, "app")}
+        {_bar("联动内存", wired, "wired")}
+        {_bar("被压缩", compressed, "compressed")}
+        {_bar("缓存文件", file_backed, "cached")}
+      </div>
+      <p class="memory-hint muted">
+        下方进程列表只包含本 dashboard 采集到的用户态进程（合计约 {lib.h(_format_gb(processes_total_rss_gb))}），
+        不包含 kernel、系统守护进程、压缩页、文件缓存等，因此会小于系统总已用内存。
+      </p>
+    </div>
+    """
+
+
 def _render_top_processors(aggregated, max_cpu, max_rss):
     """渲染「高占用进程」顶部卡片：左侧 Top 5 CPU，右侧 Top 5 内存。
 
@@ -1264,10 +1332,11 @@ def _render_top_processors(aggregated, max_cpu, max_rss):
     """
 
 
-def render_system_processes_rows(processes):
-    """渲染「系统进程」tab：按应用聚合、顶部高占用、可排序筛选。
+def render_system_processes_rows(processes, mem_stats=None):
+    """渲染「系统进程」tab：内存总览 + 高占用 + 聚合表格。
 
     设计意图：
+    - 顶部先给系统级内存总览，解释「为什么进程列表加总小于实际占用」。
     - 参考 Stats 的高占用进程卡片，把 Top CPU / Top 内存放在最显眼的位置。
     - 按应用名称聚合，避免 Chrome / WeChat / Electron Helper 等把表格撑爆。
     - 表格默认按内存降序，支持表头排序和分类筛选。
@@ -1324,8 +1393,11 @@ def render_system_processes_rows(processes):
 
     out_rows = [_row_html(g) for g in default_rows]
     top_section = _render_top_processors(aggregated, max_cpu, max_rss)
+    processes_total_rss_gb = sum(g["rss"] for g in aggregated) / (1024 * 1024)
+    memory_section = _render_memory_summary_card(mem_stats, processes_total_rss_gb)
 
     return f"""
+    {memory_section}
     {top_section}
     <div class="filter-bar system-processes-filter-bar">
       {"".join(filter_buttons)}

@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-04 11:45
+
+### [BUG] 修正系统进程页「内存总览」统计口径
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 系统进程页顶部「内存总览」显示「已用 17 GB / 总计 16 GB（>100%）」，与活动监视器口径不一致；用户指出「联动内存」应对应 Wired，而不是文件缓存。 |
+| **根因/方案** | 旧实现把 `active + inactive + speculative` 当作 App 内存，并把 `file-backed` 同时计入「联动内存」和已用内存，导致重复计算。修正后：App 内存 = `Anonymous pages`；联动内存 = `Pages wired down`；缓存文件 = `File-backed pages`；已用内存 = App + Wired + Compressed；可用内存保持 `free + inactive + purgeable`。 |
+| **改动范围** | `lib/agent_assets_dashboard_data.py`（`collect_system_memory` 计算逻辑）、`lib/agent_assets_dashboard_render.py`（内存卡片标签与条形图）、`lib/agent_assets_dashboard_html.py`（新增 `.wired` / `.cached` 样式）、`tests/test_dashboard_data.py`、`tests/test_dashboard_render.py`、`docs/FEATURES.md`、`docs/CHANGELOG.md` |
+| **影响面** | 系统进程页「内存总览」数字与 macOS 活动监视器接近；条形图四分类之和不再超过物理内存总计。 |
+| **状态** | ✅ 已完成 |
+
 ## 2026-07-04 04:30
 
 ### [FIX] 解决 dashboard 页面刷新后仍显示老内容

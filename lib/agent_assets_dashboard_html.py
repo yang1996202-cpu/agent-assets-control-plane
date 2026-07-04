@@ -461,6 +461,75 @@ CSS = """    :root {
       overflow: hidden;
       margin-bottom: 16px;
     }
+    .memory-summary {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .memory-summary-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 14px;
+    }
+    .memory-summary-head h4 {
+      margin: 0 0 4px;
+      font-size: 15px;
+      font-weight: 650;
+    }
+    .memory-total {
+      font-size: 20px;
+      font-weight: 700;
+    }
+    .memory-availability {
+      font-size: 14px;
+      color: var(--green);
+      font-weight: 600;
+    }
+    .memory-bars {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px 24px;
+      margin-bottom: 12px;
+    }
+    .mem-bar-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+    }
+    .mem-bar-label {
+      flex: 0 0 5.5em;
+      color: var(--muted);
+    }
+    .mem-bar-track {
+      flex: 1;
+      height: 8px;
+      background: var(--soft);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .mem-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+    }
+    .mem-bar-fill.app { background: #60a5fa; }
+    .mem-bar-fill.wired { background: #a78bfa; }
+    .mem-bar-fill.compressed { background: #f87171; }
+    .mem-bar-fill.cached { background: #fbbf24; }
+    .mem-bar-fill.free { background: #86efac; }
+    .mem-bar-value {
+      flex: 0 0 4.5em;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .memory-hint {
+      font-size: 12px;
+      line-height: 1.5;
+      margin: 0;
+    }
     .top-processors {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -1015,6 +1084,7 @@ def build_html(
     live=False,
     runtime_data=None,
     all_processes=None,
+    system_memory=None,
 ):
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     runtime_updated = render._runtime_updated_at(runtime_data)
@@ -1025,7 +1095,7 @@ def build_html(
     signals_section = signals_error_banner + (render.render_macos_signals_rows(signals_rows, process_list=all_processes) if signals_rows else '<p class="muted">系统信号未加载。</p>')
     cli_section = render.render_cli_section(entrypoints)
     action_log_section = render.render_action_log()
-    system_processes_section = render.render_system_processes_rows(all_processes) if all_processes is not None else '<p class="muted">系统进程数据未加载。</p>'
+    system_processes_section = render.render_system_processes_rows(all_processes, mem_stats=system_memory) if all_processes is not None else '<p class="muted">系统进程数据未加载。</p>'
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1195,6 +1265,7 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, run
         _row["_safe"] = render.is_safe_to_control(_row)
     runtime_data = data.collect_runtime()
     all_processes = data.collect_all_processes()
+    system_memory = data.collect_system_memory()
     if refresh_mcp:
         health, health_raw = data.parse_claude_mcp_health()
     else:
@@ -1222,6 +1293,7 @@ def build_dashboard(run_discovery=True, refresh_mcp=True, run_projects=True, run
         live=live,
         runtime_data=runtime_data,
         all_processes=all_processes,
+        system_memory=system_memory,
     )
     project_summary = project_meta.get("summary", {})
     assets = agent_registry.get("assets", {})

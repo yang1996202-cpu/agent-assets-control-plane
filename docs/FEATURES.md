@@ -33,6 +33,7 @@
   - [2026-07-03] 进程分类规则与用户环境映射外置到 `~/.config/agent-assets/runtime-classification.json` / `product-map.json`。
   - [2026-07-04] 参考 Stats 风格重构：顶部新增「高占用进程」卡片（Top 5 CPU + Top 5 内存）；表格按应用名称聚合，消除 Chrome / WeChat / Electron Helper 重复行；批量终止支持聚合进程组。
   - [2026-07-04] 修复 `_pid_exists` 对 root 系统守护进程权限错误的处理，避免「运行中」被误判为「未运行」；修复 `state_badge` 覆盖自定义状态文案的问题。
+  - [2026-07-04] 新增「内存总览」卡片：基于 `vm_stat` + `sysctl` 展示总内存、已用、App、联动（Wired）、被压缩、缓存文件与可用内存，解释进程列表合计与系统总占用的差异。
 
 ### macOS 系统信号全景
 - **状态**：🟢 已完成

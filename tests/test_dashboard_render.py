@@ -142,6 +142,29 @@ class TestAggregateSystemProcesses(unittest.TestCase):
         self.assertEqual(groups[0]["category"], "mcp")
 
 
+class TestRenderMemorySummaryCard(unittest.TestCase):
+    def test_shows_system_memory_breakdown(self):
+        """内存总览卡片应展示系统级内存统计和说明文字。"""
+        mem_stats = {
+            "total_gb": 16.0,
+            "used_gb": 12.0,
+            "app_gb": 5.0,
+            "wired_gb": 3.0,
+            "compressed_gb": 2.0,
+            "file_backed_gb": 2.0,
+            "free_gb": 1.0,
+            "available_gb": 3.0,
+        }
+        html = render._render_memory_summary_card(mem_stats, 4.0)
+        self.assertIn("内存总览", html)
+        self.assertIn("16.00 GB", html)
+        self.assertIn("12.00 GB", html)
+        self.assertIn("进程列表只包含本 dashboard 采集到的用户态进程", html)
+
+    def test_returns_empty_when_no_stats(self):
+        self.assertEqual(render._render_memory_summary_card(None, 0), "")
+
+
 class TestRenderSystemProcessesRows(unittest.TestCase):
     def test_shows_top_processors_and_aggregated_table(self):
         """系统进程页应同时展示高占用卡片和聚合后的表格。"""

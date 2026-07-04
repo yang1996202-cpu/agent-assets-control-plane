@@ -13,6 +13,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 import subprocess
 
 import agent_assets_common as lib
@@ -539,6 +540,94 @@ def collect_all_processes():
         return processes
     except Exception:
         return []
+
+
+def collect_system_memory():
+    """采集 macOS 系统级内存统计，用于在系统进程页展示总览。
+
+    背景：dashboard 的进程列表只显示我们关心的用户态进程，其 RSS 加总必然远小于
+          系统实际已用内存（缺少 kernel/wired/compressed/file-cache 等）。如果不做说明，
+          用户会以为统计漏了或算错了。
+    设计意图：用 `vm_stat` + `sysctl hw.memsize` 给出与 macOS 活动监视器口径接近的总览：
+             总内存、已用内存、App 内存、联动内存（Wired）、被压缩、缓存文件、可用/空闲。
+    约束：非 macOS 环境或命令失败时返回 None；页数按 vm_stat 自身报告的 page size 换算。
+    """
+    try:
+        vm_proc = subprocess.run(
+            ["vm_stat"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if vm_proc.returncode != 0:
+            return None
+        sys_proc = subprocess.run(
+            ["sysctl", "hw.memsize", "hw.pagesize"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if sys_proc.returncode != 0:
+            return None
+
+        pages = {}
+        page_size = 16384  # macOS 默认页大小，会从 vm_stat 输出覆盖
+        for line in vm_proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "page size of" in line:
+                m = re.search(r"page size of (\d+)", line)
+                if m:
+                    page_size = int(m.group(1))
+                continue
+            # vm_stat 大部分行是 "Pages free:"，少数如 "File-backed pages:" 没有 Pages 前缀
+            m = re.match(r"(?:Pages\s+)?([\w\-]+(?:\s+[\w\-]+)*)\s*:\s+(\d+)\.", line)
+            if m:
+                key = m.group(1).lower().replace(" ", "_")
+                # 去掉末尾多余的 _pages
+                if key.endswith("_pages"):
+                    key = key[:-6]
+                pages[key] = int(m.group(2))
+
+        memsize = None
+        for line in sys_proc.stdout.splitlines():
+            if line.startswith("hw.memsize:"):
+                memsize = int(line.split(":", 1)[1].strip())
+
+        if memsize is None:
+            return None
+
+        def _gb(pages_count):
+            return (pages_count * page_size) / (1024 * 1024 * 1024)
+
+        # 与 macOS 活动监视器口径对齐的估算
+        # App 内存 ≈ 匿名页；联动内存 ≈ wired；缓存文件 ≈ file-backed；被压缩 ≈ compressor
+        anonymous_pages = pages.get("anonymous", 0)
+        wired_pages = pages.get("wired_down", 0)
+        compressed_pages = pages.get("occupied_by_compressor", 0)
+        file_backed_pages = pages.get("file-backed", 0)
+        free_pages = pages.get("free", 0)
+        inactive_pages = pages.get("inactive", 0)
+        purgeable_pages = pages.get("purgeable", 0)
+
+        app_pages = anonymous_pages
+        used_pages = app_pages + wired_pages + compressed_pages
+        available_pages = free_pages + inactive_pages + purgeable_pages
+
+        return {
+            "total_gb": memsize / (1024 * 1024 * 1024),
+            "used_gb": _gb(used_pages),
+            "app_gb": _gb(app_pages),
+            "wired_gb": _gb(wired_pages),
+            "compressed_gb": _gb(compressed_pages),
+            "file_backed_gb": _gb(file_backed_pages),
+            "free_gb": _gb(free_pages),
+            "available_gb": _gb(available_pages),
+            "page_size": page_size,
+        }
+    except Exception:
+        return None
 
 
 def refresh_signals(skip_btm=False):
