@@ -461,6 +461,45 @@ CSS = """    :root {
       overflow: hidden;
       margin-bottom: 16px;
     }
+    .top-processors {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .top-processors h4 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      font-weight: 650;
+      color: var(--text);
+    }
+    .top-proc-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+    }
+    .top-proc-col {
+      min-width: 0;
+    }
+    .top-proc-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .top-proc-name {
+      flex: 0 0 38%;
+      font-size: 13px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--text);
+    }
+    .top-proc-item .usage-cell {
+      flex: 1;
+      min-width: 0;
+    }
     .system-processes-table { width: 100%; border-collapse: collapse; font-size: 14px; }
     .system-processes-table th {
       text-align: left; padding: 10px 12px;
@@ -531,6 +570,12 @@ CSS = """    :root {
 
 
 JS = """    (function() {
+      // 强制绕过浏览器缓存重新加载页面；location.reload() 在某些浏览器/场景下仍会读缓存。
+      function hardReload() {
+        var base = location.href.split('?')[0];
+        var hash = location.hash || '';
+        location.href = base + '?_t=' + Date.now() + hash;
+      }
       function showToast(message, type) {
         const toast = document.createElement('div');
         toast.className = 'toast ' + (type ? 'toast-' + type : '');
@@ -755,7 +800,7 @@ JS = """    (function() {
             const res = await fetch('/api/scan', {method: 'POST'});
             const data = await res.json();
             if (data.ok) {
-              window.location.reload();
+              hardReload();
             } else {
               refreshStatus.textContent = data.error || '刷新失败';
             }
@@ -777,7 +822,7 @@ JS = """    (function() {
             const res = await fetch('/api/refresh-all', {method: 'POST'});
             const data = await res.json();
             if (data.ok) {
-              window.location.reload();
+              hardReload();
             } else {
               refreshStatus.textContent = data.error || '刷新失败';
             }
@@ -795,7 +840,7 @@ JS = """    (function() {
       if (sigRefresh) {
         sigRefresh.addEventListener('click', () => {
           sigStatus.textContent = '刷新中...';
-          window.location.reload();
+          hardReload();
         });
       }
 
@@ -804,8 +849,18 @@ JS = """    (function() {
         btn.addEventListener('click', async () => {
           const pid = btn.dataset.pid;
           const mode = btn.dataset.mode;
+          const cmd = btn.dataset.cmd || '';
           if (!pid) return;
-          if (!confirm('确认终止 PID ' + pid + '？')) return;
+          let confirmMsg = '确认终止 PID ' + pid + '？';
+          if (pid.startsWith('[')) {
+            try {
+              const pids = JSON.parse(pid);
+              confirmMsg = '确认终止「' + cmd + '」下的 ' + pids.length + ' 个进程？';
+            } catch (e) {
+              confirmMsg = '确认终止该进程组？';
+            }
+          }
+          if (!confirm(confirmMsg)) return;
           btn.disabled = true;
           try {
             const res = await fetch('/api/kill-process', {
@@ -819,7 +874,7 @@ JS = """    (function() {
             } else {
               showToast(data.error || '操作失败', 'err');
             }
-            window.location.reload();
+            hardReload();
           } catch (e) {
             showToast('请求失败', 'err');
           }
@@ -884,7 +939,7 @@ JS = """    (function() {
             }
             showToast('操作成功，正在刷新状态...', 'ok');
             await waitForSignalsRefresh(opStarted);
-            window.location.reload();
+            hardReload();
           } else {
             showToast(data.error || '操作失败', 'err');
             btn.disabled = false;
@@ -930,7 +985,7 @@ JS = """    (function() {
             } else {
               showToast(data.error || '清空失败', 'err');
             }
-            window.location.reload();
+            hardReload();
           } catch (e) {
             showToast('请求失败', 'err');
           }
@@ -976,6 +1031,9 @@ def build_html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <title>本机运行态</title>
   <style>
 {CSS}  </style>
@@ -1009,7 +1067,7 @@ def build_html(
             <button class="btn primary" id="refresh-runtime">刷新运行态</button>
           </div>
         </div>
-        {render.render_runtime_filter_bar()}
+        {render.render_runtime_filter_bar(runtime_data)}
         {render.render_alert_cards(runtime_data)}
         {runtime_section}
       </section>

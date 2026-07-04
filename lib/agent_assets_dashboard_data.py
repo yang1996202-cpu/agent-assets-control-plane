@@ -514,6 +514,7 @@ def collect_all_processes():
 
     直接调用 asset-runtime --show-system --show-normal --json，复用其分类和去噪逻辑。
     如果 asset-runtime 不存在或失败，返回空列表。
+    同时把采集到的 pid 写入 RUNTIME_WHITELIST，让系统进程 tab 的终止操作也能被白名单覆盖。
     """
     if not paths.ASSET_RUNTIME.exists():
         return []
@@ -528,7 +529,14 @@ def collect_all_processes():
         if proc.returncode != 0:
             return []
         data = json.loads(proc.stdout or "{}")
-        return data.get("processes", [])
+        processes = data.get("processes", [])
+        # 扩展 kill 白名单，让系统进程 tab 里的用户应用也能被终止（系统级路径仍会被 API 层二次拦截）
+        global RUNTIME_WHITELIST
+        for p in processes:
+            pid = p.get("pid")
+            if pid:
+                RUNTIME_WHITELIST[str(pid)] = {"cmd": p.get("cmd", ""), "category": p.get("category", "")}
+        return processes
     except Exception:
         return []
 

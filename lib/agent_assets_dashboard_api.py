@@ -35,7 +35,10 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        # dashboard 是实时快照，任何情况下都不应被浏览器/中间件缓存
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         if include_body:
             self.wfile.write(data)
@@ -437,53 +440,95 @@ def handle_refresh_all():
     return {"ok": True}, 200
 
 
-def handle_kill_process(payload):
-    """终止单个 runtime 进程。安全模型：白名单 + 禁系统路径 + Host 127.0.0.1（由 server 绑定保证）。返回 (result, http_status)。"""
-    pid = str(payload.get("pid") or "")
-    mode = str(payload.get("mode") or "term")
-    if mode not in {"term", "kill"}:
-        return {"ok": False, "error": "非法 mode（仅允许 term/kill）"}, 400
-    if not pid:
-        return {"ok": False, "error": "缺少 pid"}, 400
+def _parse_kill_pids(raw):
+    """解析前端传来的 pid：支持单个字符串或 JSON 数组字符串（用于聚合进程批量终止）。"""
+    if isinstance(raw, list):
+        return [str(p) for p in raw if p not in (None, "")]
+    if isinstance(raw, str) and raw.startswith("["):
+        try:
+            return [str(p) for p in json.loads(raw) if p not in (None, "")]
+        except json.JSONDecodeError:
+            pass
+    if raw not in (None, ""):
+        return [str(raw)]
+    return []
+
+
+def _kill_one_pid(pid, mode):
+    """终止单个 pid，返回 (ok: bool, result: dict, http_status: int)。"""
     info = data.RUNTIME_WHITELIST.get(pid)
     cmd = (info or {}).get("cmd", "")
     safe, reason = _is_kill_safe_pid(pid, cmd)
     if not safe:
         sys.stderr.write(f"asset-dashboard: kill DENY pid={pid} reason={reason}\n")
-        return {"ok": False, "error": reason, "pid": pid}, 403
-    # 二次校验：进程还活着吗？取实时 comm 再核对一次路径
+        return False, {"ok": False, "error": reason, "pid": pid}, 403
     try:
         check = subprocess.run(["ps", "-o", "comm=", "-p", pid], capture_output=True, text=True, timeout=4)
     except Exception as exc:
-        return {"ok": False, "error": f"进程状态检查失败：{exc}"}, 500
+        return False, {"ok": False, "error": f"进程状态检查失败：{exc}", "pid": pid}, 500
     live_comm = (check.stdout or "").strip()
     if not live_comm:
-        return {"ok": False, "error": "进程已不在（pid 可能已退出）", "pid": pid}, 404
-    # 实时 comm 也走一次系统路径检查（防 pid 被复用为系统进程）
+        return False, {"ok": False, "error": "进程已不在（pid 可能已退出）", "pid": pid}, 404
     if any(live_comm.startswith(p.rstrip("/")) for p in ("/usr/sbin/", "/usr/libexec/", "/sbin/", "/System/")):
         sys.stderr.write(f"asset-dashboard: kill DENY pid={pid} live_comm={live_comm} (system path)\n")
-        return {"ok": False, "error": "实时核对发现目标是系统进程，拒绝终止"}, 403
+        return False, {"ok": False, "error": "实时核对发现目标是系统进程，拒绝终止", "pid": pid}, 403
     signum = "TERM" if mode == "term" else "KILL"
     try:
         proc = subprocess.run(["kill", "-" + signum, pid], capture_output=True, text=True, timeout=6)
     except Exception as exc:
-        return {"ok": False, "error": f"发送信号失败：{exc}"}, 500
+        return False, {"ok": False, "error": f"发送信号失败：{exc}", "pid": pid}, 500
     err = (proc.stderr or "").strip()
     if proc.returncode != 0:
-        return {"ok": False, "error": err or f"kill 退出码 {proc.returncode}", "pid": pid}, 500
+        return False, {"ok": False, "error": err or f"kill 退出码 {proc.returncode}", "pid": pid}, 500
     sys.stderr.write(f"asset-dashboard: kill OK pid={pid} mode={mode} cmd={cmd[:120]}\n")
     verb = "已发送 SIGTERM" if mode == "term" else "已发送 SIGKILL"
-    # 后台异步刷新运行态，让用户稍后看到进程已消失
+    return True, {"ok": True, "pid": pid, "mode": mode, "verb": verb, "cmd": cmd}, 200
+
+
+def handle_kill_process(payload):
+    """终止单个或批量 runtime 进程。安全模型：白名单 + 禁系统路径 + Host 127.0.0.1。
+
+    背景：系统进程页按应用聚合后，一行可能对应多个 PID（如多个 Chrome Helper），
+          需要支持一次性终止组内所有进程。
+    返回 (result, http_status)：
+    - 单个 pid 保持原行为；
+    - 多个 pid 时，只要有一个成功就返回 200，并在 detail 里列出每个 pid 的结果。
+    """
+    mode = str(payload.get("mode") or "term")
+    if mode not in {"term", "kill"}:
+        return {"ok": False, "error": "非法 mode（仅允许 term/kill）"}, 400
+    pids = _parse_kill_pids(payload.get("pid"))
+    if not pids:
+        return {"ok": False, "error": "缺少 pid"}, 400
+
+    results = []
+    any_ok = False
+    last_error = None
+    for pid in pids:
+        ok, result, _status = _kill_one_pid(pid, mode)
+        results.append(result)
+        if ok:
+            any_ok = True
+        elif not last_error:
+            last_error = result.get("error")
+
+    # 后台异步刷新运行态
     def _refresh_after_kill():
         try:
-            # kill 后进程可能还有短暂延迟，等 1 秒再扫描确保状态准确
             import time
             time.sleep(1)
             html_module.write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_signals=True, run_signals_skip_btm=True, live=False)
         except Exception as exc:
             sys.stderr.write(f"asset-dashboard: kill refresh failed: {exc}\n")
     threading.Thread(target=_refresh_after_kill, daemon=True).start()
-    return {"ok": True, "pid": pid, "mode": mode, "verb": verb, "cmd": cmd}, 200
+
+    if any_ok:
+        if len(pids) == 1:
+            return results[0], 200
+        return {"ok": True, "verb": "已批量发送信号", "count": len(pids), "results": results}, 200
+    if len(pids) == 1:
+        return results[0], 403 if results[0].get("error", "").startswith("pid 不在") else 500
+    return {"ok": False, "error": last_error or "所有 pid 终止失败", "results": results}, 403
 
 
 def _cleanup_existing_dashboard(port):

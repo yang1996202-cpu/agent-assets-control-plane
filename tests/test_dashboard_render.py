@@ -115,6 +115,146 @@ class TestRenderLinkedAssets(unittest.TestCase):
         self.assertIn("agent-assets-dashboard:source_paths", html)
 
 
+class TestAggregateSystemProcesses(unittest.TestCase):
+    def test_merge_same_app_helpers(self):
+        """同一应用的多 helper 进程应聚合为一行，CPU/内存做加总。"""
+        processes = [
+            {"pid": "1", "cmd": "/Applications/WeChat.app/Contents/MacOS/WeChat", "category": "app", "rss": 100 * 1024, "cpu": 5.0},
+            {"pid": "2", "cmd": "/Applications/WeChat.app/Contents/MacOS/WeChat Helper", "category": "app", "rss": 50 * 1024, "cpu": 2.0},
+            {"pid": "3", "cmd": "/Applications/Chrome.app/Contents/MacOS/Chrome Helper", "category": "app", "rss": 80 * 1024, "cpu": 3.0},
+        ]
+        groups = render._aggregate_system_processes(processes)
+        self.assertEqual(len(groups), 2)
+        names = {g["name"] for g in groups}
+        self.assertEqual(names, {"WeChat.app", "Chrome.app"})
+        wechat = next(g for g in groups if g["name"] == "WeChat.app")
+        self.assertEqual(wechat["rss"], 150 * 1024)
+        self.assertEqual(wechat["cpu"], 7.0)
+        self.assertEqual(len(wechat["pids"]), 2)
+
+    def test_category_takes_most_common(self):
+        processes = [
+            {"pid": "1", "cmd": "node mcp-server", "category": "mcp", "rss": 10, "cpu": 0.1},
+            {"pid": "2", "cmd": "node mcp-server", "category": "mcp", "rss": 10, "cpu": 0.1},
+            {"pid": "3", "cmd": "node mcp-server", "category": "unknown", "rss": 10, "cpu": 0.1},
+        ]
+        groups = render._aggregate_system_processes(processes)
+        self.assertEqual(groups[0]["category"], "mcp")
+
+
+class TestRenderSystemProcessesRows(unittest.TestCase):
+    def test_shows_top_processors_and_aggregated_table(self):
+        """系统进程页应同时展示高占用卡片和聚合后的表格。"""
+        processes = [
+            {"pid": "1", "cmd": "/Applications/WeChat.app/Contents/MacOS/WeChat", "category": "app", "rss": 500 * 1024, "cpu": 10.0},
+            {"pid": "2", "cmd": "/Applications/WeChat.app/Contents/MacOS/WeChat Helper", "category": "app", "rss": 200 * 1024, "cpu": 3.0},
+            {"pid": "3", "cmd": "/Applications/WeChat.app/Contents/MacOS/WeChat Helper (GPU)", "category": "app", "rss": 100 * 1024, "cpu": 1.0},
+            {"pid": "4", "cmd": "/Applications/WeChat.app/Contents/MacOS/WeChat Helper (Renderer)", "category": "app", "rss": 50 * 1024, "cpu": 0.5},
+            {"pid": "5", "cmd": "node vite", "category": "dev-server", "rss": 50 * 1024, "cpu": 1.0},
+        ]
+        html = render.render_system_processes_rows(processes)
+        self.assertIn("高 CPU 占用", html)
+        self.assertIn("高内存占用", html)
+        self.assertIn("WeChat.app", html)
+        self.assertIn("4 个进程", html)
+
+
+class TestRenderRuntimeFilterBar(unittest.TestCase):
+    def test_hides_empty_categories(self):
+        """没有 agent-daemon 时不显示 Agent Daemon 按钮，避免用户点击后为空。"""
+        data = {
+            "processes": [
+                {"pid": "1", "category": "mcp", "cmd": "bun gbrain"},
+                {"pid": "2", "category": "support", "cmd": "python dashboard"},
+                {"pid": "3", "category": "dev-server", "cmd": "node vite"},
+            ]
+        }
+        html = render.render_runtime_filter_bar(data)
+        self.assertIn("全部 (3)", html)
+        self.assertIn("MCP (1)", html)
+        self.assertIn("Dev Server (1)", html)
+        self.assertIn("支撑 / 系统 (1)", html)
+        self.assertNotIn("Agent Daemon", html)
+
+    def test_support_and_system_combined(self):
+        data = {
+            "processes": [
+                {"pid": "1", "category": "support", "cmd": "x"},
+                {"pid": "2", "category": "system", "cmd": "y"},
+            ]
+        }
+        html = render.render_runtime_filter_bar(data)
+        self.assertIn("支撑 / 系统 (2)", html)
+
+
+class TestRenderMacosSignalsRowsGrouping(unittest.TestCase):
+    def test_same_title_rows_stay_adjacent_despite_linked_status(self):
+        """同一产品（如 gbrain）无论是否关联都应相邻，避免被其他产品插开导致重复分组表头。"""
+        rows = [
+            {
+                "label": "com.gbrain.memory-browser",
+                "launch_role": "user-agent",
+                "launch_plist": "/Users/x/Library/LaunchAgents/com.gbrain.memory-browser.plist",
+                "running": True,
+                "linked_assets": ["pkg:stable_entrypoints"],
+            },
+            {
+                "label": "com.gbrain.serve-http",
+                "launch_role": "user-agent",
+                "launch_plist": "/Users/x/Library/LaunchAgents/com.gbrain.serve-http.plist",
+                "running": False,
+                "linked_assets": [],
+            },
+            {
+                "label": "com.google.keystone.agent",
+                "launch_role": "user-agent",
+                "launch_plist": "/Users/x/Library/LaunchAgents/com.google.keystone.agent.plist",
+                "running": False,
+                "linked_assets": [],
+            },
+        ]
+        # 复用 build_dashboard 里的预处理逻辑
+        for r in rows:
+            r["_signal_kind"] = "launchd·用户级"
+            r["_control"] = "user-launchd"
+            r["_human"] = render.humanize_signal(r)
+            r["_safe"] = True
+        html = render.render_macos_signals_rows(rows)
+        # gbrain 记忆服务 应该只出现一次分组表头
+        self.assertEqual(html.count(">gbrain 记忆服务<"), 1)
+        # Google 自动更新 表头出现一次
+        self.assertEqual(html.count(">Google 自动更新<"), 1)
+
+
+class TestPidExists(unittest.TestCase):
+    @patch("os.kill")
+    def test_exists_when_permission_denied(self, mock_kill):
+        """root 系统守护进程没权限发信号时，应认为进程存在，而不是已退出。"""
+        mock_kill.side_effect = PermissionError(1, "Operation not permitted")
+        self.assertTrue(render._pid_exists(123))
+
+    @patch("os.kill")
+    def test_not_exists_when_no_such_process(self, mock_kill):
+        mock_kill.side_effect = ProcessLookupError(3, "No such process")
+        self.assertFalse(render._pid_exists(123))
+
+    @patch("os.kill")
+    def test_exists_when_no_error(self, mock_kill):
+        mock_kill.return_value = None
+        self.assertTrue(render._pid_exists(123))
+
+
+class TestStateBadge(unittest.TestCase):
+    def test_custom_label_wins(self):
+        """传入自定义 label 时不应被 state_labels 覆盖。"""
+        html = render.state_badge("not-running", "已停止（进程已退出）")
+        self.assertIn("已停止（进程已退出）", html)
+
+    def test_fallback_to_state_lookup(self):
+        html = render.state_badge("not-running")
+        self.assertIn("未运行", html)
+
+
 class TestLaunchctlDisabledSet(unittest.TestCase):
     """覆盖 _launchctl_disabled_set 对 print-disabled 输出的解析。"""
 

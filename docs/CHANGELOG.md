@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-07-04 04:30
+
+### [FIX] 解决 dashboard 页面刷新后仍显示老内容
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 用户刷新页面后仍看到旧版内容，怀疑是浏览器缓存或旧服务实例导致。 |
+| **根因/方案** | 服务端 HTML 响应只设置了 `Cache-Control: no-store`，部分浏览器/场景下仍可能缓存；`window.location.reload()` 也可能读缓存。同时本地 LaunchAgent 常驻的 dashboard 服务进程加载的是内存中的旧 lib，必须重启才能生效。 |
+| **改动范围** | `lib/agent_assets_dashboard_api.py`（HTTP 响应头增加 `Pragma: no-cache`、`Expires: 0`）、`lib/agent_assets_dashboard_html.py`（HTML head 增加 cache-control meta 标签；所有刷新按钮改用带时间戳的 `hardReload()`）、`docs/CHANGELOG.md`；本机已重新运行 `install.sh` 并重启 `com.yang.agent-assets-dashboard` LaunchAgent。 |
+| **影响面** | 点击任意刷新按钮都会强制绕过缓存重新加载；新启动/重启的 dashboard 服务一定使用最新安装的 lib 代码。 |
+| **状态** | ✅ 已完成 |
+
+## 2026-07-04 04:10
+
+### [BUG] 修复系统守护进程「运行中」被误判为「未运行」
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 系统级 LaunchDaemons（Clash Verge、Docker、Vortex、向日葵等）在界面显示「未运行」，但资源列却显示 CPU/内存占用，状态与资源矛盾。 |
+| **根因/方案** | 渲染层用 `os.kill(pid, 0)` 对 running 行做实时 PID 校验。对 root 运行的系统守护进程，当前用户无权限发信号，会抛 `PermissionError(EPERM)`；旧代码把所有 `OSError` 都当成「进程不存在」，于是状态被错误覆盖为「未运行」。同时 `state_badge` 的自定义 label 会被 `state_labels` 覆盖，导致「已停止（进程已退出）」也显示成「未运行」。 |
+| **改动范围** | `lib/agent_assets_dashboard_render.py`（`_pid_exists` 区分 EPERM/ESRCH、`state_badge` 优先使用自定义 label）、`tests/test_dashboard_render.py`、`docs/CHANGELOG.md` |
+| **影响面** | 系统级守护进程的状态现在与实际一致；若进程真的已退出，会正确显示「已停止（进程已退出）」而不是被覆盖成「未运行」。 |
+| **状态** | ✅ 已完成 |
+
+## 2026-07-04 04:20
+
+### [FEAT] 系统进程页参考 Stats 重构：高占用卡片 + 应用聚合 + 批量终止
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 系统进程 tab 被 Chrome Helper / WeChat 等大量重复进程撑爆，看不到真正的高占用；用户希望参考 Stats 应用，顶部直接展示高 CPU / 高内存进程。 |
+| **根因/方案** | 原始实现是一行一个 PID，未做聚合。新增 `_aggregate_system_processes()` 按 `_process_display_name`（应用 bundle 或 basename）聚合同名进程，CPU 和内存做加总；顶部新增「高占用进程」双栏卡片，左侧 Top 5 CPU、右侧 Top 5 内存；kill 接口支持 JSON 数组形式的批量 PID；系统进程采集同时扩展 `RUNTIME_WHITELIST`，让聚合后的终止操作可被白名单覆盖。 |
+| **改动范围** | `lib/agent_assets_dashboard_render.py`（聚合、高占用卡片、系统进程表格）、`lib/agent_assets_dashboard_html.py`（CSS、批量 kill 确认文案）、`lib/agent_assets_dashboard_data.py`（扩展白名单）、`lib/agent_assets_dashboard_api.py`（批量 kill 解析与执行）、`tests/test_dashboard_render.py`、`tests/test_dashboard_api.py`、`docs/FEATURES.md` |
+| **影响面** | 系统进程 tab 大幅精简；Chrome / WeChat / Electron 应用只显示一行并标注进程数；顶部高占用卡片一眼可见当前资源消耗大户；终止操作支持一键结束应用所有相关进程。 |
+| **状态** | ✅ 已完成 |
+
 ## 2026-07-04 03:45
 
 ### [REFACTOR] 系统信号表格改为表头排序，移除「全部状态」筛选按钮行

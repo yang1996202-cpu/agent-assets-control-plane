@@ -69,6 +69,23 @@
   4. 对不再引用的缓存/报告/备份文件也一并清理，避免历史垃圾干扰排查。
 - **适用场景**：任何会安装到用户 `~/.local/bin` 且经历过重命名的工具链。
 
+## 9. 本地 dashboard 必须同时防浏览器缓存和旧服务实例
+
+- **观察**：dashboard 是本地静态 HTML + HTTP 服务，用户经常只点浏览器刷新或 F5，
+  但浏览器对本地/localhost 页面也可能缓存；同时 LaunchAgent 常驻的 dashboard 进程
+  加载的是内存中的旧 lib，不重启示新代码不会生效。两种因素叠加，表现为「我改了代码，
+  用户刷新页面却看不到变化」「好像又做了一遍」。
+- **推论**：每次交付 dashboard 相关改动后，必须同时做三件事：
+  1. 在 HTML/HTTP 层声明禁止缓存；
+  2. 把所有「刷新」按钮从 `location.reload()` 改为带时间戳的强制重载；
+  3. 重新运行 `install.sh` 并重启常驻 dashboard 服务，确保内存里是最新 lib。
+- **做法**：
+  1. HTML `<head>` 加 `Cache-Control: no-store, no-cache, must-revalidate, max-age=0` meta。
+  2. HTTP 响应头同步加 `Cache-Control` / `Pragma: no-cache` / `Expires: 0`。
+  3. 刷新按钮统一用 `location.href = base + '?_t=' + Date.now() + hash`。
+  4. 交付后检查端口占用进程启动时间，确认服务已重启；提醒用户关闭旧 tab 再开新页。
+- **适用场景**：任何通过本地 HTTP 服务提供 HTML 界面的工具。
+
 ## 8. 先审计环境，再修症状
 
 - **观察**：当用户反馈「A 不刷新」「B 状态不对」「C 点了没反应」时，

@@ -381,8 +381,9 @@ def state_badge(state, label=None):
         "residual": "残留",
         "not-agent": "非 Agent",
     }
-    raw_text = label or state
-    text = state_labels.get(raw_text, state_labels.get(state, raw_text))
+    # 自定义 label 优先使用；没有时才按 state 查表，避免「已停止（进程已退出）」
+    # 这种自定义文案被 state_labels 里的「未运行」覆盖掉。
+    text = label if label else state_labels.get(state, state)
     normalized = state.replace("_", "-")
     return f'<span class="state state-{lib.h(normalized)}">{lib.h(text)}</span>'
 
@@ -598,11 +599,20 @@ def _render_linked_assets(linked):
 
 
 def _pid_exists(pid):
-    """检查某个 pid 当前是否还活着（不发送信号，只检测）。"""
+    """检查某个 pid 当前是否还活着（不发送信号，只检测）。
+
+    背景：对 root 运行的系统守护进程（/Library/LaunchDaemons）执行 os.kill(pid, 0)
+          时，当前用户可能没权限发信号，会抛 PermissionError(EPERM)，但进程其实是存在的。
+          如果把它当成不存在，就会出现「状态显示未运行，但资源列仍有 CPU/内存」的矛盾。
+    设计意图：区分「进程不存在(ESRCH)」和「存在但没权限(EPERM)」，前者才返回 False。
+    约束：传入非数字、负值等非法 pid 时返回 False；权限不足但进程存在时返回 True。
+    """
     try:
         os.kill(int(pid), 0)
         return True
-    except (OSError, ValueError, TypeError):
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError, ValueError, TypeError):
         return False
 
 
@@ -701,9 +711,11 @@ def render_macos_signals_rows(rows, process_list=None):
     for row in rows:
         groups.setdefault(row.get("_control") or "login-item", []).append(row)
     for key in groups:
+        # 先按人话标题（忽略大小写）聚合，再把已关联的置顶；
+        # 这样同一产品（如 gbrain 记忆服务）的多行会相邻，避免被 Google 自动更新等插开。
         groups[key].sort(key=lambda r: (
+            str((r.get("_human") or humanize_signal(r))[0]).lower(),
             0 if lib.listify(r.get("linked_assets")) else 1,
-            (r.get("_human") or ("", ""))[0],
         ))
     disabled = _launchctl_disabled_set()
     process_lookup = _build_process_lookup(process_list)
@@ -1172,53 +1184,115 @@ def _signal_resource_text(row, process_lookup):
     return f"CPU {cpu_text} · 内存 {rss_text}"
 
 
+def _aggregate_system_processes(processes):
+    """把原始进程列表按「可读名称」聚合，消除 Chrome Helper / 微信多进程等重复行。
+
+    背景：macOS 上现代应用（浏览器、微信、Electron 应用）会拉起大量 helper/渲染进程，
+          如果不聚合，表格会被同一应用的几十行占满，高占用反而被淹没。
+    设计意图：按 _process_display_name 聚合，同名进程合并为一条，CPU 和内存做加总，
+             保留所有 PID 用于终止操作；分类取组内最常见的非 unknown 值。
+    约束：返回的聚合行包含 pids 列表、聚合后的 cpu/rss、代表性 cmd 和 category。
+    """
+    groups = {}
+    for p in processes:
+        cmd = p.get("cmd", "")
+        name = _process_display_name(cmd)
+        g = groups.setdefault(
+            name,
+            {
+                "name": name,
+                "pids": [],
+                "rss": 0,
+                "cpu": 0.0,
+                "cmd": cmd,
+                "categories": [],
+            },
+        )
+        pid = p.get("pid")
+        if pid:
+            g["pids"].append(pid)
+        g["rss"] += int(p.get("rss", 0) or 0)
+        g["cpu"] += float(p.get("cpu", 0) or 0)
+        g["categories"].append(p.get("category", "unknown"))
+
+    for g in groups.values():
+        cats = [c for c in g["categories"] if c != "unknown"]
+        if not cats:
+            cats = g["categories"]
+        g["category"] = max(set(cats), key=cats.count) if cats else "unknown"
+        g["pids"].sort(key=lambda x: int(x) if str(x).isdigit() else 0)
+    return sorted(groups.values(), key=lambda g: (-g["rss"], -g["cpu"]))
+
+
+def _render_top_processors(aggregated, max_cpu, max_rss):
+    """渲染「高占用进程」顶部卡片：左侧 Top 5 CPU，右侧 Top 5 内存。
+
+    设计意图：参考 Stats / macOS 活动监视器，把最值得关注的进程直接放在页面顶部，
+             用户不用滚动和搜索就能看到当前谁最吃资源。
+    约束：聚合后的数据已经按应用合并，不会出现 Chrome Helper 占满榜单的情况。
+    """
+    if not aggregated:
+        return ""
+
+    top_cpu = sorted(aggregated, key=lambda g: -g["cpu"])[:5]
+    top_rss = sorted(aggregated, key=lambda g: -g["rss"])[:5]
+
+    def _item_html(g, value, max_value, css_class, formatter):
+        return (
+            f'<div class="top-proc-item">'
+            f'<span class="top-proc-name" title="{lib.h(g["cmd"])}">{lib.h(g["name"])}</span>'
+            f'{_usage_bar_html(value, max_value, formatter(value), css_class)}'
+            f'</div>'
+        )
+
+    cpu_items = "\n".join(_item_html(g, g["cpu"], max_cpu, "cpu", lambda v: _format_cpu(v, True)) for g in top_cpu)
+    rss_items = "\n".join(_item_html(g, g["rss"], max_rss, "mem", _format_rss) for g in top_rss)
+
+    return f"""
+    <div class="top-processors card">
+      <div class="top-proc-grid">
+        <div class="top-proc-col">
+          <h4>⚡ 高 CPU 占用</h4>
+          {cpu_items}
+        </div>
+        <div class="top-proc-col">
+          <h4>🧠 高内存占用</h4>
+          {rss_items}
+        </div>
+      </div>
+    </div>
+    """
+
+
 def render_system_processes_rows(processes):
-    """渲染「系统进程」tab：清爽、克制的进程列表，风格与「运行态」「系统信号」保持一致。
+    """渲染「系统进程」tab：按应用聚合、顶部高占用、可排序筛选。
 
     设计意图：
-    - 进程名是最突出的信息，PID 作为辅助信息尽量弱化。
-    - CPU / 内存列只保留必要的小进度条 + 数值，避免大块彩色条抢注意力。
-    - 表头排序默认按内存降序，并高亮当前排序列。
-    - 筛选按钮保留：全部 / 用户进程 / App / MCP / Dev Server / Support / system / unknown。
+    - 参考 Stats 的高占用进程卡片，把 Top CPU / Top 内存放在最显眼的位置。
+    - 按应用名称聚合，避免 Chrome / WeChat / Electron Helper 等把表格撑爆。
+    - 表格默认按内存降序，支持表头排序和分类筛选。
     """
     if not processes:
         return '<p class="muted">没有采集到系统进程数据。运行 asset-runtime --show-system 生成。</p>'
 
-    # 统一数值字段
-    rows = []
-    for p in processes:
-        try:
-            rss = int(p.get("rss", 0) or 0)
-        except (TypeError, ValueError):
-            rss = 0
-        try:
-            cpu = float(p.get("cpu", 0) or 0)
-        except (TypeError, ValueError):
-            cpu = 0.0
-        rows.append({
-            "pid": p.get("pid", "?"),
-            "category": p.get("category", "unknown"),
-            "cmd": p.get("cmd", ""),
-            "rss": rss,
-            "cpu": cpu,
-        })
+    aggregated = _aggregate_system_processes(processes)
+    if not aggregated:
+        return '<p class="muted">没有可展示的系统进程。</p>'
 
-    # 分类统计
+    # 分类统计（基于聚合后的行）
     cat_counts = {}
-    for p in rows:
-        cat = p["category"]
+    for g in aggregated:
+        cat = g["category"]
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
-    # 默认视图：排除纯 system，显示应用、agent、mcp、dev 等用户关心进程
-    non_system = [p for p in rows if p["category"] != "system"]
-    default_rows = non_system if non_system else rows
+    non_system = [g for g in aggregated if g["category"] != "system"]
+    default_rows = non_system if non_system else aggregated
 
-    # 进度条缩放极值
-    max_cpu = max((p["cpu"] for p in rows), default=0) or 1
-    max_rss = max((p["rss"] for p in rows), default=0) or 1
+    max_cpu = max((g["cpu"] for g in aggregated), default=0) or 1
+    max_rss = max((g["rss"] for g in aggregated), default=0) or 1
 
-    # 筛选按钮：全部 / 用户进程 / App / MCP / Dev Server / Support / system / unknown
-    filter_buttons = [f'<button class="filter" data-filter="">全部 ({len(rows)})</button>']
+    # 筛选按钮
+    filter_buttons = [f'<button class="filter" data-filter="">全部 ({len(aggregated)})</button>']
     if non_system:
         filter_buttons.append(f'<button class="filter active" data-filter="user">用户进程 ({len(non_system)})</button>')
     user_cats = [("app", "App"), ("mcp", "MCP"), ("dev-server", "Dev Server"), ("support", "Support")]
@@ -1228,29 +1302,31 @@ def render_system_processes_rows(processes):
         if n:
             filter_buttons.append(f'<button class="filter" data-filter="{lib.h(cat)}">{lib.h(label)} ({n})</button>')
 
-    # 默认按内存降序，让高占用进程自然排在前面
-    default_rows.sort(key=lambda p: (-p["rss"], -p["cpu"]))
+    # 默认按内存降序
+    default_rows.sort(key=lambda g: (-g["rss"], -g["cpu"]))
 
-    def _row_html(p):
-        pid = p["pid"]
-        cat = p["category"]
-        name = _process_display_name(p["cmd"])
+    def _row_html(g):
+        name = g["name"]
+        cat = g["category"]
         type_badge = _runtime_type_badge(cat)
         filter_tags = f"{cat} user" if cat != "system" else cat
-        kill_btns = _kill_buttons_for_pids([pid], name) if pid != "?" else ""
+        pid_hint = f"PID {', '.join(str(p) for p in g['pids'])}" if len(g["pids"]) <= 3 else f"{len(g['pids'])} 个进程"
+        kill_btns = _kill_buttons_for_pids(g["pids"], name) if g["pids"] else ""
         return (
             f'<tr class="searchable" data-section="system-processes" data-filter-tags="{lib.h(filter_tags)}">'
-            f'<td class="col-name"><strong title="{lib.h(p["cmd"])}">{lib.h(name)}</strong><span class="pid-hint">PID {lib.h(pid)}</span></td>'
-            f'<td class="col-cpu" data-sort-value="{p["cpu"]:.3f}">{_usage_bar_html(p["cpu"], max_cpu, _format_cpu(p["cpu"], True), "cpu")}</td>'
-            f'<td class="col-rss" data-sort-value="{p["rss"]}">{_usage_bar_html(p["rss"], max_rss, _format_rss(p["rss"]), "mem")}</td>'
+            f'<td class="col-name"><strong title="{lib.h(g["cmd"])}">{lib.h(name)}</strong><span class="pid-hint">{lib.h(pid_hint)}</span></td>'
+            f'<td class="col-cpu" data-sort-value="{g["cpu"]:.3f}">{_usage_bar_html(g["cpu"], max_cpu, _format_cpu(g["cpu"], True), "cpu")}</td>'
+            f'<td class="col-rss" data-sort-value="{g["rss"]}">{_usage_bar_html(g["rss"], max_rss, _format_rss(g["rss"]), "mem")}</td>'
             f'<td class="col-type">{type_badge}</td>'
             f'<td class="col-action">{kill_btns}</td>'
             f'</tr>'
         )
 
-    out_rows = [_row_html(p) for p in default_rows]
+    out_rows = [_row_html(g) for g in default_rows]
+    top_section = _render_top_processors(aggregated, max_cpu, max_rss)
 
     return f"""
+    {top_section}
     <div class="filter-bar system-processes-filter-bar">
       {"".join(filter_buttons)}
     </div>
@@ -1452,15 +1528,40 @@ def render_alert_cards(runtime_data):
     """
 
 
-def render_runtime_filter_bar():
-    return """
+def render_runtime_filter_bar(runtime_data=None):
+    """渲染运行态顶部分类筛选按钮，按实际进程数动态显示并带计数。
+
+    背景：旧版硬编码了「Agent」「MCP」「Dev Server」等按钮，用户点击「Agent」时
+          若本机没有 `agent-daemon` 分类进程，会以为功能坏了。
+    设计意图：根据当前 runtime 数据里的真实分类统计，只显示有数据的按钮，并标注数量；
+             把「Agent」改成「Agent Daemon」，避免与「Agent 应用」混淆。
+    约束：category 只可能为 mcp / agent-daemon / dev-server / support / system / unknown / app；
+          support 与 system 合并为一个「支撑 / 系统」按钮，与前端 JS 过滤逻辑保持一致。
+    """
+    processes = (runtime_data or {}).get("processes") or []
+    counts = {"mcp": 0, "agent-daemon": 0, "dev-server": 0, "support": 0, "system": 0, "unknown": 0}
+    for p in processes:
+        cat = p.get("category", "unknown")
+        if cat in counts:
+            counts[cat] += 1
+    support_system = counts["support"] + counts["system"]
+    total = len(processes)
+
+    buttons = [f'<button class="filter active" data-filter="">全部 ({total})</button>']
+    if counts["mcp"]:
+        buttons.append(f'<button class="filter" data-filter="mcp">MCP ({counts["mcp"]})</button>')
+    if counts["agent-daemon"]:
+        buttons.append(f'<button class="filter" data-filter="agent-daemon">Agent Daemon ({counts["agent-daemon"]})</button>')
+    if counts["dev-server"]:
+        buttons.append(f'<button class="filter" data-filter="dev-server">Dev Server ({counts["dev-server"]})</button>')
+    if support_system:
+        buttons.append(f'<button class="filter" data-filter="support-system">支撑 / 系统 ({support_system})</button>')
+    if counts["unknown"]:
+        buttons.append(f'<button class="filter" data-filter="other">其他 ({counts["unknown"]})</button>')
+
+    return f"""
     <div class="filter-bar runtime-filter-bar">
-      <button class="filter active" data-filter="">全部</button>
-      <button class="filter" data-filter="mcp">MCP</button>
-      <button class="filter" data-filter="agent-daemon">Agent</button>
-      <button class="filter" data-filter="dev-server">Dev Server</button>
-      <button class="filter" data-filter="support-system">支撑 / 系统</button>
-      <button class="filter" data-filter="other">其他</button>
+      {"".join(buttons)}
     </div>
     """
 

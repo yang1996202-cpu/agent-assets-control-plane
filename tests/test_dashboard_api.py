@@ -60,6 +60,21 @@ class TestDashboardStateHelpers(unittest.TestCase):
             self.fail(f"_clear_signals_refresh_error raised {exc}")
 
 
+class TestParseKillPids(unittest.TestCase):
+    def test_single_string(self):
+        self.assertEqual(api._parse_kill_pids("123"), ["123"])
+
+    def test_json_array_string(self):
+        self.assertEqual(api._parse_kill_pids('["1", "2", "3"]'), ["1", "2", "3"])
+
+    def test_python_list(self):
+        self.assertEqual(api._parse_kill_pids([1, 2, 3]), ["1", "2", "3"])
+
+    def test_empty(self):
+        self.assertEqual(api._parse_kill_pids(None), [])
+        self.assertEqual(api._parse_kill_pids(""), [])
+
+
 class TestHandleLaunchctlActionZh(unittest.TestCase):
     """覆盖 handle_launchctl 用真实状态修正 action_zh 的逻辑。"""
 
