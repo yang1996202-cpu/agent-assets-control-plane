@@ -17,6 +17,7 @@ import plistlib
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 
 import agent_assets_common as lib
@@ -276,19 +277,19 @@ def _refresh_after_launchctl(skip_btm=True):
     - 只调用一次 refresh_signals，避免重复运行采集脚本。
     """
     try:
-        import time
         # bootout 后 launchd/进程可能还有短暂延迟，先等 4 秒再扫描
         time.sleep(4)
-        error = data.refresh_signals(skip_btm=skip_btm)
-        if error:
-            _record_signals_refresh_error(error)
-            sys.stderr.write(f"asset-dashboard: launchctl refresh signals failed: {error}\n")
-        else:
-            _clear_signals_refresh_error()
-        # 再扫一次运行态进程，确保 kill 后的状态同步；不再重新跑 signals 采集
-        html_module.write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_signals=False, live=False)
-        if not error:
-            _touch_last_signals_refresh_at()
+        with _refresh_lock:
+            error = data.refresh_signals(skip_btm=skip_btm)
+            if error:
+                _record_signals_refresh_error(error)
+                sys.stderr.write(f"asset-dashboard: launchctl refresh signals failed: {error}\n")
+            else:
+                _clear_signals_refresh_error()
+            # 再扫一次运行态进程，确保 kill 后的状态同步；不再重新跑 signals 采集
+            html_module.write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_signals=False, live=False)
+            if not error:
+                _touch_last_signals_refresh_at()
     except Exception as exc:
         _record_signals_refresh_error(str(exc))
         sys.stderr.write(f"asset-dashboard: launchctl refresh failed: {exc}\n")
@@ -525,11 +526,43 @@ def _cleanup_existing_dashboard(port):
         pass
 
 
+_refresh_lock = threading.Lock()
+
+
+def _periodic_signals_refresh(interval_seconds=300):
+    """后台定时刷新系统信号，避免快照过旧。
+
+    背景：用户可能在 dashboard 外杀掉进程或开关服务，macos-signals.json 如果不刷新，
+          页面会一直显示旧状态。
+    设计意图：每 5 分钟（默认）在后台静默刷新一次信号并重写 dashboard.html，
+              与用户手动刷新互不阻塞。
+    关键约束：
+    - 使用锁避免与 launchctl 操作后的刷新并发。
+    - 失败时把错误写入 macos-signals.json 的 _refresh_error，由页面 banner 展示。
+    - skip_btm=True 避免触发密码提示。
+    """
+    while True:
+        time.sleep(interval_seconds)
+        with _refresh_lock:
+            try:
+                error = data.refresh_signals(skip_btm=True)
+                if error:
+                    _record_signals_refresh_error(error)
+                else:
+                    _clear_signals_refresh_error()
+                html_module.write_dashboard(run_discovery=False, refresh_mcp=False, run_projects=False, run_signals=True, run_signals_skip_btm=True, live=False)
+                _touch_last_signals_refresh_at()
+            except Exception as exc:
+                sys.stderr.write(f"asset-dashboard: periodic signals refresh failed: {exc}\n")
+
+
 def serve(host, port, open_browser=False):
     _cleanup_existing_dashboard(port)
     server = http.server.ThreadingHTTPServer((host, port), DashboardHandler)
     url = f"http://{host}:{port}/"
     html_module.write_dashboard(run_discovery=True, refresh_mcp=False, live=False)
+    # 启动后台定时刷新，避免 macos-signals 快照过旧
+    threading.Thread(target=_periodic_signals_refresh, kwargs={"interval_seconds": 300}, daemon=True).start()
     print(url)
     if open_browser:
         subprocess.run(["/usr/bin/open", url], check=False)

@@ -596,6 +596,15 @@ def _render_linked_assets(linked):
     return f'{first}<span class="linked-more" title="{lib.h(full)}">+{len(values) - 1}</span>'
 
 
+def _pid_exists(pid):
+    """检查某个 pid 当前是否还活着（不发送信号，只检测）。"""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _signal_row_html(row, disabled, resource_html, show_title=True):
     title, note = row.get("_human") or humanize_signal(row)
     raw_label = row.get("label") or row.get("name") or row.get("identifier") or "未命名"
@@ -607,6 +616,12 @@ def _signal_row_html(row, disabled, resource_html, show_title=True):
     tags = lib.listify(row.get("tags"))
     if row.get("launch_state") == "running" or row.get("running"):
         state, state_label = "running", "运行中"
+        # 对后台进程/监听端口类行做实时 PID 校验：如果用户已在系统外杀掉，
+        # 快照数据会滞后，这里按实际进程是否存在修正状态。
+        if control in ("app-running",) and state == "running":
+            pids = [p.get("pid") for p in (row.get("processes") or []) if p.get("pid")]
+            if pids and not any(_pid_exists(pid) for pid in pids):
+                state, state_label = "not-running", "已停止（进程已退出）"
     elif plist:
         state, state_label = "not-running", "未运行"
     else:
