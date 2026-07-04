@@ -3,6 +3,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch, MagicMock
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
@@ -112,6 +113,36 @@ class TestRenderLinkedAssets(unittest.TestCase):
         ])
         self.assertIn('title="', html)
         self.assertIn("agent-assets-dashboard:source_paths", html)
+
+
+class TestLaunchctlDisabledSet(unittest.TestCase):
+    """覆盖 _launchctl_disabled_set 对 print-disabled 输出的解析。"""
+
+    def _mock_run(self, stdout):
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = stdout
+        proc.stderr = ""
+        return proc
+
+    def test_parses_dotted_label(self):
+        stdout = 'disabled services = {\n\t"com.example.foo" => disabled\n}'
+        with patch("subprocess.run", return_value=self._mock_run(stdout)):
+            result = render._launchctl_disabled_set()
+        self.assertIn("com.example.foo", result)
+
+    def test_parses_chinese_label_without_dot(self):
+        """中文 Label（如 闪电说）不含点，也要能被识别为已禁用。"""
+        stdout = 'disabled services = {\n\t"闪电说" => disabled\n}'
+        with patch("subprocess.run", return_value=self._mock_run(stdout)):
+            result = render._launchctl_disabled_set()
+        self.assertIn("闪电说", result)
+
+    def test_ignores_braces_and_headers(self):
+        stdout = 'disabled services = {\n}'
+        with patch("subprocess.run", return_value=self._mock_run(stdout)):
+            result = render._launchctl_disabled_set()
+        self.assertEqual(result, set())
 
 
 if __name__ == "__main__":

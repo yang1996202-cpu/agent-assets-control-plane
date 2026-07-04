@@ -570,7 +570,8 @@ def _launchctl_disabled_set():
             low = s.lower()
             if "(true)" in s or "=> disabled" in low or low.endswith("disabled"):
                 lbl = s.split("\t")[0].split("=>")[0].split()[0].strip().strip("\"'")
-                if lbl and "." in lbl:
+                # launchd Label 不强制要求含点；中文/短名称也要支持
+                if lbl and lbl not in {"{", "}"} and not lbl.lower().startswith("disabled"):
                     disabled.add(lbl)
         return disabled
     except Exception:

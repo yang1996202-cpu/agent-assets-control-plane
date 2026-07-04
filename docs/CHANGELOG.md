@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-04 03:35
+
+### [BUG] 修复中文/无点 launchd Label 禁用状态识别错误
+
+| 字段 | 内容 |
+|---|---|
+| **问题/需求** | 「闪电说」Label 为中文（不含点），用户点击「禁用自启」后操作记录显示成功，但界面仍显示「自启·已启用」。 |
+| **根因/方案** | `_launchctl_disabled_set()` 解析 `launchctl print-disabled` 输出时，错误地过滤掉不含 `.` 的 Label，导致中文或短名称服务被排除在已禁用集合外。移除该点号限制，仅排除花括号和 header 行。 |
+| **改动范围** | `lib/agent_assets_dashboard_render.py`、`tests/test_dashboard_render.py`、`docs/CHANGELOG.md` |
+| **影响面** | 中文 Label、短名称 Label 的 LaunchAgent 禁用/启用状态现在能正确显示；补充了针对中文 Label 的单元测试。 |
+| **状态** | ✅ 已完成 |
+
 ## 2026-07-04 03:25
 
 ### [FEAT] 系统信号实时 PID 校验 + 后台每 5 分钟自动刷新
